@@ -34,6 +34,31 @@ declare global {
     babylonScene: unknown | null;
   }
 
+  interface DesktopProjectAssetPayload {
+    data: ArrayBuffer;
+    lastModified: number;
+  }
+
+  interface DesktopModelPackageProjectFile {
+    relativePath: string;
+    projectFile: string;
+    role: "primaryModel" | "modelDependency" | "script" | "meta" | "texture" | "other";
+    size: number;
+    lastModified?: number;
+  }
+
+  interface DesktopModelPackageImportResult {
+    packageId: string;
+    displayName: string;
+    rootDirectoryName: string;
+    primaryModelFile: string;
+    scriptFile?: string;
+    metaFile?: string;
+    projectFiles: DesktopModelPackageProjectFile[];
+    textFiles: Record<string, string>;
+    warnings: string[];
+  }
+
   interface Window {
     electronApp?: {
       isElectron: boolean;
@@ -51,6 +76,9 @@ declare global {
         loadScene: (projectPath: string, sceneId: string) => Promise<DesktopScenePayload>;
         createScene: (projectPath: string, name: string) => Promise<DesktopProjectRecord>;
         saveScene: (projectPath: string, sceneId: string, babylonScene: unknown) => Promise<DesktopProjectRecord>;
+        saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) => Promise<string>;
+        loadAssetFile: (projectPath: string, projectFile: string) => Promise<DesktopProjectAssetPayload>;
+        importModelPackage?: (projectPath: string) => Promise<DesktopModelPackageImportResult | null>;
       };
     };
   }

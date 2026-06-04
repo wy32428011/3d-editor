@@ -3,14 +3,18 @@ import {
   Bug,
   Circle,
   Cylinder,
+  FileAxis3d,
   Gauge,
   Grid3X3,
   Lightbulb,
   MousePointer2,
   Move3D,
+  Package,
+  Play,
   Rotate3D,
   Save,
   Scaling,
+  Square,
   Upload
 } from "lucide-react";
 import { useRef } from "react";
@@ -19,14 +23,19 @@ import type { EditorStats, EditorTool, PrimitiveKind } from "../types/editor";
 interface ToolbarProps {
   tool: EditorTool;
   performanceMode: boolean;
+  previewMode: boolean;
   stats: EditorStats;
   onToolChange: (tool: EditorTool) => void;
   onAddPrimitive: (kind: PrimitiveKind) => void;
   onImportFiles: (files: FileList) => void;
+  onImportCadDrawing: (file: File) => void;
+  onImportModelPackage: () => void;
   onSave: () => void;
   saveDisabled?: boolean;
+  saveDisabledReason?: string;
   onToggleInspector: () => void;
   onTogglePerformance: () => void;
+  onTogglePreview: () => void;
 }
 
 const toolButtons: Array<{ tool: EditorTool; label: string; icon: typeof MousePointer2 }> = [
@@ -48,26 +57,46 @@ const primitiveButtons: Array<{ kind: PrimitiveKind; label: string; icon: typeof
 export function Toolbar({
   tool,
   performanceMode,
+  previewMode,
   stats,
   onToolChange,
   onAddPrimitive,
   onImportFiles,
+  onImportCadDrawing,
+  onImportModelPackage,
   onSave,
   saveDisabled = false,
+  saveDisabledReason,
   onToggleInspector,
-  onTogglePerformance
+  onTogglePerformance,
+  onTogglePreview
 }: ToolbarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const cadInputRef = useRef<HTMLInputElement>(null);
 
   /** 打开隐藏文件选择器，复用拖拽导入同一套逻辑。 */
   const openFilePicker = () => {
     inputRef.current?.click();
   };
 
+  /** 打开 CAD 图纸选择器，CAD 会直接生成贴地矢量线。 */
+  const openCadFilePicker = () => {
+    cadInputRef.current?.click();
+  };
+
   /** 处理本地文件选择结果，并清空 input 以便重复选择同名文件。 */
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files?.length) {
       onImportFiles(event.target.files);
+      event.target.value = "";
+    }
+  };
+
+  /** 处理 CAD 图纸选择结果，并清空 input 以便重复选择同名文件。 */
+  const handleCadFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      onImportCadDrawing(file);
       event.target.value = "";
     }
   };
@@ -111,8 +140,28 @@ export function Toolbar({
         <button className="icon-button" title="导入资源" type="button" onClick={openFilePicker}>
           <Upload size={18} />
         </button>
-        <button className="icon-button" title={saveDisabled ? "场景读取完成后才能保存" : "保存场景"} type="button" disabled={saveDisabled} onClick={onSave}>
+        <button className="icon-button" title="导入 CAD 图纸" type="button" onClick={openCadFilePicker}>
+          <FileAxis3d size={18} />
+        </button>
+        <button className="icon-button" title="导入模型包文件夹" type="button" onClick={onImportModelPackage}>
+          <Package size={18} />
+        </button>
+        <button
+          className="icon-button"
+          title={saveDisabled ? saveDisabledReason ?? "当前状态下不能保存场景" : "保存场景"}
+          type="button"
+          disabled={saveDisabled}
+          onClick={onSave}
+        >
           <Save size={18} />
+        </button>
+        <button
+          className={`icon-button ${previewMode ? "is-active" : ""}`}
+          title={previewMode ? "停止预览" : "预览完整场景和动画"}
+          type="button"
+          onClick={onTogglePreview}
+        >
+          {previewMode ? <Square size={18} /> : <Play size={18} />}
         </button>
         <button className="icon-button" title="Babylon Inspector" type="button" onClick={onToggleInspector}>
           <Bug size={18} />
@@ -138,9 +187,10 @@ export function Toolbar({
         className="hidden-input"
         type="file"
         multiple
-        accept=".glb,.gltf,.babylon,.obj,.stl,.png,.jpg,.jpeg,.webp,.ktx,.ktx2"
+        accept=".glb,.gltf,.babylon,.obj,.stl,.bin,.mtl,.png,.jpg,.jpeg,.webp,.ktx,.ktx2"
         onChange={handleFileChange}
       />
+      <input ref={cadInputRef} className="hidden-input" type="file" accept=".dxf,.dwg" onChange={handleCadFileChange} />
     </header>
   );
 }

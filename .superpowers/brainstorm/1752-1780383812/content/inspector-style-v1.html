@@ -1,0 +1,234 @@
+<style>
+  .inspector-demo-wrap {
+    display: grid;
+    grid-template-columns: minmax(360px, 520px) 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  .inspector-demo {
+    width: 360px;
+    background: #2d2d2d;
+    color: #d8d8d8;
+    border: 1px solid #151515;
+    box-shadow: 0 18px 50px rgba(0,0,0,.35);
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px;
+  }
+  .inspector-object-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 8px;
+    background: #242424;
+    border-bottom: 1px solid #111;
+  }
+  .inspector-object-bar .toggle {
+    width: 15px;
+    height: 15px;
+    accent-color: #7f9b71;
+  }
+  .object-name {
+    flex: 1;
+    min-width: 0;
+    height: 22px;
+    border: 1px solid #484848;
+    border-radius: 3px;
+    background: #303030;
+    color: #dcdcdc;
+    text-align: center;
+    font-size: 13px;
+  }
+  .section-block {
+    border-top: 1px solid #1c1c1c;
+  }
+  .section-title {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 25px;
+    padding: 0 8px;
+    background: #3a3a3a;
+    color: #f1f1f1;
+    font-weight: 600;
+    letter-spacing: .2px;
+  }
+  .section-title .chev { font-size: 14px; color: #fff; }
+  .refresh-icon { margin-left: auto; color: #4b4b4b; font-size: 16px; }
+  .section-body {
+    padding: 6px 8px 8px;
+    background: #2f2f2f;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 72px 1fr;
+    gap: 8px;
+    min-height: 24px;
+    align-items: center;
+  }
+  .row + .row { margin-top: 3px; }
+  .row-label { color: #d6d6d6; white-space: nowrap; }
+  .xyz-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) 12px minmax(0, 1fr) 12px minmax(0, 1fr);
+    gap: 3px;
+    align-items: center;
+  }
+  .axis { color: #cfcfcf; text-align: right; font-size: 12px; }
+  .mini-input,
+  .long-input {
+    box-sizing: border-box;
+    width: 100%;
+    height: 22px;
+    border: 1px solid #4c4c4c;
+    border-radius: 2px;
+    background: #2a2a2a;
+    color: #dcdcdc;
+    padding: 0 5px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .mini-input[readonly], .long-input[readonly] { color: #c8c8c8; }
+  .checkbox-cell {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #4c4c4c;
+    background: #242424;
+    border-radius: 2px;
+  }
+  .checkbox-cell input { width: 14px; height: 14px; accent-color: #808080; }
+  .color-swatch {
+    height: 22px;
+    border: 1px solid #777;
+    background: #eeeeee;
+  }
+  .asset-row {
+    display: grid;
+    grid-template-columns: 72px 1fr;
+    gap: 8px;
+    align-items: center;
+  }
+  .asset-actions {
+    margin-top: 8px;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .refresh-button {
+    min-width: 58px;
+    height: 25px;
+    border: 1px solid #686868;
+    border-radius: 3px;
+    background: #3b3b3b;
+    color: #d9d9d9;
+  }
+  .collapsed .section-body { display: none; }
+  .note-card {
+    border: 1px solid #35513a;
+    background: #142016;
+    padding: 16px;
+    border-radius: 10px;
+  }
+  .note-card h3 { margin-top: 0; color: #b8e7b9; }
+  .note-card li { margin: 8px 0; }
+  .option-line {
+    margin-top: 16px;
+    display: grid;
+    gap: 10px;
+  }
+  .option-tile {
+    border: 1px solid #3a4c3c;
+    border-radius: 10px;
+    padding: 12px;
+    background: #182019;
+    cursor: pointer;
+  }
+  .option-tile:hover { border-color: #7bbf77; }
+  .option-tile strong { color: #d7ffd4; }
+</style>
+
+<h2>右侧属性面板改版预览</h2>
+<p class="subtitle">第一版按截图方向做：深色、紧凑、折叠分组、三轴一行。左侧是目标视觉 mockup，右侧是实现取舍。</p>
+
+<div class="inspector-demo-wrap">
+  <div class="inspector-demo">
+    <div class="inspector-object-bar">
+      <input class="toggle" type="checkbox" checked />
+      <input class="object-name" value="弯道输送机" />
+    </div>
+
+    <div class="section-block">
+      <div class="section-title"><span class="chev">▼</span>空间信息 <span class="refresh-icon">↻</span></div>
+      <div class="section-body">
+        <div class="row">
+          <div class="row-label">位置</div>
+          <div class="xyz-row"><span class="axis">X</span><input class="mini-input" value="4.893"/><span class="axis">Y</span><input class="mini-input" value="2.100"/><span class="axis">Z</span><input class="mini-input" value="18.033"/></div>
+        </div>
+        <div class="row">
+          <div class="row-label">旋转</div>
+          <div class="xyz-row"><span class="axis">X</span><input class="mini-input" value="0"/><span class="axis">Y</span><input class="mini-input" value="0"/><span class="axis">Z</span><input class="mini-input" value="0"/></div>
+        </div>
+        <div class="row">
+          <div class="row-label">缩放</div>
+          <div class="xyz-row"><span class="axis">X</span><input class="mini-input" value="1"/><span class="axis">Y</span><input class="mini-input" value="1"/><span class="axis">Z</span><input class="mini-input" value="1"/></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <div class="section-title"><span class="chev">▼</span>MeshVertexModifyComponent</div>
+      <div class="section-body">
+        <div class="row"><div class="row-label">显示腿A</div><div><span class="checkbox-cell"><input type="checkbox" checked /></span></div></div>
+        <div class="row"><div class="row-label">显示腿B</div><div><span class="checkbox-cell"><input type="checkbox" checked /></span></div></div>
+        <div class="row"><div class="row-label">辊轮皮</div><div><span class="checkbox-cell"><input type="checkbox" checked /></span></div></div>
+        <div class="row"><div class="row-label">挡边</div><div><span class="checkbox-cell"><input type="checkbox" checked /></span></div></div>
+        <div class="row"><div class="row-label">主体颜色</div><div class="color-swatch"></div></div>
+        <div class="row"><div class="row-label">高度A</div><input class="long-input" value="0.3616738" /></div>
+        <div class="row"><div class="row-label">高度B</div><input class="long-input" value="0.3616731" /></div>
+        <div class="row"><div class="row-label">弯道宽度</div><input class="long-input" value="1.185945" /></div>
+        <div class="row"><div class="row-label">半径</div><input class="long-input" value="1" /></div>
+        <div class="row"><div class="row-label">弯道角度</div><input class="long-input" value="90" /></div>
+        <div class="row"><div class="row-label">辊筒密度</div><input class="long-input" value="0.5" /></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <div class="section-title"><span class="chev">▼</span>资产信息</div>
+      <div class="section-body">
+        <div class="asset-row"><div class="row-label">资产编号</div><input class="long-input" value="" /></div>
+        <div class="asset-actions"><button class="refresh-button">刷新</button></div>
+      </div>
+    </div>
+
+    <div class="section-block collapsed"><div class="section-title"><span class="chev">▶</span>关节参数</div><div class="section-body"></div></div>
+    <div class="section-block collapsed"><div class="section-title"><span class="chev">▶</span>数据驱动</div><div class="section-body"></div></div>
+  </div>
+
+  <div>
+    <div class="note-card">
+      <h3>推荐实现方式</h3>
+      <ul>
+        <li><strong>先做视觉 + 现有真实字段：</strong>对象名、位置、旋转、缩放、可见性、主体颜色。</li>
+        <li><strong>截图中的组件字段：</strong>作为节点 metadata 保存，后续真正做 MeshVertexModify 时再接几何逻辑。</li>
+        <li><strong>资产编号：</strong>建议作为业务资产编码 <code>assetCode</code>，不要和文件资产 ID 混用。</li>
+        <li><strong>关节参数 / 数据驱动：</strong>先做折叠区域和空状态，避免假功能误导。</li>
+      </ul>
+    </div>
+
+    <div class="option-line">
+      <div class="option-tile" data-choice="a" onclick="toggleSelect(this)">
+        <strong>A. 推荐：截图风格 + metadata 字段落地</strong>
+        <div>视觉最接近截图，同时字段可保存，后续组件逻辑可复用。</div>
+      </div>
+      <div class="option-tile" data-choice="b" onclick="toggleSelect(this)">
+        <strong>B. 只做视觉壳</strong>
+        <div>最快，但 MeshVertexModify 参数和资产编号不会真正保存。</div>
+      </div>
+      <div class="option-tile" data-choice="c" onclick="toggleSelect(this)">
+        <strong>C. 先完整组件系统</strong>
+        <div>最完整，但范围会扩大到组件模型、资产刷新和后续数据驱动。</div>
+      </div>
+    </div>
+  </div>
+</div>

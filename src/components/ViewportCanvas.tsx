@@ -1,16 +1,29 @@
 import { useEffect, useRef } from "react";
+import type { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { BabylonEditorEngine } from "../engine/BabylonEditorEngine";
-import type { EditorEngineCallbacks, EditorTool, PrimitiveKind } from "../types/editor";
+import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind } from "../types/editor";
 
 interface ViewportCanvasProps {
   callbacks: EditorEngineCallbacks;
   tool: EditorTool;
   performanceMode: boolean;
+  previewMode: boolean;
   onEngineReady: (engine: BabylonEditorEngine | null) => void;
+  onDropAsset: (assetId: string, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
+  onDropFiles: (files: FileList, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
 }
 
 /** 中央视口承载 Babylon canvas，并处理文件拖拽和内置资产拖拽。 */
-export function ViewportCanvas({ callbacks, tool, performanceMode, onEngineReady }: ViewportCanvasProps) {
+export function ViewportCanvas({
+  callbacks,
+  tool,
+  performanceMode,
+  previewMode,
+  onEngineReady,
+  onDropAsset,
+  onDropFiles
+}: ViewportCanvasProps) {
+  const shellRef = useRef<HTMLElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<BabylonEditorEngine | null>(null);
 
@@ -22,8 +35,20 @@ export function ViewportCanvas({ callbacks, tool, performanceMode, onEngineReady
     const editorEngine = new BabylonEditorEngine(canvasRef.current, callbacks);
     engineRef.current = editorEngine;
     onEngineReady(editorEngine);
+    const resizeFrame = window.requestAnimationFrame(() => editorEngine.resize());
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(() => {
+            editorEngine.resize();
+          });
+    if (shellRef.current) {
+      resizeObserver?.observe(shellRef.current);
+    }
 
     return () => {
+      window.cancelAnimationFrame(resizeFrame);
+      resizeObserver?.disconnect();
       editorEngine.dispose();
       engineRef.current = null;
       onEngineReady(null);
@@ -37,6 +62,10 @@ export function ViewportCanvas({ callbacks, tool, performanceMode, onEngineReady
   useEffect(() => {
     engineRef.current?.setPerformanceMode(performanceMode);
   }, [performanceMode]);
+
+  useEffect(() => {
+    engineRef.current?.setPreviewMode(previewMode);
+  }, [previewMode]);
 
   /** 允许浏览器把文件或内置对象拖放到视口。 */
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
@@ -59,19 +88,31 @@ export function ViewportCanvas({ callbacks, tool, performanceMode, onEngineReady
       return;
     }
 
+    const poi = event.dataTransfer.getData("application/x-editor-poi");
+    if (isPoiKind(poi)) {
+      engine.addPoi(poi, point);
+      return;
+    }
+
+    const assetId = event.dataTransfer.getData("application/x-editor-asset");
+    if (assetId) {
+      void onDropAsset(assetId, point, engine);
+      return;
+    }
+
     if (event.dataTransfer.files.length) {
-      void engine.importFiles(event.dataTransfer.files, point);
+      void onDropFiles(event.dataTransfer.files, point, engine);
     }
   };
 
   return (
-    <main className="viewport-shell" onDragOver={handleDragOver} onDrop={handleDrop}>
+    <main ref={shellRef} className="viewport-shell" onDragOver={handleDragOver} onDrop={handleDrop}>
       <canvas ref={canvasRef} className="viewport-canvas" />
-      <div className="viewport-corner">
-        <span>X</span>
-        <span>Y</span>
-        <span>Z</span>
-      </div>
     </main>
   );
+}
+
+/** 校验拖拽中的 POI 类型，避免外部拖拽伪造 payload 导致引擎创建异常。 */
+function isPoiKind(value: string): value is PoiKind {
+  return ["marker", "info", "warning", "camera", "device", "label"].includes(value);
 }

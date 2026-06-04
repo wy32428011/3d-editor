@@ -17,6 +17,10 @@ contextBridge.exposeInMainWorld("electronApp", {
     loadScene: (projectPath: string, sceneId: string) => ipcRenderer.invoke("projects:loadScene", projectPath, sceneId),
     createScene: (projectPath: string, name: string) => ipcRenderer.invoke("projects:createScene", projectPath, name),
     saveScene: (projectPath: string, sceneId: string, babylonScene: unknown) =>
-      ipcRenderer.invoke("projects:saveScene", projectPath, sceneId, babylonScene)
+      ipcRenderer.invoke("projects:saveScene", projectPath, sceneId, babylonScene),
+    saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) =>
+      ipcRenderer.invoke("projects:saveAssetFile", projectPath, assetId, fileName, data),
+    loadAssetFile: (projectPath: string, projectFile: string) => ipcRenderer.invoke("projects:loadAssetFile", projectPath, projectFile),
+    importModelPackage: (projectPath: string) => ipcRenderer.invoke("projects:importModelPackage", projectPath)
   }
 });

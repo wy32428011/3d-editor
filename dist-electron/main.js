@@ -12,10 +12,31 @@ const rendererDist = path.join(__dirname, "../dist");
 const preloadPath = path.join(__dirname, "preload.js");
 const projectMetaDir = ".babylon-editor";
 const projectManifestName = "project.json";
+const projectAssetsDirName = "assets";
+const projectAssetSourceDirName = "source";
 const appStateName = "app-state.json";
 const sceneBackupDirName = ".backups";
 const maxSceneBackupsPerScene = 10;
+const modelPackageMaxFiles = 200;
+const modelPackageMaxTextFileBytes = 2 * 1024 * 1024;
+const modelPackageMaxReturnedTextBytes = 8 * 1024 * 1024;
+const modelPackageMaxTotalBytes = 1024 * 1024 * 1024;
+const modelPackageAllowedExtensions = new Set([
+    ".glb",
+    ".gltf",
+    ".bin",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".ktx",
+    ".ktx2",
+    ".ts",
+    ".json",
+    ".js"
+]);
 let mainWindow = null;
+const authorizedProjectPaths = new Set();
 /** 判断未知值是否为普通对象，便于安全读取磁盘 JSON 字段。 */
 function isRecord(value) {
     return typeof value === "object" && value !== null;
@@ -31,6 +52,29 @@ function isMissingPathError(error) {
 /** 把异常转成面向用户的简短文本，保留底层错误线索。 */
 function formatUnknownError(error) {
     return error instanceof Error ? error.message : String(error);
+}
+/** 只允许 Electron 打开常见安全外链协议，避免自定义协议被误触发。 */
+function isSafeExternalUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === "https:" || parsed.protocol === "http:" || parsed.protocol === "mailto:";
+    }
+    catch {
+        return false;
+    }
+}
+/** 判断导航目标是否仍属于当前应用入口。 */
+function isAllowedAppNavigation(url) {
+    if (isDevelopment) {
+        return url.startsWith(rendererUrl);
+    }
+    try {
+        const targetPath = fileURLToPath(url);
+        return path.resolve(targetPath) === path.resolve(path.join(rendererDist, "index.html"));
+    }
+    catch {
+        return false;
+    }
 }
 /** 创建主编辑器窗口，并按开发/生产环境加载不同渲染入口。 */
 async function createMainWindow() {
@@ -57,14 +101,17 @@ async function createMainWindow() {
         }
     });
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-        void shell.openExternal(url);
+        if (isSafeExternalUrl(url)) {
+            void shell.openExternal(url);
+        }
         return { action: "deny" };
     });
     mainWindow.webContents.on("will-navigate", (event, url) => {
-        const isLocalFile = url.startsWith("file://");
-        const isDevServer = isDevelopment && url.startsWith(rendererUrl);
-        if (!isLocalFile && !isDevServer) {
-            event.preventDefault();
+        if (isAllowedAppNavigation(url)) {
+            return;
+        }
+        event.preventDefault();
+        if (isSafeExternalUrl(url)) {
             void shell.openExternal(url);
         }
     });
@@ -107,13 +154,111 @@ function toFileSlug(input, fallback) {
     const slug = sanitizeName(input, fallback).replace(/\s+/g, "-").replace(/-+/g, "-");
     return slug || fallback;
 }
+/** 规范化项目路径，用作主进程内部授权表的键。 */
+function normalizeProjectPath(projectPath) {
+    return path.resolve(projectPath).toLowerCase();
+}
+/** 记录由用户选择或最近项目列表授权过的项目路径。 */
+function authorizeProjectPath(projectPath) {
+    authorizedProjectPaths.add(normalizeProjectPath(projectPath));
+}
+/** 限制 renderer 只能操作主进程已授权的项目目录。 */
+function assertAuthorizedProjectPath(projectPath) {
+    if (!authorizedProjectPaths.has(normalizeProjectPath(projectPath))) {
+        throw new Error("项目路径未授权，请先通过启动页打开项目。");
+    }
+}
 /** 返回项目清单文件路径。 */
 function getProjectManifestPath(projectPath) {
     return path.join(projectPath, projectMetaDir, projectManifestName);
 }
-/** 返回场景文件绝对路径。 */
+/** 返回场景文件绝对路径，并限制场景只能位于项目 scenes 目录内。 */
 function getScenePath(projectPath, scene) {
-    return path.join(projectPath, scene.file);
+    if (path.isAbsolute(scene.file) || scene.file.includes("\0") || !scene.file.endsWith(".scene.json")) {
+        throw new Error("场景文件路径无效。");
+    }
+    const scenesRoot = path.resolve(projectPath, "scenes");
+    const scenePath = resolveProjectRelativePath(projectPath, scene.file);
+    if (scenePath !== scenesRoot && !scenePath.startsWith(`${scenesRoot}${path.sep}`)) {
+        throw new Error("场景文件只能位于 scenes 目录内。");
+    }
+    return scenePath;
+}
+/** 返回经过 symlink 防护的场景文件路径。 */
+async function getSafeScenePath(projectPath, scene) {
+    const scenePath = getScenePath(projectPath, scene);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, "scenes"), scenePath);
+    return scenePath;
+}
+/** 确认项目相对路径解析后仍在项目目录内部，避免 IPC 路径越界。 */
+function resolveProjectRelativePath(projectPath, relativePath) {
+    const projectRoot = path.resolve(projectPath);
+    const targetPath = path.resolve(projectRoot, relativePath);
+    if (targetPath !== projectRoot && !targetPath.startsWith(`${projectRoot}${path.sep}`)) {
+        throw new Error("项目路径越界，已拒绝访问。");
+    }
+    return targetPath;
+}
+/** 返回项目资产文件路径，并限制资产只能位于 assets 目录内。 */
+function getProjectAssetPath(projectPath, projectFile) {
+    const assetRoot = path.resolve(projectPath, projectAssetsDirName);
+    const assetPath = resolveProjectRelativePath(projectPath, projectFile);
+    if (assetPath !== assetRoot && !assetPath.startsWith(`${assetRoot}${path.sep}`)) {
+        throw new Error("项目资产只能保存在 assets 目录内。");
+    }
+    return assetPath;
+}
+/** 检查已存在的路径层级中没有符号链接，避免项目资产读写经 symlink 逃逸。 */
+async function assertNoSymlinkInExistingPath(rootPath, targetPath) {
+    const root = path.resolve(rootPath);
+    const target = path.resolve(targetPath);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+        throw new Error("路径越界，已拒绝访问。");
+    }
+    try {
+        const rootStats = await fs.lstat(root);
+        if (rootStats.isSymbolicLink()) {
+            throw new Error("项目资产路径包含符号链接，已拒绝访问。");
+        }
+    }
+    catch (error) {
+        if (!isMissingPathError(error)) {
+            throw error;
+        }
+    }
+    const relativeParts = path.relative(root, target).split(path.sep).filter(Boolean);
+    let current = root;
+    for (const part of relativeParts) {
+        current = path.join(current, part);
+        try {
+            const stats = await fs.lstat(current);
+            if (stats.isSymbolicLink()) {
+                throw new Error("项目资产路径包含符号链接，已拒绝访问。");
+            }
+        }
+        catch (error) {
+            if (isMissingPathError(error)) {
+                return;
+            }
+            throw error;
+        }
+    }
+}
+/** 把 IPC 传入的二进制数据转成 Buffer，避免用 base64 复制大模型内容。 */
+function toBuffer(data) {
+    if (data instanceof ArrayBuffer) {
+        return Buffer.from(data);
+    }
+    if (ArrayBuffer.isView(data)) {
+        return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    }
+    throw new Error("资产文件数据格式无效。");
+}
+/** 从 Buffer 中切出精确 ArrayBuffer，避免返回底层池化缓冲区的多余字节。 */
+function toExactArrayBuffer(buffer) {
+    const arrayBuffer = new ArrayBuffer(buffer.byteLength);
+    new Uint8Array(arrayBuffer).set(buffer);
+    return arrayBuffer;
 }
 /** 判断指定路径是否存在，非缺失类错误继续抛出给调用方处理。 */
 async function pathExists(targetPath) {
@@ -221,6 +366,7 @@ async function writeProjectManifest(manifest) {
 }
 /** 把项目加入最近列表，自动去重并限制数量。 */
 async function rememberProject(manifest) {
+    authorizeProjectPath(manifest.path);
     const state = await readAppState();
     const recent = {
         id: manifest.id,
@@ -247,13 +393,14 @@ async function createSceneFile(projectPath, name) {
         scene,
         babylonScene: null
     };
-    await fs.mkdir(path.dirname(getScenePath(projectPath, scene)), { recursive: true });
-    await fs.writeFile(getScenePath(projectPath, scene), `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
+    const scenePath = await getSafeScenePath(projectPath, scene);
+    await fs.mkdir(path.dirname(scenePath), { recursive: true });
+    await fs.writeFile(scenePath, `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
     return scene;
 }
 /** 读取单个场景文件，并以项目清单中的路径为准修正场景记录。 */
 async function readSceneFile(projectPath, scene) {
-    const content = await fs.readFile(getScenePath(projectPath, scene), "utf-8");
+    const content = await fs.readFile(await getSafeScenePath(projectPath, scene), "utf-8");
     const parsed = JSON.parse(content);
     const fileScene = parsed.scene?.id === scene.id ? parsed.scene : scene;
     return {
@@ -358,16 +505,202 @@ async function pruneSceneBackups(backupDir, filePrefix) {
 }
 /** 保存覆盖前复制旧场景文件，为误保存或加载失败后的恢复留出回退点。 */
 async function backupSceneFile(projectPath, scene) {
-    const scenePath = getScenePath(projectPath, scene);
+    const scenePath = await getSafeScenePath(projectPath, scene);
     if (!(await pathExists(scenePath))) {
         return;
     }
     const sceneBaseName = path.basename(scene.file, ".scene.json");
     const backupDir = path.join(path.dirname(scenePath), sceneBackupDirName);
     const backupPath = path.join(backupDir, `${sceneBaseName}-${toBackupTimestamp(new Date())}.scene.json`);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, "scenes"), backupPath);
     await fs.mkdir(backupDir, { recursive: true });
     await fs.copyFile(scenePath, backupPath);
     await pruneSceneBackups(backupDir, `${sceneBaseName}-`);
+}
+/** 把渲染端导入的资产文件保存到项目 assets/source 目录，并返回项目相对路径。 */
+async function saveProjectAssetFile(projectPath, assetId, fileName, data) {
+    await readProjectManifest(projectPath);
+    const safeAssetId = toFileSlug(assetId, "asset");
+    const safeName = sanitizeName(path.basename(fileName), "asset");
+    const projectFile = path
+        .join(projectAssetsDirName, projectAssetSourceDirName, safeAssetId, safeName)
+        .replace(/\\/g, "/");
+    const assetPath = getProjectAssetPath(projectPath, projectFile);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
+    await fs.mkdir(path.dirname(assetPath), { recursive: true });
+    await fs.writeFile(assetPath, toBuffer(data));
+    return projectFile;
+}
+/** 读取项目内持久化资产文件，供渲染端重新构造 File 并继续实例化。 */
+async function loadProjectAssetFile(projectPath, projectFile) {
+    await readProjectManifest(projectPath);
+    const assetPath = getProjectAssetPath(projectPath, projectFile);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
+    const [buffer, stats] = await Promise.all([fs.readFile(assetPath), fs.stat(assetPath)]);
+    return {
+        data: toExactArrayBuffer(buffer),
+        lastModified: stats.mtimeMs
+    };
+}
+/** 判断模型包文件扩展名是否允许复制到项目资产目录。 */
+function isModelPackageAllowedFile(filePath) {
+    return modelPackageAllowedExtensions.has(path.extname(filePath).toLowerCase());
+}
+/** 判断模型包中的文本文件是否需要返回内容给渲染端解析。 */
+function isModelPackageTextFile(relativePath) {
+    const lowerName = path.basename(relativePath).toLowerCase();
+    return path.extname(relativePath).toLowerCase() === ".ts" || lowerName === "meta.json" || lowerName === "meta.js";
+}
+/** 按文件扩展名和主模型路径推断模型包文件角色。 */
+function getModelPackageFileRole(relativePath, primaryModelFile) {
+    const extension = path.extname(relativePath).toLowerCase();
+    const lowerName = path.basename(relativePath).toLowerCase();
+    if (relativePath === primaryModelFile) {
+        return "primaryModel";
+    }
+    if (extension === ".glb" || extension === ".gltf" || extension === ".bin") {
+        return "modelDependency";
+    }
+    if (extension === ".ts") {
+        return "script";
+    }
+    if (lowerName === "meta.json" || lowerName === "meta.js") {
+        return "meta";
+    }
+    if ([".png", ".jpg", ".jpeg", ".webp", ".ktx", ".ktx2"].includes(extension)) {
+        return "texture";
+    }
+    return "other";
+}
+/** 递归读取模型包目录，拒绝符号链接并限制文件数量。 */
+async function readModelPackageDirectory(sourceRoot) {
+    const entries = await fs.readdir(sourceRoot, { withFileTypes: true });
+    const files = [];
+    for (const entry of entries) {
+        if (entry.isSymbolicLink()) {
+            throw new Error(`模型包不支持符号链接：${entry.name}`);
+        }
+        const entryPath = path.join(sourceRoot, entry.name);
+        if (entry.isDirectory()) {
+            files.push(...(await readModelPackageDirectory(entryPath)));
+            continue;
+        }
+        if (entry.isFile()) {
+            files.push(entryPath);
+        }
+    }
+    if (files.length > modelPackageMaxFiles) {
+        throw new Error(`模型包文件数量超过 ${modelPackageMaxFiles} 个，请精简后再导入。`);
+    }
+    return files;
+}
+/** 复制模型包内单个文件到项目 assets/source/<packageId> 下，并返回项目相对路径。 */
+async function copyModelPackageFileToProject(projectPath, packageId, sourceRoot, absoluteFilePath) {
+    const relativePath = path.relative(sourceRoot, absoluteFilePath).replace(/\\/g, "/");
+    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath) || relativePath.includes("\0")) {
+        throw new Error(`模型包文件路径不安全：${relativePath}`);
+    }
+    if (!isModelPackageAllowedFile(relativePath)) {
+        throw new Error(`模型包包含不支持的文件类型：${relativePath}`);
+    }
+    const sourceStats = await fs.lstat(absoluteFilePath);
+    if (!sourceStats.isFile() || sourceStats.isSymbolicLink()) {
+        throw new Error(`模型包文件不是普通文件：${relativePath}`);
+    }
+    const projectFile = path
+        .join(projectAssetsDirName, projectAssetSourceDirName, packageId, relativePath)
+        .replace(/\\/g, "/");
+    const assetPath = getProjectAssetPath(projectPath, projectFile);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
+    await fs.mkdir(path.dirname(assetPath), { recursive: true });
+    await fs.copyFile(absoluteFilePath, assetPath);
+    const stats = await fs.stat(assetPath);
+    return {
+        relativePath,
+        projectFile,
+        size: stats.size,
+        lastModified: stats.mtimeMs
+    };
+}
+/** 扫描、校验并复制文件夹模型包，返回渲染端构建 manifest 所需的轻量信息。 */
+async function importModelPackageDirectory(projectPath, sourceRoot) {
+    await readProjectManifest(projectPath);
+    const absoluteFiles = await readModelPackageDirectory(sourceRoot);
+    const relativeFiles = absoluteFiles.map((file) => path.relative(sourceRoot, file).replace(/\\/g, "/")).sort((left, right) => left.localeCompare(right));
+    const allowedFiles = relativeFiles.filter(isModelPackageAllowedFile);
+    const warnings = relativeFiles
+        .filter((file) => !isModelPackageAllowedFile(file))
+        .map((file) => `已忽略不支持的模型包文件：${file}`);
+    let totalBytes = 0;
+    for (const relativePath of allowedFiles) {
+        const stats = await fs.stat(path.join(sourceRoot, relativePath));
+        totalBytes += stats.size;
+        if (totalBytes > modelPackageMaxTotalBytes) {
+            throw new Error("模型包总大小超过 1GB，请精简后再导入。");
+        }
+    }
+    const glbFiles = allowedFiles.filter((file) => path.extname(file).toLowerCase() === ".glb");
+    const tsFiles = allowedFiles.filter((file) => path.extname(file).toLowerCase() === ".ts");
+    const metaFiles = allowedFiles.filter((file) => ["meta.json", "meta.js"].includes(path.basename(file).toLowerCase()));
+    if (glbFiles.length === 0) {
+        throw new Error("模型包必须包含至少一个 .glb 文件。");
+    }
+    if (glbFiles.length > 1) {
+        throw new Error("模型包包含多个 .glb 文件，当前版本需要包内只有一个主 GLB。");
+    }
+    if (tsFiles.length === 0) {
+        throw new Error("模型包必须包含至少一个 .ts 参数脚本。");
+    }
+    if (tsFiles.length > 1) {
+        warnings.push("模型包包含多个 .ts 脚本，已全部复制；属性栏会优先按 meta.json 或 .params.ts 解析参数脚本。");
+    }
+    if (metaFiles.length === 0) {
+        throw new Error("模型包必须包含 meta.json 或 meta.js。");
+    }
+    if (metaFiles.length > 1) {
+        warnings.push(`模型包包含多个 meta 文件，当前版本使用 ${metaFiles.includes("meta.json") ? "meta.json" : metaFiles[0]}。`);
+    }
+    const primaryModelFile = glbFiles[0];
+    const scriptFile = tsFiles[0];
+    const metaFile = metaFiles.includes("meta.json") ? "meta.json" : metaFiles[0];
+    const packageId = `${Date.now()}-${toFileSlug(path.basename(sourceRoot), "model-package")}`;
+    const projectFiles = [];
+    const textFiles = {};
+    let returnedTextBytes = 0;
+    for (const relativePath of allowedFiles) {
+        const copied = await copyModelPackageFileToProject(projectPath, packageId, sourceRoot, path.join(sourceRoot, relativePath));
+        projectFiles.push({
+            ...copied,
+            role: getModelPackageFileRole(copied.relativePath, primaryModelFile)
+        });
+        if (isModelPackageTextFile(relativePath)) {
+            if (copied.size > modelPackageMaxTextFileBytes) {
+                warnings.push(`${relativePath} 超过 2MB，已复制但未返回文本内容。`);
+                continue;
+            }
+            if (returnedTextBytes + copied.size > modelPackageMaxReturnedTextBytes) {
+                warnings.push(`${relativePath} 会超过模型包文本返回上限，已复制但未返回文本内容。`);
+                continue;
+            }
+            const text = await fs.readFile(getProjectAssetPath(projectPath, copied.projectFile), "utf-8");
+            returnedTextBytes += Buffer.byteLength(text, "utf-8");
+            textFiles[relativePath] = text;
+        }
+    }
+    if (metaFile.toLowerCase() === "meta.js") {
+        warnings.push("meta.js 已复制到项目中，但当前版本不会执行 JavaScript 元数据文件。");
+    }
+    return {
+        packageId,
+        displayName: path.basename(sourceRoot),
+        rootDirectoryName: path.basename(sourceRoot),
+        primaryModelFile,
+        scriptFile,
+        metaFile,
+        projectFiles,
+        textFiles,
+        warnings
+    };
 }
 /** 注册项目制应用需要的 IPC，渲染端只能调用受控方法。 */
 function registerProjectIpc() {
@@ -408,9 +741,15 @@ function registerProjectIpc() {
         return openProjectDirectory(result.filePaths[0]);
     });
     ipcMain.handle("projects:openRecent", async (_event, projectPath) => {
+        const state = await readAppState();
+        const knownProject = state.recentProjects.some((item) => normalizeProjectPath(item.path) === normalizeProjectPath(projectPath));
+        if (!knownProject) {
+            throw new Error("最近项目路径未授权，请通过“打开项目”重新选择目录。");
+        }
         return openProjectDirectory(projectPath);
     });
     ipcMain.handle("projects:loadScene", async (_event, projectPath, sceneId) => {
+        assertAuthorizedProjectPath(projectPath);
         const manifest = await readProjectManifest(projectPath);
         const scene = manifest.scenes.find((item) => item.id === sceneId);
         if (!scene) {
@@ -429,6 +768,7 @@ function registerProjectIpc() {
         };
     });
     ipcMain.handle("projects:createScene", async (_event, projectPath, rawName) => {
+        assertAuthorizedProjectPath(projectPath);
         const manifest = await readProjectManifest(projectPath);
         const scene = await createSceneFile(projectPath, sanitizeName(rawName, "New Scene"));
         manifest.scenes = [...manifest.scenes, scene];
@@ -439,6 +779,7 @@ function registerProjectIpc() {
         return manifest;
     });
     ipcMain.handle("projects:saveScene", async (_event, projectPath, sceneId, babylonScene) => {
+        assertAuthorizedProjectPath(projectPath);
         const manifest = await readProjectManifest(projectPath);
         const scene = manifest.scenes.find((item) => item.id === sceneId);
         if (!scene) {
@@ -451,13 +792,34 @@ function registerProjectIpc() {
             babylonScene
         };
         await backupSceneFile(projectPath, scene);
-        await fs.writeFile(getScenePath(projectPath, updatedScene), `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
+        await fs.writeFile(await getSafeScenePath(projectPath, updatedScene), `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
         manifest.scenes = manifest.scenes.map((item) => (item.id === sceneId ? updatedScene : item));
         manifest.activeSceneId = sceneId;
         manifest.updatedAt = updatedScene.updatedAt;
         await writeProjectManifest(manifest);
         await rememberProject(manifest);
         return manifest;
+    });
+    ipcMain.handle("projects:saveAssetFile", async (_event, projectPath, assetId, fileName, data) => {
+        assertAuthorizedProjectPath(projectPath);
+        return saveProjectAssetFile(projectPath, assetId, fileName, data);
+    });
+    ipcMain.handle("projects:loadAssetFile", async (_event, projectPath, projectFile) => {
+        assertAuthorizedProjectPath(projectPath);
+        return loadProjectAssetFile(projectPath, projectFile);
+    });
+    ipcMain.handle("projects:importModelPackage", async (_event, projectPath) => {
+        assertAuthorizedProjectPath(projectPath);
+        const options = {
+            title: "选择模型包文件夹",
+            defaultPath: path.join(os.homedir(), "Documents"),
+            properties: ["openDirectory"]
+        };
+        const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+        if (result.canceled || !result.filePaths[0]) {
+            return null;
+        }
+        return importModelPackageDirectory(projectPath, result.filePaths[0]);
     });
 }
 /** 注册 Electron 生命周期，兼容 Windows/Linux 退出和 macOS 激活行为。 */

@@ -6,17 +6,31 @@ import { InspectorPanel } from "./components/InspectorPanel";
 import { ProjectLauncher } from "./components/ProjectLauncher";
 import { Toolbar } from "./components/Toolbar";
 import { ViewportCanvas } from "./components/ViewportCanvas";
-import type { BabylonEditorEngine } from "./engine/BabylonEditorEngine";
+import { parseModelPackageDecorators } from "./editor/modelPackageDecorators";
+import { DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS } from "./editor/modelPackageRuntime";
+import { DEFAULT_SCENE_ENVIRONMENT_COLOR, type BabylonEditorEngine } from "./engine/BabylonEditorEngine";
 import type {
   AssetRecord,
   EditorEngineCallbacks,
   EditorStats,
   EditorTool,
+  ModelPackageManifest,
+  ModelPackageProjectFile,
   PrimitiveKind,
   SceneNodeSummary,
   TransformSnapshot,
   TransformUpdate
 } from "./types/editor";
+
+interface PersistedProjectAssetFiles {
+  projectFiles: Map<File, string>;
+  failedFiles: Set<File>;
+}
+
+interface ModelPackageRuntimeScriptSelection {
+  scriptFile?: string;
+  className: string;
+}
 
 const initialStats: EditorStats = {
   fps: 0,
@@ -39,6 +53,228 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+/** 根据文件名推断基础 MIME，供从项目资产恢复 File 对象时使用。 */
+function getProjectAssetMimeType(fileName: string): string {
+  const extension = fileName.slice(fileName.lastIndexOf(".")).toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    ".babylon": "application/json",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".ktx": "image/ktx",
+    ".ktx2": "image/ktx2",
+    ".obj": "model/obj",
+    ".png": "image/png",
+    ".stl": "model/stl",
+    ".webp": "image/webp"
+  };
+  return mimeTypes[extension] ?? "application/octet-stream";
+}
+
+/** 生成与 Babylon 引擎一致的资产编号，便于项目资产文件和资产记录互相定位。 */
+function getFileAssetId(file: File): string {
+  return `${file.name}-${file.size}-${file.lastModified}`;
+}
+
+/** 从项目相对路径中取回文件名，恢复 glTF/OBJ 依赖时必须保留原始文件名。 */
+function getProjectFileName(projectFile: string): string {
+  return projectFile.split(/[\\/]/).pop() || "asset";
+}
+
+/** 合并主源文件和同批依赖文件路径，避免场景元数据中重复记录。 */
+function getAssetProjectFiles(asset: AssetRecord): string[] {
+  return [...new Set([asset.projectFile, ...(asset.projectFiles ?? [])].filter((file): file is string => Boolean(file)))];
+}
+
+/** 将 Electron 返回的模型包文件记录转换成编辑器 manifest 文件记录。 */
+function mapModelPackageFiles(files: DesktopModelPackageProjectFile[]): ModelPackageProjectFile[] {
+  return files.map((file) => ({
+    relativePath: file.relativePath,
+    projectFile: file.projectFile,
+    role: file.role,
+    size: file.size,
+    lastModified: file.lastModified
+  }));
+}
+
+/** 安全解析 meta.json；meta.js 当前只复制保存，不执行。 */
+function parseModelPackageMeta(metaFile: string | undefined, textFiles: Record<string, string>, warnings: string[]): unknown {
+  if (!metaFile || !metaFile.toLowerCase().endsWith(".json")) {
+    return undefined;
+  }
+
+  const text = textFiles[metaFile];
+  if (!text) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    warnings.push(`${metaFile} 不是合法 JSON，已忽略 meta 内容。`);
+    return undefined;
+  }
+}
+
+/** 将未知 JSON 值安全收敛为普通对象，避免损坏 meta 影响模型包导入。 */
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+/** 根据模型包内部相对路径构建规范化索引，用于兼容 ./ 和 Windows 反斜杠。 */
+function createModelPackageRelativePathMap(paths: string[]): Map<string, string> {
+  return new Map(paths.map((file) => [normalizeModelPackageRelativePath(file), file]));
+}
+
+/** 从 meta.json 中读取参数脚本文件名，当前优先兼容 parameterScripts[0].scriptFilename。 */
+function getMetaParameterScriptFile(meta: unknown, textFiles: Record<string, string>, warnings: string[]): string | undefined {
+  const parameterScripts = asRecord(meta).parameterScripts;
+  if (!Array.isArray(parameterScripts)) {
+    return undefined;
+  }
+
+  const textFileMap = createModelPackageRelativePathMap(Object.keys(textFiles));
+  for (const script of parameterScripts) {
+    const scriptFile = asRecord(script).scriptFilename;
+    if (typeof scriptFile !== "string" || scriptFile.trim().length === 0) {
+      continue;
+    }
+
+    const matchedFile = textFileMap.get(normalizeModelPackageRelativePath(scriptFile));
+    if (matchedFile) {
+      return matchedFile;
+    }
+
+    warnings.push(`meta.json 声明的参数脚本 ${scriptFile} 不在模型包文本文件中，已继续查找下一个参数脚本。`);
+  }
+
+  return undefined;
+}
+
+/** 从 meta.json 中读取运行脚本文件名和类名，默认兼容 ParametricModelRuntimeComponent。 */
+function getMetaRuntimeScript(
+  meta: unknown,
+  availableFiles: string[],
+  fallbackScriptFile: string | undefined,
+  warnings: string[]
+): ModelPackageRuntimeScriptSelection {
+  const animationScripts = asRecord(meta).animationScripts;
+  const fileMap = createModelPackageRelativePathMap(availableFiles);
+  if (Array.isArray(animationScripts)) {
+    for (const script of animationScripts) {
+      const scriptRecord = asRecord(script);
+      const scriptFile = scriptRecord.scriptFilename;
+      const className =
+        typeof scriptRecord.className === "string" && scriptRecord.className.trim().length > 0
+          ? scriptRecord.className.trim()
+          : DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS;
+      if (typeof scriptFile !== "string" || scriptFile.trim().length === 0) {
+        continue;
+      }
+
+      const matchedFile = fileMap.get(normalizeModelPackageRelativePath(scriptFile));
+      if (matchedFile) {
+        return { scriptFile: matchedFile, className };
+      }
+
+      warnings.push(`meta.json 声明的运行脚本 ${scriptFile} 不在模型包文件中，已继续查找下一个运行脚本。`);
+    }
+  }
+
+  return {
+    scriptFile: fallbackScriptFile,
+    className: DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS
+  };
+}
+
+/** 规范化模型包内部相对路径，兼容 meta 中的 ./ 前缀和 Windows 反斜杠。 */
+function normalizeModelPackageRelativePath(filePath: string): string {
+  return filePath.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+}
+
+/** 选择用于右侧属性栏解析的参数脚本，避免多个 .ts 时误选运行脚本。 */
+function chooseModelPackageParameterScriptFile(
+  meta: unknown,
+  textFiles: Record<string, string>,
+  fallbackScriptFile: string | undefined,
+  warnings: string[]
+): string | undefined {
+  const metaScriptFile = getMetaParameterScriptFile(meta, textFiles, warnings);
+  if (metaScriptFile) {
+    return metaScriptFile;
+  }
+
+  const tsFiles = Object.keys(textFiles)
+    .filter((file) => file.toLowerCase().endsWith(".ts"))
+    .sort((left, right) => left.localeCompare(right));
+  const paramsFiles = tsFiles.filter((file) => file.toLowerCase().endsWith(".params.ts"));
+  if (paramsFiles.length > 0) {
+    if (paramsFiles.length > 1) {
+      warnings.push(`模型包包含多个 .params.ts 参数脚本，当前版本使用 ${paramsFiles[0]}。`);
+    }
+    return paramsFiles[0];
+  }
+
+  if (fallbackScriptFile && textFiles[fallbackScriptFile] !== undefined) {
+    return fallbackScriptFile;
+  }
+
+  if (tsFiles.length === 1) {
+    return tsFiles[0];
+  }
+
+  warnings.push("模型包包含多个 .ts 脚本，但未找到 meta.json 声明的有效参数脚本或 .params.ts 文件，已跳过动态参数解析。");
+  return undefined;
+}
+
+/** 从项目资产目录轻量恢复模型包脚本文本，避免打开项目时强制加载大 GLB。 */
+async function restoreModelPackageScriptTextsFromProject(projectPath: string, targetEngine: BabylonEditorEngine): Promise<string[]> {
+  if (!window.electronApp?.projects.loadAssetFile) {
+    return [];
+  }
+
+  const warnings: string[] = [];
+  const decoder = new TextDecoder("utf-8");
+  for (const asset of targetEngine.getAssetsSnapshot()) {
+    const manifest = asset.modelPackage;
+    if (!manifest) {
+      continue;
+    }
+
+    const scriptFiles = manifest.files.filter((file) => file.role === "script");
+    const requiredPaths = new Set(
+      [manifest.scriptFile, manifest.runtimeScriptFile, ...scriptFiles.map((file) => file.relativePath)].filter(
+        (file): file is string => Boolean(file)
+      )
+    );
+    const scriptFileMap = createModelPackageRelativePathMap(scriptFiles.map((file) => file.relativePath));
+    const texts: Record<string, string> = {};
+
+    for (const requiredPath of requiredPaths) {
+      const matchedRelativePath = scriptFileMap.get(normalizeModelPackageRelativePath(requiredPath));
+      const projectFileRecord = scriptFiles.find((file) => file.relativePath === matchedRelativePath);
+      if (!projectFileRecord) {
+        warnings.push(`模型包 ${manifest.displayName} 缺少脚本文件记录：${requiredPath}`);
+        continue;
+      }
+
+      try {
+        const payload = await window.electronApp.projects.loadAssetFile(projectPath, projectFileRecord.projectFile);
+        texts[projectFileRecord.relativePath] = decoder.decode(payload.data);
+      } catch (error) {
+        warnings.push(getErrorMessage(error, `模型包 ${manifest.displayName} 脚本 ${projectFileRecord.relativePath} 读取失败。`));
+      }
+    }
+
+    if (Object.keys(texts).length > 0) {
+      targetEngine.registerModelPackageScriptTexts(manifest.packageId, texts);
+    }
+  }
+
+  return warnings;
+}
+
 /** 编辑器根组件，负责连接 React 面板状态和 Babylon 引擎实例。 */
 export function App() {
   const [engine, setEngine] = useState<BabylonEditorEngine | null>(null);
@@ -49,6 +285,7 @@ export function App() {
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [stats, setStats] = useState<EditorStats>(initialStats);
   const [performanceMode, setPerformanceMode] = useState(false);
+  const [previewMode, setPreviewMode] = useState(false);
   const [recentProjects, setRecentProjects] = useState<RecentProjectRecord[]>([]);
   const [activeProject, setActiveProject] = useState<DesktopProjectRecord | null>(null);
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
@@ -57,9 +294,17 @@ export function App() {
   const [sceneLoadFailed, setSceneLoadFailed] = useState(false);
   const [sceneDialogOpen, setSceneDialogOpen] = useState(false);
   const [sceneName, setSceneName] = useState("New Scene");
+  const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
 
   const activeScene = activeProject?.scenes.find((scene) => scene.id === activeSceneId) ?? activeProject?.scenes[0] ?? null;
-  const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed));
+  const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed || previewMode));
+  const saveDisabledReason = previewMode
+    ? "停止预览后才能保存场景"
+    : sceneLoading
+      ? "场景读取完成后才能保存"
+      : sceneLoadFailed
+        ? "当前场景加载失败，已阻止保存"
+        : undefined;
 
   const callbacks: EditorEngineCallbacks = useMemo(
     () => ({
@@ -88,11 +333,17 @@ export function App() {
 
   /** 激活项目并同步默认场景选择。 */
   const activateProject = useCallback((project: DesktopProjectRecord | null) => {
+    setPreviewMode(false);
     setActiveProject(project);
     setActiveSceneId(project?.activeSceneId ?? project?.scenes[0]?.id ?? null);
     setProjectError(null);
     setSceneLoadFailed(false);
   }, []);
+
+  /** 切换项目场景时退出预览，避免旧场景动画状态泄漏到新场景。 */
+  useEffect(() => {
+    setPreviewMode(false);
+  }, [activeProject?.path, activeSceneId]);
 
   /** 创建新项目，实际目录选择由 Electron 主进程文件对话框完成。 */
   const handleCreateProject = useCallback(
@@ -140,11 +391,18 @@ export function App() {
     [activateProject, refreshRecentProjects]
   );
 
-  /** 缓存 Babylon 引擎实例，并记录它对应的场景，避免异步加载写入旧视口。 */
+  /** 缓存 Babylon 引擎实例，并记录它对应的场景；引擎释放时同步清空旧 UI 快照。 */
   const handleEngineReady = useCallback(
     (nextEngine: BabylonEditorEngine | null) => {
       setEngine(nextEngine);
       setEngineSceneId(nextEngine ? activeSceneId : null);
+      setSceneEnvironmentColor(nextEngine?.getSceneEnvironmentColor() ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
+      if (!nextEngine) {
+        setSelection(null);
+        setNodes([]);
+        setAssets([]);
+        setStats(initialStats);
+      }
     },
     [activeSceneId]
   );
@@ -165,11 +423,21 @@ export function App() {
         }
 
         setActiveProject(payload.project);
-        if (payload.babylonScene) {
-          await engine.loadSerializedScene(payload.babylonScene);
-        }
         if (!cancelled) {
           setProjectError(null);
+        }
+        if (payload.babylonScene) {
+          await engine.loadSerializedScene(payload.babylonScene);
+          const runtimeWarnings = await restoreModelPackageScriptTextsFromProject(activeProject.path, engine);
+          if (!cancelled) {
+            engine.initializeModelPackageRuntimesForScene();
+            setProjectError(runtimeWarnings.length > 0 ? runtimeWarnings.join("；") : null);
+          }
+        }
+        if (!cancelled) {
+          setSceneEnvironmentColor(engine.getSceneEnvironmentColor());
+        }
+        if (!cancelled) {
           setSceneLoadFailed(false);
         }
       })
@@ -198,12 +466,243 @@ export function App() {
     [engine]
   );
 
-  /** 从工具栏导入文件，默认放在世界原点。 */
+  /** 层级面板的新建按钮默认创建一个立方体，保持与顶部创建工具一致。 */
+  const handleCreateHierarchyNode = useCallback(() => {
+    handleAddPrimitive("cube");
+  }, [handleAddPrimitive]);
+
+  /** 把导入文件复制进项目资产目录，返回 File 对象到项目相对路径的映射。 */
+  const persistProjectAssetFiles = useCallback(
+    async (files: FileList | File[]): Promise<PersistedProjectAssetFiles> => {
+      const projectFiles = new Map<File, string>();
+      const failedFiles = new Set<File>();
+      if (!activeProject || !window.electronApp?.projects.saveAssetFile) {
+        return { projectFiles, failedFiles };
+      }
+
+      for (const file of Array.from(files)) {
+        try {
+          const projectFile = await window.electronApp.projects.saveAssetFile(
+            activeProject.path,
+            getFileAssetId(file),
+            file.name,
+            await file.arrayBuffer()
+          );
+          projectFiles.set(file, projectFile);
+        } catch (error) {
+          failedFiles.add(file);
+          setProjectError(getErrorMessage(error, `资产 ${file.name} 写入项目目录失败。`));
+        }
+      }
+
+      return { projectFiles, failedFiles };
+    },
+    [activeProject]
+  );
+
+  /** 从项目资产目录读取一组项目相对文件，并恢复为浏览器 File 对象。 */
+  const loadProjectAssetFiles = useCallback(
+    async (projectFiles: string[], mainProjectFile?: string, mainFileName?: string): Promise<File[]> => {
+      if (!activeProject || !window.electronApp?.projects.loadAssetFile) {
+        throw new Error("当前运行环境不支持读取项目资产文件。");
+      }
+
+      const files: File[] = [];
+      for (const projectFile of projectFiles) {
+        const payload = await window.electronApp.projects.loadAssetFile(activeProject.path, projectFile);
+        const fileName = projectFile === mainProjectFile && mainFileName ? mainFileName : getProjectFileName(projectFile);
+        files.push(
+          new File([payload.data], fileName, {
+            type: getProjectAssetMimeType(fileName),
+            lastModified: payload.lastModified
+          })
+        );
+      }
+
+      return files;
+    },
+    [activeProject]
+  );
+
+  /** 按需从项目资产目录恢复单个资产文件，避免打开项目时一次性加载大模型。 */
+  const ensureProjectAssetFile = useCallback(
+    async (assetId: string, targetEngine: BabylonEditorEngine): Promise<boolean> => {
+      const asset = targetEngine.getAssetsSnapshot().find((item) => item.id === assetId);
+      if (!asset) {
+        setProjectError("资产记录不存在，请刷新项目后重试。");
+        return false;
+      }
+
+      if (asset.sourceAvailable === true) {
+        return true;
+      }
+
+      const projectFiles = getAssetProjectFiles(asset);
+      if (projectFiles.length === 0) {
+        return true;
+      }
+
+      if (!activeProject || !window.electronApp?.projects.loadAssetFile) {
+        return true;
+      }
+
+      try {
+        const primaryModelFileName = asset.modelPackage?.primaryModelFile.split(/[\\/]/).pop();
+        const files = await loadProjectAssetFiles(projectFiles, asset.projectFile, primaryModelFileName ?? asset.name);
+        targetEngine.restoreAssetFiles(new Map([[assetId, files]]));
+        return true;
+      } catch (error) {
+        setProjectError(getErrorMessage(error, `资产 ${asset.name} 源文件读取失败，将尝试使用当前场景模板。`));
+        return true;
+      }
+    },
+    [activeProject, loadProjectAssetFiles]
+  );
+
+  /** 从工具栏或资产面板导入文件时先快照文件，再持久化并登记资产等待用户拖入视口。 */
   const handleImportFiles = useCallback(
-    (files: FileList) => {
-      void engine?.importFiles(files, new Vector3(0, 0, 0));
+    async (files: FileList) => {
+      if (!engine) {
+        return;
+      }
+
+      const fileArray = Array.from(files);
+      if (fileArray.length === 0) {
+        return;
+      }
+
+      const persisted = await persistProjectAssetFiles(fileArray);
+      if (activeProject && persisted.failedFiles.size > 0) {
+        setProjectError("部分资产文件写入项目目录失败，已先作为当前会话资产登记；重新打开项目后未成功写入的文件需要重新导入。");
+      } else {
+        setProjectError(null);
+      }
+
+      engine.registerAssetFiles(fileArray, persisted.projectFiles);
+    },
+    [activeProject, engine, persistProjectAssetFiles]
+  );
+
+  /** 导入文件夹模型包，解析 TypeScript 装饰器生成动态参数面板。 */
+  const handleImportModelPackage = useCallback(async () => {
+    if (!activeProject) {
+      setProjectError("请先打开或创建项目，再导入模型包。");
+      return;
+    }
+
+    if (!window.electronApp?.projects.importModelPackage) {
+      setProjectError("当前运行环境不支持文件夹模型包导入。");
+      return;
+    }
+
+    if (!engine) {
+      setProjectError("3D 引擎尚未准备好，请稍后再导入模型包。");
+      return;
+    }
+
+    try {
+      const result = await window.electronApp.projects.importModelPackage(activeProject.path);
+      if (!result) {
+        return;
+      }
+
+      const projectFilePaths = result.projectFiles.map((file) => file.projectFile);
+      const files = await loadProjectAssetFiles(projectFilePaths);
+      const warnings = [...result.warnings];
+      const meta = parseModelPackageMeta(result.metaFile, result.textFiles, warnings);
+      const scriptFile = chooseModelPackageParameterScriptFile(meta, result.textFiles, result.scriptFile, warnings);
+      const runtimeScript = getMetaRuntimeScript(
+        meta,
+        result.projectFiles.map((file) => file.relativePath),
+        scriptFile ?? result.scriptFile,
+        warnings
+      );
+      const scriptText = scriptFile ? result.textFiles[scriptFile] ?? "" : "";
+      const parsed = parseModelPackageDecorators(scriptText, scriptFile ?? "");
+      warnings.push(...parsed.warnings);
+      const manifest: ModelPackageManifest = {
+        version: 1,
+        packageId: result.packageId,
+        displayName: result.displayName,
+        rootDirectoryName: result.rootDirectoryName,
+        primaryModelFile: result.primaryModelFile,
+        scriptFile,
+        runtimeScriptFile: runtimeScript.scriptFile,
+        runtimeClassName: runtimeScript.className,
+        metaFile: result.metaFile,
+        meta,
+        files: mapModelPackageFiles(result.projectFiles),
+        dynamicFields: parsed.fields,
+        warnings,
+        importedAt: Date.now()
+      };
+
+      engine.registerModelPackageScriptTexts(result.packageId, result.textFiles);
+      await engine.importModelPackage(files, new Vector3(0, 0, 0), manifest);
+      setProjectError(warnings.length > 0 ? warnings.join("；") : null);
+    } catch (error) {
+      setProjectError(getErrorMessage(error, "导入模型包失败。"));
+    }
+  }, [activeProject, engine, loadProjectAssetFiles]);
+
+  /** 从工具栏导入 CAD 图纸，直接在当前场景网格上创建米制矢量线。 */
+  const handleImportCadDrawing = useCallback(
+    async (file: File) => {
+      if (!engine) {
+        setProjectError("3D 引擎尚未准备好，请稍后再导入 CAD 图纸。");
+        return;
+      }
+
+      try {
+        const result = await engine.importCadDrawing(file);
+        setProjectError(
+          result.warnings.length > 0
+            ? `CAD 图纸已导入，但有提示：${result.warnings.join("；")}`
+            : null
+        );
+      } catch (error) {
+        setProjectError(getErrorMessage(error, "导入 CAD 图纸失败。"));
+      }
     },
     [engine]
+  );
+
+  /** 外部文件直接拖入视口时，保持原有立即入场景语义，同时同步写入项目资产库。 */
+  const handleDropFiles = useCallback(
+    async (files: FileList, position: Vector3, targetEngine: BabylonEditorEngine) => {
+      const fileArray = Array.from(files);
+      if (fileArray.length === 0) {
+        return;
+      }
+
+      const persisted = await persistProjectAssetFiles(fileArray);
+      if (activeProject && persisted.failedFiles.size > 0) {
+        setProjectError("资产文件写入项目目录失败，本次拖入未添加到场景，请修复后重新导入。");
+        return;
+      }
+
+      await targetEngine.importFiles(fileArray, position, persisted.projectFiles);
+    },
+    [activeProject, persistProjectAssetFiles]
+  );
+
+  /** 从资产库拖入模型时，必要时先按项目相对路径恢复源文件，再实例化到视口。 */
+  const handleDropAsset = useCallback(
+    async (assetId: string, position: Vector3, targetEngine: BabylonEditorEngine) => {
+      if (!(await ensureProjectAssetFile(assetId, targetEngine))) {
+        return;
+      }
+
+      const instantiated = await targetEngine.instantiateAsset(assetId, position);
+      if (!instantiated) {
+        const asset = targetEngine.getAssetsSnapshot().find((item) => item.id === assetId);
+        setProjectError(`资产 ${asset?.name ?? assetId} 缺少项目内源文件或当前场景模板，请重新导入该资产。`);
+        return;
+      }
+
+      setProjectError(null);
+    },
+    [ensureProjectAssetFile]
   );
 
   /** 从层级面板选中指定节点。 */
@@ -214,13 +713,29 @@ export function App() {
     [engine]
   );
 
+  /** 从层级面板双击节点时，快速把视角定位到该对象。 */
+  const handleFocusNode = useCallback(
+    (id: number) => {
+      engine?.focusById(id);
+    },
+    [engine]
+  );
+
+  /** 从层级面板切换场景节点显隐状态。 */
+  const handleToggleNodeVisibility = useCallback(
+    (id: number, visible: boolean) => {
+      engine?.setNodeVisibilityById(id, visible);
+    },
+    [engine]
+  );
+
   /** 删除当前选中的场景对象，支持导入模型和基础对象。 */
   const handleDeleteSelected = useCallback(() => {
     engine?.deleteSelected();
   }, [engine]);
 
   useEffect(() => {
-    /** 响应 Delete/Backspace 快捷键，并避开输入框内的文本编辑场景。 */
+    /** 响应场景快捷键，并避开输入框内的文本编辑场景。 */
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const isTyping =
@@ -228,7 +743,27 @@ export function App() {
         target instanceof HTMLTextAreaElement ||
         target instanceof HTMLSelectElement ||
         Boolean(target?.isContentEditable);
-      if (isTyping || !selection || !engine || (event.key !== "Delete" && event.key !== "Backspace")) {
+      if (isTyping || event.defaultPrevented || !engine || event.repeat) {
+        return;
+      }
+
+      const normalizedKey = event.key.toLowerCase();
+      const isPlainSystemShortcut = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+      if (isPlainSystemShortcut && normalizedKey === "c") {
+        if (engine.copySelected()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (isPlainSystemShortcut && normalizedKey === "v") {
+        if (engine.pasteClipboard()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (!selection || (event.key !== "Delete" && event.key !== "Backspace")) {
         return;
       }
 
@@ -240,17 +775,34 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [engine, selection]);
 
-  /** 从属性面板提交对象变换或材质更新。 */
+  /** 从属性面板按当前快照节点 ID 提交对象变换、材质或 metadata 更新，避免引擎选中状态短暂失配。 */
   const handleInspectorChange = useCallback(
     (update: TransformUpdate) => {
-      engine?.updateSelected(update);
+      if (!engine || !selection) {
+        return;
+      }
+
+      const targetId = selection.id;
+      const nextSelection = engine.updateNodeById(targetId, update);
+      setSelection((current) => {
+        if (current?.id !== targetId) {
+          return current;
+        }
+
+        return nextSelection;
+      });
     },
-    [engine]
+    [engine, selection]
   );
 
   /** 保存当前 Babylon 场景，项目场景读取失败时禁止覆盖磁盘文件。 */
   const handleSave = useCallback(async () => {
     if (!engine) {
+      return;
+    }
+
+    if (previewMode) {
+      setProjectError("预览模式正在播放场景，为避免把动画中间帧写入文件，请先停止预览再保存。");
       return;
     }
 
@@ -277,7 +829,7 @@ export function App() {
     }
 
     engine.saveScene();
-  }, [activeProject, activeScene, engine, refreshRecentProjects, sceneLoadFailed, sceneLoading]);
+  }, [activeProject, activeScene, engine, previewMode, refreshRecentProjects, sceneLoadFailed, sceneLoading]);
 
   /** 打开 Babylon 官方 Inspector 作为高级调试面板。 */
   const handleToggleInspector = useCallback(() => {
@@ -287,6 +839,20 @@ export function App() {
   /** 切换性能预览模式，并交给 Babylon 引擎调整渲染策略。 */
   const handleTogglePerformance = useCallback(() => {
     setPerformanceMode((value) => !value);
+  }, []);
+
+  /** 更新当前场景环境背景色，色值会写入 Babylon 场景并随保存恢复。 */
+  const handleSceneEnvironmentColorChange = useCallback(
+    (color: string) => {
+      const normalizedColor = engine?.setSceneEnvironmentColor(color) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR;
+      setSceneEnvironmentColor(normalizedColor);
+    },
+    [engine]
+  );
+
+  /** 切换场景预览模式，交给 Babylon 引擎取景完整场景并播放动画。 */
+  const handleTogglePreview = useCallback(() => {
+    setPreviewMode((value) => !value);
   }, []);
 
   /** 创建新场景并立即切换到该场景。 */
@@ -327,14 +893,19 @@ export function App() {
       <Toolbar
         tool={tool}
         performanceMode={performanceMode}
+        previewMode={previewMode}
         stats={stats}
         onToolChange={setTool}
         onAddPrimitive={handleAddPrimitive}
         onImportFiles={handleImportFiles}
+        onImportCadDrawing={handleImportCadDrawing}
+        onImportModelPackage={handleImportModelPackage}
         onSave={handleSave}
         saveDisabled={projectSaveBlocked}
+        saveDisabledReason={saveDisabledReason}
         onToggleInspector={handleToggleInspector}
         onTogglePerformance={handleTogglePerformance}
+        onTogglePreview={handleTogglePreview}
       />
 
       <div className="project-strip">
@@ -352,6 +923,15 @@ export function App() {
             ))}
           </select>
         </label>
+        <label className="scene-environment-control" title="场景环境背景色">
+          <span>环境</span>
+          <input
+            aria-label="场景环境背景色"
+            type="color"
+            value={sceneEnvironmentColor}
+            onChange={(event) => handleSceneEnvironmentColorChange(event.target.value)}
+          />
+        </label>
         <button className="icon-text-button" type="button" onClick={() => setSceneDialogOpen(true)}>
           新建场景
         </button>
@@ -366,16 +946,25 @@ export function App() {
       </div>
 
       <div className="workspace">
-        <HierarchyPanel nodes={nodes} onSelect={handleSelectNode} />
+        <HierarchyPanel
+          nodes={nodes}
+          onSelect={handleSelectNode}
+          onFocus={handleFocusNode}
+          onCreateNode={handleCreateHierarchyNode}
+          onToggleVisibility={handleToggleNodeVisibility}
+        />
         <ViewportCanvas
           key={activeScene?.id ?? "empty-scene"}
           callbacks={callbacks}
           tool={tool}
           performanceMode={performanceMode}
+          previewMode={previewMode}
           onEngineReady={handleEngineReady}
+          onDropAsset={handleDropAsset}
+          onDropFiles={handleDropFiles}
         />
         <InspectorPanel selection={selection} onChange={handleInspectorChange} />
-        <AssetBrowser assets={assets} onImportFiles={handleImportFiles} />
+        <AssetBrowser assets={assets} onImportFiles={handleImportFiles} onImportModelPackage={handleImportModelPackage} />
       </div>
 
       {sceneDialogOpen && (
