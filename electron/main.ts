@@ -39,6 +39,7 @@ const modelPackageAllowedExtensions = new Set([
 
 let mainWindow: BrowserWindow | null = null;
 const authorizedProjectPaths = new Set<string>();
+const sceneMutationQueues = new Map<string, Promise<void>>();
 
 interface RecentProjectRecord {
   id: string;
@@ -244,6 +245,26 @@ function toFileSlug(input: string, fallback: string): string {
 /** 规范化项目路径，用作主进程内部授权表的键。 */
 function normalizeProjectPath(projectPath: string): string {
   return path.resolve(projectPath).toLowerCase();
+}
+
+/** 串行化同一项目同一场景的磁盘写入，避免重命名和保存并发覆盖场景文件。 */
+async function runSerializedSceneMutation<T>(projectPath: string, sceneId: string, operation: () => Promise<T>): Promise<T> {
+  const queueKey = `${normalizeProjectPath(projectPath)}:${sceneId}`;
+  const previous = sceneMutationQueues.get(queueKey) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(operation);
+  const next = run.then(
+    () => undefined,
+    () => undefined
+  );
+  sceneMutationQueues.set(queueKey, next);
+
+  try {
+    return await run;
+  } finally {
+    if (sceneMutationQueues.get(queueKey) === next) {
+      sceneMutationQueues.delete(queueKey);
+    }
+  }
 }
 
 /** 记录由用户选择或最近项目列表授权过的项目路径。 */
@@ -958,28 +979,62 @@ function registerProjectIpc(): void {
     return manifest;
   });
 
+  ipcMain.handle("projects:renameScene", async (_event, projectPath: string, sceneId: string, rawName: string) => {
+    assertAuthorizedProjectPath(projectPath);
+    return runSerializedSceneMutation(projectPath, sceneId, async () => {
+      const manifest = await readProjectManifest(projectPath);
+      const scene = manifest.scenes.find((item) => item.id === sceneId);
+      if (!scene) {
+        throw new Error("场景不存在，无法重命名。");
+      }
+
+      const nextName = sanitizeName(rawName, scene.name);
+      const updatedAt = new Date().toISOString();
+      const sceneFile = await readSceneFile(projectPath, scene);
+      const updatedScene: SceneRecord = {
+        ...sceneFile.scene,
+        id: scene.id,
+        name: nextName,
+        file: scene.file,
+        updatedAt
+      };
+      const updatedSceneFile: ProjectSceneFile = {
+        ...sceneFile,
+        scene: updatedScene
+      };
+      await fs.writeFile(await getSafeScenePath(projectPath, scene), `${JSON.stringify(updatedSceneFile, null, 2)}\n`, "utf-8");
+      manifest.scenes = manifest.scenes.map((item) => (item.id === sceneId ? updatedScene : item));
+      manifest.updatedAt = updatedAt;
+      await writeProjectManifest(manifest);
+      await rememberProject(manifest);
+      return manifest;
+    });
+  });
+
   ipcMain.handle("projects:saveScene", async (_event, projectPath: string, sceneId: string, babylonScene: unknown) => {
     assertAuthorizedProjectPath(projectPath);
-    const manifest = await readProjectManifest(projectPath);
-    const scene = manifest.scenes.find((item) => item.id === sceneId);
-    if (!scene) {
-      throw new Error("场景不存在，无法保存。");
-    }
+    return runSerializedSceneMutation(projectPath, sceneId, async () => {
+      const manifest = await readProjectManifest(projectPath);
+      const scene = manifest.scenes.find((item) => item.id === sceneId);
+      if (!scene) {
+        throw new Error("场景不存在，无法保存。");
+      }
 
-    const updatedScene = { ...scene, updatedAt: new Date().toISOString() };
-    const sceneFile: ProjectSceneFile = {
-      version: 1,
-      scene: updatedScene,
-      babylonScene
-    };
-    await backupSceneFile(projectPath, scene);
-    await fs.writeFile(await getSafeScenePath(projectPath, updatedScene), `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
-    manifest.scenes = manifest.scenes.map((item) => (item.id === sceneId ? updatedScene : item));
-    manifest.activeSceneId = sceneId;
-    manifest.updatedAt = updatedScene.updatedAt;
-    await writeProjectManifest(manifest);
-    await rememberProject(manifest);
-    return manifest;
+      const updatedScene = { ...scene, updatedAt: new Date().toISOString() };
+      const sceneFile: ProjectSceneFile = {
+        version: 1,
+        scene: updatedScene,
+        babylonScene
+      };
+      await backupSceneFile(projectPath, scene);
+      await fs.writeFile(await getSafeScenePath(projectPath, updatedScene), `${JSON.stringify(sceneFile, null, 2)}\n`, "utf-8");
+      manifest.scenes = manifest.scenes.map((item) => (item.id === sceneId ? updatedScene : item));
+      manifest.activeSceneId = sceneId;
+      manifest.updatedAt = updatedScene.updatedAt;
+      await writeProjectManifest(manifest);
+      await rememberProject(manifest);
+      return manifest;
+    });
   });
 
   ipcMain.handle("projects:saveAssetFile", async (_event, projectPath: string, assetId: string, fileName: string, data: unknown) => {

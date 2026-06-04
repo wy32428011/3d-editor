@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld("electronApp", {
     openRecent: (projectPath: string) => ipcRenderer.invoke("projects:openRecent", projectPath),
     loadScene: (projectPath: string, sceneId: string) => ipcRenderer.invoke("projects:loadScene", projectPath, sceneId),
     createScene: (projectPath: string, name: string) => ipcRenderer.invoke("projects:createScene", projectPath, name),
+    renameScene: (projectPath: string, sceneId: string, name: string) =>
+      ipcRenderer.invoke("projects:renameScene", projectPath, sceneId, name),
     saveScene: (projectPath: string, sceneId: string, babylonScene: unknown) =>
       ipcRenderer.invoke("projects:saveScene", projectPath, sceneId, babylonScene),
     saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) =>

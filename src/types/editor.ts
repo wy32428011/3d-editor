@@ -151,6 +151,73 @@ export interface TransformUpdate {
   dynamicParameter?: DynamicParameterUpdate;
 }
 
+/** 场景相机属性快照，当前只暴露编辑视口可视距离。 */
+export interface SceneCameraSnapshot {
+  visibleDistance: number;
+}
+
+/** 场景编辑器设置快照，保存到场景 metadata，供重新打开场景后恢复。 */
+export interface SceneEditorSettingsSnapshot {
+  zoomSensitivity: number;
+  moveSensitivity: number;
+  rotateSensitivity: number;
+}
+
+/** 场景环境属性快照，使用标准 #rrggbb 色值。 */
+export interface SceneEnvironmentSnapshot {
+  backgroundColor: string;
+}
+
+/** 场景级数据驱动组件配置，本次只负责编辑和持久化，不启动运行时。 */
+export interface SceneDataDrivenSnapshot {
+  dataDrivenMode: string;
+  defaultGenerator: string;
+  devicePropertyInitialization: string;
+  robotArmDriveMode: string;
+  boxLineGenerator: string;
+  size: number;
+}
+
+/** 右侧属性面板的场景级快照。 */
+export interface SceneInspectorSnapshot {
+  name: string;
+  camera: SceneCameraSnapshot;
+  editorSettings: SceneEditorSettingsSnapshot;
+  environment: SceneEnvironmentSnapshot;
+  dataDriven: SceneDataDrivenSnapshot;
+}
+
+/** 右侧属性面板提交的场景级更新。 */
+export interface SceneInspectorUpdate {
+  name?: string;
+  camera?: Partial<SceneCameraSnapshot>;
+  editorSettings?: Partial<SceneEditorSettingsSnapshot>;
+  environment?: Partial<SceneEnvironmentSnapshot>;
+  dataDriven?: Partial<SceneDataDrivenSnapshot>;
+}
+
+/** 右侧属性面板当前目标，严格区分对象属性和场景属性。 */
+export type InspectorTarget =
+  | { type: "node"; node: TransformSnapshot }
+  | { type: "scene"; scene: SceneInspectorSnapshot };
+
+/** 场景数据驱动组件默认值，与截图中的默认配置保持一致。 */
+export const DEFAULT_SCENE_DATA_DRIVEN: SceneDataDrivenSnapshot = {
+  dataDrivenMode: "RuntimeDataDrivenZD",
+  defaultGenerator: "注塑托盘（实体）",
+  devicePropertyInitialization: "不初始化",
+  robotArmDriveMode: "全部新能源库",
+  boxLineGenerator: "",
+  size: 0
+};
+
+/** 场景编辑器设置默认值，沿用截图中三项灵敏度的初始数值。 */
+export const DEFAULT_SCENE_EDITOR_SETTINGS: SceneEditorSettingsSnapshot = {
+  zoomSensitivity: 10,
+  moveSensitivity: 10,
+  rotateSensitivity: 10
+};
+
 /** 层级面板展示的扁平化节点数据。 */
 export interface SceneNodeSummary {
   id: number;
@@ -205,7 +272,7 @@ export interface EditorStats {
 /** Babylon 引擎向 React 外层同步状态的回调集合。 */
 export interface EditorEngineCallbacks {
   onSceneGraphChange: (nodes: SceneNodeSummary[]) => void;
-  onSelectionChange: (selection: TransformSnapshot | null) => void;
+  onSelectionChange: (target: InspectorTarget) => void;
   onAssetsChange: (assets: AssetRecord[]) => void;
   onStatsChange: (stats: EditorStats) => void;
 }

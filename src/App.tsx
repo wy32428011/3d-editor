@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { AssetBrowser } from "./components/AssetBrowser";
 import { HierarchyPanel } from "./components/HierarchyPanel";
@@ -14,11 +14,12 @@ import type {
   EditorEngineCallbacks,
   EditorStats,
   EditorTool,
+  InspectorTarget,
   ModelPackageManifest,
   ModelPackageProjectFile,
   PrimitiveKind,
+  SceneInspectorUpdate,
   SceneNodeSummary,
-  TransformSnapshot,
   TransformUpdate
 } from "./types/editor";
 
@@ -281,7 +282,7 @@ export function App() {
   const [engineSceneId, setEngineSceneId] = useState<string | null>(null);
   const [tool, setTool] = useState<EditorTool>("move");
   const [nodes, setNodes] = useState<SceneNodeSummary[]>([]);
-  const [selection, setSelection] = useState<TransformSnapshot | null>(null);
+  const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget | null>(null);
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [stats, setStats] = useState<EditorStats>(initialStats);
   const [performanceMode, setPerformanceMode] = useState(false);
@@ -297,6 +298,26 @@ export function App() {
   const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
 
   const activeScene = activeProject?.scenes.find((scene) => scene.id === activeSceneId) ?? activeProject?.scenes[0] ?? null;
+  const activeSceneRef = useRef<{ projectPath: string | null; sceneId: string | null }>({ projectPath: null, sceneId: null });
+  const sceneRenameRequestRef = useRef(0);
+  const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
+  const panelInspectorTarget = useMemo<InspectorTarget | null>(() => {
+    if (!inspectorTarget) {
+      return null;
+    }
+
+    if (inspectorTarget.type === "scene") {
+      return {
+        type: "scene",
+        scene: {
+          ...inspectorTarget.scene,
+          name: activeScene?.name ?? inspectorTarget.scene.name
+        }
+      };
+    }
+
+    return inspectorTarget;
+  }, [activeScene?.name, inspectorTarget]);
   const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed || previewMode));
   const saveDisabledReason = previewMode
     ? "停止预览后才能保存场景"
@@ -309,7 +330,7 @@ export function App() {
   const callbacks: EditorEngineCallbacks = useMemo(
     () => ({
       onSceneGraphChange: setNodes,
-      onSelectionChange: setSelection,
+      onSelectionChange: setInspectorTarget,
       onAssetsChange: setAssets,
       onStatsChange: setStats
     }),
@@ -333,12 +354,28 @@ export function App() {
 
   /** 激活项目并同步默认场景选择。 */
   const activateProject = useCallback((project: DesktopProjectRecord | null) => {
+    const nextSceneId = project?.activeSceneId ?? project?.scenes[0]?.id ?? null;
     setPreviewMode(false);
+    activeSceneRef.current = { projectPath: project?.path ?? null, sceneId: nextSceneId };
     setActiveProject(project);
-    setActiveSceneId(project?.activeSceneId ?? project?.scenes[0]?.id ?? null);
+    setActiveSceneId(nextSceneId);
     setProjectError(null);
     setSceneLoadFailed(false);
   }, []);
+
+  /** 保存当前项目和场景上下文，异步 IPC 返回时用它避免旧响应覆盖新界面。 */
+  useEffect(() => {
+    activeSceneRef.current = { projectPath: activeProject?.path ?? null, sceneId: activeScene?.id ?? null };
+  }, [activeProject?.path, activeScene?.id]);
+
+  /** 切换项目场景，先同步 ref 再触发 React 状态更新，避免重命名响应竞态。 */
+  const handleSceneSelectChange = useCallback(
+    (sceneId: string) => {
+      activeSceneRef.current = { projectPath: activeProject?.path ?? null, sceneId };
+      setActiveSceneId(sceneId);
+    },
+    [activeProject?.path]
+  );
 
   /** 切换项目场景时退出预览，避免旧场景动画状态泄漏到新场景。 */
   useEffect(() => {
@@ -398,7 +435,7 @@ export function App() {
       setEngineSceneId(nextEngine ? activeSceneId : null);
       setSceneEnvironmentColor(nextEngine?.getSceneEnvironmentColor() ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
       if (!nextEngine) {
-        setSelection(null);
+        setInspectorTarget(null);
         setNodes([]);
         setAssets([]);
         setStats(initialStats);
@@ -763,7 +800,7 @@ export function App() {
         return;
       }
 
-      if (!selection || (event.key !== "Delete" && event.key !== "Backspace")) {
+      if (!selectedNode || (event.key !== "Delete" && event.key !== "Backspace")) {
         return;
       }
 
@@ -773,26 +810,26 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [engine, selection]);
+  }, [engine, selectedNode]);
 
   /** 从属性面板按当前快照节点 ID 提交对象变换、材质或 metadata 更新，避免引擎选中状态短暂失配。 */
   const handleInspectorChange = useCallback(
     (update: TransformUpdate) => {
-      if (!engine || !selection) {
+      if (!engine || !selectedNode) {
         return;
       }
 
-      const targetId = selection.id;
+      const targetId = selectedNode.id;
       const nextSelection = engine.updateNodeById(targetId, update);
-      setSelection((current) => {
-        if (current?.id !== targetId) {
+      setInspectorTarget((current) => {
+        if (current?.type !== "node" || current.node.id !== targetId) {
           return current;
         }
 
-        return nextSelection;
+        return nextSelection ? { type: "node", node: nextSelection } : current;
       });
     },
-    [engine, selection]
+    [engine, selectedNode]
   );
 
   /** 保存当前 Babylon 场景，项目场景读取失败时禁止覆盖磁盘文件。 */
@@ -817,13 +854,25 @@ export function App() {
     }
 
     if (activeProject && activeScene && window.electronApp?.projects) {
+      const projectPath = activeProject.path;
+      const sceneId = activeScene.id;
       try {
-        const project = await window.electronApp.projects.saveScene(activeProject.path, activeScene.id, engine.serializeScene());
-        setActiveProject(project);
-        setActiveSceneId(activeScene.id);
+        const project = await window.electronApp.projects.saveScene(projectPath, sceneId, engine.serializeScene());
+        const currentContext = activeSceneRef.current;
+        if (currentContext.projectPath === projectPath) {
+          setActiveProject(project);
+        }
+        if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
+          setActiveSceneId(sceneId);
+        }
         await refreshRecentProjects();
         return;
       } catch (error) {
+        const currentContext = activeSceneRef.current;
+        if (currentContext.projectPath !== projectPath || currentContext.sceneId !== sceneId) {
+          return;
+        }
+
         setProjectError(getErrorMessage(error, "保存场景到项目失败。"));
       }
     }
@@ -846,9 +895,109 @@ export function App() {
     (color: string) => {
       const normalizedColor = engine?.setSceneEnvironmentColor(color) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR;
       setSceneEnvironmentColor(normalizedColor);
+      setInspectorTarget((current) => {
+        if (current?.type !== "scene") {
+          return current;
+        }
+
+        return {
+          type: "scene",
+          scene: {
+            ...current.scene,
+            environment: {
+              ...current.scene.environment,
+              backgroundColor: normalizedColor
+            }
+          }
+        };
+      });
     },
     [engine]
   );
+
+  /** 从右侧场景属性面板提交场景配置，按字段分发到项目清单或 Babylon 场景 metadata。 */
+  const handleSceneInspectorChange = useCallback(
+    async (update: SceneInspectorUpdate) => {
+      if (!engine) {
+        return;
+      }
+
+      let nextSceneSnapshot = engine.updateSceneInspector(update);
+      if (update.name !== undefined) {
+        const nextName = update.name.trim();
+        if (!nextName) {
+          setProjectError("场景名称不能为空。");
+        } else if (activeProject && activeScene && window.electronApp?.projects) {
+          const projectPath = activeProject.path;
+          const sceneId = activeScene.id;
+          const requestId = ++sceneRenameRequestRef.current;
+          try {
+            const project = await window.electronApp.projects.renameScene(projectPath, sceneId, nextName);
+            const currentContext = activeSceneRef.current;
+            const stillSameProject = currentContext.projectPath === projectPath;
+            const stillSameScene = stillSameProject && currentContext.sceneId === sceneId && sceneRenameRequestRef.current === requestId;
+
+            if (stillSameProject) {
+              setActiveProject(project);
+            }
+            await refreshRecentProjects();
+            if (!stillSameScene) {
+              return;
+            }
+
+            setActiveSceneId(sceneId);
+            setProjectError(null);
+            const renamedScene = project.scenes.find((scene) => scene.id === sceneId);
+            nextSceneSnapshot = {
+              ...nextSceneSnapshot,
+              name: renamedScene?.name ?? nextName
+            };
+          } catch (error) {
+            const currentContext = activeSceneRef.current;
+            if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
+              setProjectError(getErrorMessage(error, "重命名场景失败。"));
+            }
+            return;
+          }
+        } else {
+          nextSceneSnapshot = {
+            ...nextSceneSnapshot,
+            name: nextName
+          };
+        }
+      } else {
+        nextSceneSnapshot = {
+          ...nextSceneSnapshot,
+          name: activeScene?.name ?? nextSceneSnapshot.name
+        };
+      }
+
+      setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
+      setInspectorTarget({ type: "scene", scene: nextSceneSnapshot });
+    },
+    [activeProject, activeScene, engine, refreshRecentProjects]
+  );
+
+  /** 从右侧场景属性面板初始化当前场景，执行前要求用户确认以避免误清空。 */
+  const handleInitializeScene = useCallback(() => {
+    if (!engine) {
+      return;
+    }
+
+    if (!window.confirm("场景初始化会清空当前场景中的可编辑对象并重建默认工作台，是否继续？")) {
+      return;
+    }
+
+    const nextSceneSnapshot = engine.initializeEditableScene();
+    setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
+    setInspectorTarget({
+      type: "scene",
+      scene: {
+        ...nextSceneSnapshot,
+        name: activeScene?.name ?? nextSceneSnapshot.name
+      }
+    });
+  }, [activeScene?.name, engine]);
 
   /** 切换场景预览模式，交给 Babylon 引擎取景完整场景并播放动画。 */
   const handleTogglePreview = useCallback(() => {
@@ -915,7 +1064,7 @@ export function App() {
         </div>
         <label className="scene-switcher">
           <span>场景</span>
-          <select value={activeScene?.id ?? ""} onChange={(event) => setActiveSceneId(event.target.value)}>
+          <select value={activeScene?.id ?? ""} onChange={(event) => handleSceneSelectChange(event.target.value)}>
             {activeProject.scenes.map((scene) => (
               <option key={scene.id} value={scene.id}>
                 {scene.name}
@@ -935,7 +1084,7 @@ export function App() {
         <button className="icon-text-button" type="button" onClick={() => setSceneDialogOpen(true)}>
           新建场景
         </button>
-        <button className="icon-text-button danger-button" type="button" disabled={!selection} onClick={handleDeleteSelected}>
+        <button className="icon-text-button danger-button" type="button" disabled={!selectedNode} onClick={handleDeleteSelected}>
           删除选中
         </button>
         {sceneLoading && <span className="scene-status">读取场景中</span>}
@@ -963,7 +1112,13 @@ export function App() {
           onDropAsset={handleDropAsset}
           onDropFiles={handleDropFiles}
         />
-        <InspectorPanel selection={selection} onChange={handleInspectorChange} />
+        <InspectorPanel
+          target={panelInspectorTarget}
+          onNodeChange={handleInspectorChange}
+          onSceneChange={handleSceneInspectorChange}
+          onSceneInitialize={handleInitializeScene}
+          onImportCadDrawing={handleImportCadDrawing}
+        />
         <AssetBrowser assets={assets} onImportFiles={handleImportFiles} onImportModelPackage={handleImportModelPackage} />
       </div>
 

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { LENGTH_UNIT_SYMBOL, ROTATION_UNIT_SYMBOL, SCALE_UNIT_SYMBOL } from "../editor/units";
 import type {
   AssetInfoSnapshot,
@@ -7,15 +7,22 @@ import type {
   DynamicParameterSnapshot,
   DynamicParameterUpdate,
   DynamicParameterValue,
+  InspectorTarget,
   MeshVertexModifySnapshot,
+  SceneDataDrivenSnapshot,
+  SceneInspectorSnapshot,
+  SceneInspectorUpdate,
   TransformSnapshot,
   TransformUpdate,
   Vector3Snapshot
 } from "../types/editor";
 
 interface InspectorPanelProps {
-  selection: TransformSnapshot | null;
-  onChange: (update: TransformUpdate) => void;
+  target: InspectorTarget | null;
+  onNodeChange: (update: TransformUpdate) => void;
+  onSceneChange: (update: SceneInspectorUpdate) => void | Promise<void>;
+  onSceneInitialize: () => void;
+  onImportCadDrawing: (file: File) => void | Promise<void>;
 }
 
 const vectorKeys: Array<keyof Vector3Snapshot> = ["x", "y", "z"];
@@ -32,16 +39,56 @@ const meshNumberFields: Array<{
   { key: "rollerDensity", label: "辊筒密度", step: "0.1" }
 ];
 
-/** 右侧属性面板负责编辑当前选中对象的名称、变换、显隐、组件参数和资产编号。 */
-export function InspectorPanel({ selection, onChange }: InspectorPanelProps) {
-  if (!selection) {
+const dataDrivenModeOptions = ["RuntimeDataDrivenZD"];
+const defaultGeneratorOptions = ["注塑托盘（实体）", "空托盘", "默认实体"];
+const deviceInitializationOptions = ["不初始化", "初始化"];
+const robotArmDriveModeOptions = ["全部新能源库", "手动配置", "禁用"];
+
+/** 右侧属性面板负责按当前目标编辑对象属性或场景级属性。 */
+export function InspectorPanel({ target, onNodeChange, onSceneChange, onSceneInitialize, onImportCadDrawing }: InspectorPanelProps) {
+  const cadInputRef = useRef<HTMLInputElement | null>(null);
+
+  /** 从右侧场景面板选择 CAD 文件后复用外层导入逻辑。 */
+  const handleCadFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (file) {
+      void onImportCadDrawing(file);
+    }
+  };
+
+  if (!target) {
     return (
       <aside className="panel inspector-panel inspector-panel-redesign">
-        <div className="inspector-empty-state">未选中对象</div>
+        <div className="inspector-empty-state">场景尚未准备好</div>
       </aside>
     );
   }
 
+  if (target.type === "scene") {
+    return (
+      <aside className="panel inspector-panel inspector-panel-redesign">
+        <SceneInspector
+          scene={target.scene}
+          onChange={onSceneChange}
+          onImportCad={() => cadInputRef.current?.click()}
+          onInitialize={onSceneInitialize}
+        />
+        <input ref={cadInputRef} className="hidden-input" type="file" accept=".dxf,.dwg" onChange={handleCadFileChange} />
+      </aside>
+    );
+  }
+
+  return <NodeInspector selection={target.node} onChange={onNodeChange} />;
+}
+
+interface NodeInspectorProps {
+  selection: TransformSnapshot;
+  onChange: (update: TransformUpdate) => void;
+}
+
+/** 对象属性分支，保留原有模型、组件参数和资产编号编辑能力。 */
+function NodeInspector({ selection, onChange }: NodeInspectorProps) {
   return (
     <aside className="panel inspector-panel inspector-panel-redesign">
       <div className="inspector-object-bar">
@@ -97,6 +144,222 @@ export function InspectorPanel({ selection, onChange }: InspectorPanelProps) {
         <div className="inspector-empty-section">暂无数据驱动配置</div>
       </InspectorSection>
     </aside>
+  );
+}
+
+interface SceneInspectorProps {
+  scene: SceneInspectorSnapshot;
+  onChange: (update: SceneInspectorUpdate) => void | Promise<void>;
+  onImportCad: () => void;
+  onInitialize: () => void;
+}
+
+/** 场景属性分支，点击非模型区域后显示并编辑场景级配置。 */
+function SceneInspector({ scene, onChange, onImportCad, onInitialize }: SceneInspectorProps) {
+  return (
+    <>
+      <InspectorSection title="场景" defaultOpen>
+        <SceneNameEditor name={scene.name} onCommit={(name) => void onChange({ name })} />
+        <div className="inspector-button-row">
+          <button className="inspector-action-button" type="button" onClick={onInitialize}>
+            场景初始化
+          </button>
+          <button className="inspector-action-button" type="button" onClick={onImportCad}>
+            导入CAD
+          </button>
+        </div>
+      </InspectorSection>
+
+      <InspectorSection title="相机" defaultOpen>
+        <InspectorNumberRow
+          label="可视距离"
+          step="100"
+          value={scene.camera.visibleDistance}
+          onChange={(visibleDistance) => void onChange({ camera: { visibleDistance } })}
+        />
+      </InspectorSection>
+
+      <InspectorSection title="编辑器设置" defaultOpen>
+        <InspectorNumberRow
+          label="缩放灵敏度"
+          step="1"
+          value={scene.editorSettings.zoomSensitivity}
+          onChange={(zoomSensitivity) => void onChange({ editorSettings: { zoomSensitivity } })}
+        />
+        <InspectorNumberRow
+          label="移动灵敏度"
+          step="1"
+          value={scene.editorSettings.moveSensitivity}
+          onChange={(moveSensitivity) => void onChange({ editorSettings: { moveSensitivity } })}
+        />
+        <InspectorNumberRow
+          label="旋转灵敏度"
+          step="1"
+          value={scene.editorSettings.rotateSensitivity}
+          onChange={(rotateSensitivity) => void onChange({ editorSettings: { rotateSensitivity } })}
+        />
+      </InspectorSection>
+
+      <InspectorSection title="环境属性" defaultOpen>
+        <div className="inspector-row">
+          <span className="inspector-row-label">环境模型</span>
+          <div className="inspector-environment-preview" style={{ backgroundColor: scene.environment.backgroundColor }}>
+            <span>Scene</span>
+          </div>
+        </div>
+        <div className="inspector-row">
+          <span className="inspector-row-label">背景颜色</span>
+          <input
+            className="inspector-color-input"
+            type="color"
+            value={scene.environment.backgroundColor}
+            onInput={(event) => void onChange({ environment: { backgroundColor: event.currentTarget.value } })}
+          />
+        </div>
+      </InspectorSection>
+
+      <InspectorSection title="预设效果" defaultOpen>
+        <div className="inspector-effect-grid">
+          <div className="inspector-effect-tile is-active">默认预设</div>
+          <div className="inspector-effect-tile">效果A</div>
+        </div>
+      </InspectorSection>
+
+      <InspectorSection title="SceneDataDrivenComponent" defaultOpen>
+        <SceneDataDrivenEditor
+          value={scene.dataDriven}
+          onChange={(dataDriven) => void onChange({ dataDriven })}
+        />
+      </InspectorSection>
+    </>
+  );
+}
+
+interface SceneNameEditorProps {
+  name: string;
+  onCommit: (name: string) => void;
+}
+
+/** 场景名称编辑器在失焦或回车时提交，避免每次键入都触发主进程重命名。 */
+function SceneNameEditor({ name, onCommit }: SceneNameEditorProps) {
+  const [draft, setDraft] = useState(name);
+
+  useEffect(() => {
+    setDraft(name);
+  }, [name]);
+
+  /** 提交当前草稿，空名称回退到外层传入的有效场景名。 */
+  const commitDraft = () => {
+    const nextName = draft.trim();
+    if (!nextName) {
+      setDraft(name);
+      return;
+    }
+
+    if (nextName !== name) {
+      onCommit(nextName);
+    }
+    setDraft(nextName);
+  };
+
+  return (
+    <label className="inspector-row">
+      <span className="inspector-row-label">场景名称</span>
+      <input
+        className="inspector-input"
+        value={draft}
+        onBlur={commitDraft}
+        onChange={(event) => setDraft(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.currentTarget.blur();
+          }
+        }}
+      />
+    </label>
+  );
+}
+
+interface SceneDataDrivenEditorProps {
+  value: SceneDataDrivenSnapshot;
+  onChange: (update: Partial<SceneDataDrivenSnapshot>) => void;
+}
+
+/** SceneDataDrivenComponent 配置编辑器，本次只写入场景 metadata，不启动运行时。 */
+function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) {
+  return (
+    <>
+      <InspectorSelectRow
+        label="数据驱动方式"
+        options={dataDrivenModeOptions}
+        value={value.dataDrivenMode}
+        onChange={(dataDrivenMode) => onChange({ dataDrivenMode })}
+      />
+      <InspectorSelectRow
+        label="默认产生器"
+        options={defaultGeneratorOptions}
+        value={value.defaultGenerator}
+        onChange={(defaultGenerator) => onChange({ defaultGenerator })}
+      />
+      <InspectorSelectRow
+        label="设备属性初始化"
+        options={deviceInitializationOptions}
+        value={value.devicePropertyInitialization}
+        onChange={(devicePropertyInitialization) => onChange({ devicePropertyInitialization })}
+      />
+      <InspectorSelectRow
+        label="机械手驱动方式"
+        options={robotArmDriveModeOptions}
+        value={value.robotArmDriveMode}
+        onChange={(robotArmDriveMode) => onChange({ robotArmDriveMode })}
+      />
+      <InspectorTextRow
+        label="箱式线产生器"
+        value={value.boxLineGenerator}
+        onChange={(boxLineGenerator) => onChange({ boxLineGenerator })}
+      />
+      <InspectorNumberRow label="Size" step="1" value={value.size} onChange={(size) => onChange({ size })} />
+    </>
+  );
+}
+
+interface InspectorSelectRowProps {
+  label: string;
+  options: string[];
+  value: string;
+  onChange: (value: string) => void;
+}
+
+/** 紧凑下拉行，沿用属性面板输入框视觉。 */
+function InspectorSelectRow({ label, options, value, onChange }: InspectorSelectRowProps) {
+  const normalizedOptions = options.includes(value) ? options : [value, ...options].filter((item) => item.length > 0);
+  return (
+    <label className="inspector-row">
+      <span className="inspector-row-label">{label}</span>
+      <select className="inspector-input" value={value} onChange={(event) => onChange(event.currentTarget.value)}>
+        {normalizedOptions.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+interface InspectorTextRowProps {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}
+
+/** 紧凑文本行，供场景级字符串配置实时写入 metadata。 */
+function InspectorTextRow({ label, value, onChange }: InspectorTextRowProps) {
+  return (
+    <label className="inspector-row">
+      <span className="inspector-row-label">{label}</span>
+      <input className="inspector-input" value={value} onInput={(event) => onChange(event.currentTarget.value)} />
+    </label>
   );
 }
 

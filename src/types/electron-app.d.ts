@@ -75,6 +75,7 @@ declare global {
         openRecent: (projectPath: string) => Promise<DesktopProjectRecord | null>;
         loadScene: (projectPath: string, sceneId: string) => Promise<DesktopScenePayload>;
         createScene: (projectPath: string, name: string) => Promise<DesktopProjectRecord>;
+        renameScene: (projectPath: string, sceneId: string, name: string) => Promise<DesktopProjectRecord>;
         saveScene: (projectPath: string, sceneId: string, babylonScene: unknown) => Promise<DesktopProjectRecord>;
         saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) => Promise<string>;
         loadAssetFile: (projectPath: string, projectFile: string) => Promise<DesktopProjectAssetPayload>;

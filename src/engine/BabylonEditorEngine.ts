@@ -64,6 +64,7 @@ import {
   EDITOR_GRID_SIZE_METERS,
   SCENE_UNIT_IN_METERS
 } from "../editor/units";
+import { DEFAULT_SCENE_DATA_DRIVEN, DEFAULT_SCENE_EDITOR_SETTINGS } from "../types/editor";
 import type {
   AssetInfoSnapshot,
   AssetRecord,
@@ -79,6 +80,10 @@ import type {
   ModelPackageProjectFile,
   PoiKind,
   PrimitiveKind,
+  SceneDataDrivenSnapshot,
+  SceneEditorSettingsSnapshot,
+  SceneInspectorSnapshot,
+  SceneInspectorUpdate,
   SceneNodeKind,
   SceneNodeSummary,
   TransformSnapshot,
@@ -122,6 +127,11 @@ const MIN_FRAMED_CAMERA_RADIUS_METERS = 8;
 const CAMERA_FRAME_MARGIN = 1.45;
 const DEFAULT_CAMERA_FAR_CLIP_METERS = 10000;
 const MAX_CAMERA_FAR_CLIP_METERS = 1000000;
+const DEFAULT_CAMERA_WHEEL_PRECISION = 45;
+const DEFAULT_CAMERA_PANNING_SENSIBILITY = 55;
+const DEFAULT_CAMERA_ROTATION_SENSIBILITY = 1000;
+const MIN_CAMERA_INPUT_SENSIBILITY = 1;
+const MAX_CAMERA_INPUT_SENSIBILITY = 100000;
 const POI_STEM_HEIGHT_METERS = 1.35;
 const POI_STEM_DIAMETER_METERS = 0.045;
 const POI_BASE_DIAMETER_METERS = 0.42;
@@ -263,9 +273,9 @@ export class BabylonEditorEngine {
       stencil: true
     });
     this.scene = new Scene(this.engine);
-    this.applySceneEnvironmentColor(DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
 
     this.editorCamera = this.createEditorCamera();
+    this.applySceneEnvironmentColor(DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
     this.gizmoManager = new GizmoManager(this.scene);
     this.highlightLayer = new HighlightLayer("EditorSelectionHighlight", this.scene);
 
@@ -330,6 +340,63 @@ export class BabylonEditorEngine {
     const normalizedColor = this.normalizeHexColor(colorHex) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR;
     this.applySceneEnvironmentColor(normalizedColor);
     return normalizedColor;
+  }
+
+  /** 读取右侧属性面板使用的场景级快照。 */
+  public getSceneInspectorSnapshot(): SceneInspectorSnapshot {
+    return this.createSceneInspectorSnapshot();
+  }
+
+  /** 更新场景级属性，并把配置写入场景 metadata 以便保存和重开恢复。 */
+  public updateSceneInspector(update: SceneInspectorUpdate): SceneInspectorSnapshot {
+    const current = this.createSceneInspectorSnapshot();
+    const environment = {
+      ...current.environment,
+      ...update.environment
+    };
+    const camera = {
+      ...current.camera,
+      ...update.camera
+    };
+    const editorSettings = {
+      ...current.editorSettings,
+      ...update.editorSettings
+    };
+    const dataDriven = {
+      ...current.dataDriven,
+      ...update.dataDriven
+    };
+
+    this.applySceneEnvironmentColor(environment.backgroundColor, false);
+    this.applySceneCameraSettings(camera);
+    this.applySceneEditorSettings(editorSettings);
+    this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata, {
+      sceneEnvironment: environment,
+      sceneCamera: camera,
+      sceneEditorSettings: editorSettings,
+      sceneDataDriven: dataDriven
+    });
+    this.scene.render();
+    this.emitSelectionSnapshot();
+    return this.createSceneInspectorSnapshot();
+  }
+
+  /** 清空当前可编辑内容并重建默认工作对象，保留编辑器 helper 和项目保存保护逻辑。 */
+  public initializeEditableScene(): SceneInspectorSnapshot {
+    if (this.previewMode) {
+      this.exitPreviewMode();
+    }
+
+    this.clearEditableScene(false);
+    this.createPrimitive("cube", new Vector3(-1.8, 0.5, 0));
+    this.createPrimitive("sphere", new Vector3(1.8, 0.75, 0));
+    const ground = this.createPrimitive("ground", new Vector3(0, 0, 0));
+    ground.name = "工作地面";
+    this.resetEditorCameraOverview();
+    this.selectNode(null);
+    this.refreshSceneGraph();
+    this.callbacks.onStatsChange(this.collectStats());
+    return this.createSceneInspectorSnapshot();
   }
 
   /** 开关场景预览模式：自动取景完整场景，并播放当前场景中的动画。 */
@@ -1028,6 +1095,9 @@ export class BabylonEditorEngine {
       container.addAllToScene();
       this.applySceneEnvironmentColor(this.getSerializedSceneEnvironmentColor(loadableScene) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
       this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata);
+      const sceneInspector = this.createSceneInspectorSnapshot();
+      this.applySceneCameraSettings(sceneInspector.camera);
+      this.applySceneEditorSettings(sceneInspector.editorSettings);
     } finally {
       URL.revokeObjectURL(sceneUrl);
     }
@@ -1085,7 +1155,7 @@ export class BabylonEditorEngine {
 
     const snapshot = this.updateNodeById(this.selectedNode.uniqueId, update);
     if (snapshot) {
-      this.callbacks.onSelectionChange(snapshot);
+      this.callbacks.onSelectionChange({ type: "node", node: snapshot });
     }
   }
 
@@ -1171,8 +1241,10 @@ export class BabylonEditorEngine {
     camera.doNotSerialize = true;
     camera.lowerRadiusLimit = 2;
     camera.upperRadiusLimit = DEFAULT_CAMERA_FAR_CLIP_METERS;
-    camera.wheelPrecision = 45;
-    camera.panningSensibility = 55;
+    camera.wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
+    camera.panningSensibility = DEFAULT_CAMERA_PANNING_SENSIBILITY;
+    camera.angularSensibilityX = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
+    camera.angularSensibilityY = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
     camera.movement.panSpeed = MIN_CAMERA_PAN_SPEED_SCALE;
     camera.minZ = 0.05;
     camera.maxZ = DEFAULT_CAMERA_FAR_CLIP_METERS;
@@ -1412,8 +1484,8 @@ export class BabylonEditorEngine {
     plane.material = material;
   }
 
-  /** 清空可编辑内容，避免加载项目场景时和默认对象叠加。 */
-  private clearEditableScene(): void {
+  /** 清空可编辑内容，必要时同步清空资产库，避免加载项目场景时和默认对象叠加。 */
+  private clearEditableScene(clearAssets = true): void {
     this.selectNode(null);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
@@ -1424,11 +1496,13 @@ export class BabylonEditorEngine {
       .forEach((camera) => camera.dispose());
     [...this.scene.animationGroups].forEach((animationGroup) => animationGroup.dispose());
     this.scene.materials.filter((material) => !material.doNotSerialize).forEach((material) => material.dispose(true, true));
-    this.assets.splice(0, this.assets.length);
-    this.assetFiles.clear();
-    this.assetDependencyFiles.clear();
-    this.clearRegisteredLocalImportFiles();
-    this.callbacks.onAssetsChange([]);
+    if (clearAssets) {
+      this.assets.splice(0, this.assets.length);
+      this.assetFiles.clear();
+      this.assetDependencyFiles.clear();
+      this.clearRegisteredLocalImportFiles();
+      this.callbacks.onAssetsChange([]);
+    }
     this.refreshSceneGraph();
     this.callbacks.onStatsChange(this.collectStats());
   }
@@ -2909,11 +2983,11 @@ export class BabylonEditorEngine {
   /** 向 React 发出当前选中对象的属性快照。 */
   private emitSelectionSnapshot(): void {
     if (!this.selectedNode) {
-      this.callbacks.onSelectionChange(null);
+      this.callbacks.onSelectionChange({ type: "scene", scene: this.createSceneInspectorSnapshot() });
       return;
     }
 
-    this.callbacks.onSelectionChange(this.createTransformSnapshot(this.selectedNode));
+    this.callbacks.onSelectionChange({ type: "node", node: this.createTransformSnapshot(this.selectedNode) });
   }
 
   /** 从 Babylon 节点创建属性面板需要的完整快照。 */
@@ -3595,6 +3669,103 @@ export class BabylonEditorEngine {
     };
   }
 
+  /** 创建右侧属性面板需要的场景级快照，缺失 metadata 时回退默认配置。 */
+  private createSceneInspectorSnapshot(): SceneInspectorSnapshot {
+    const editorMetadata = this.getSceneEditorMetadata();
+    const sceneEnvironment = this.asMetadataObject(editorMetadata.sceneEnvironment);
+    const sceneCamera = this.asMetadataObject(editorMetadata.sceneCamera);
+    const sceneEditorSettings = this.asMetadataObject(editorMetadata.sceneEditorSettings);
+    const sceneDataDriven = this.asMetadataObject(editorMetadata.sceneDataDriven);
+
+    return {
+      name: "场景",
+      camera: {
+        visibleDistance: this.normalizePositiveNumber(sceneCamera.visibleDistance, this.editorCamera.maxZ)
+      },
+      editorSettings: this.normalizeSceneEditorSettings(sceneEditorSettings),
+      environment: {
+        backgroundColor: this.normalizeHexColor(sceneEnvironment.backgroundColor) ?? this.getSceneEnvironmentColor()
+      },
+      dataDriven: this.normalizeSceneDataDriven(sceneDataDriven)
+    };
+  }
+
+  /** 读取场景 metadata.editor，统一兼容旧场景中的空 metadata。 */
+  private getSceneEditorMetadata(): Record<string, unknown> {
+    return this.asMetadataObject(this.asMetadataObject(this.scene.metadata).editor);
+  }
+
+  /** 应用场景相机配置，当前只影响编辑视口远裁剪和缩放上限。 */
+  private applySceneCameraSettings(camera: SceneInspectorSnapshot["camera"]): void {
+    const visibleDistance = this.normalizePositiveNumber(camera.visibleDistance, DEFAULT_CAMERA_FAR_CLIP_METERS);
+    this.editorCamera.maxZ = visibleDistance;
+    this.editorCamera.upperRadiusLimit = visibleDistance;
+  }
+
+  /** 应用编辑器设置，默认值 10 对应当前相机手感，数值越大操作越灵敏。 */
+  private applySceneEditorSettings(settings: SceneEditorSettingsSnapshot): void {
+    const normalizedSettings = this.normalizeSceneEditorSettings({
+      zoomSensitivity: settings.zoomSensitivity,
+      moveSensitivity: settings.moveSensitivity,
+      rotateSensitivity: settings.rotateSensitivity
+    });
+    this.editorCamera.wheelPrecision = this.mapSceneSensitivityToCameraSensibility(
+      normalizedSettings.zoomSensitivity,
+      DEFAULT_CAMERA_WHEEL_PRECISION
+    );
+    this.editorCamera.panningSensibility = this.mapSceneSensitivityToCameraSensibility(
+      normalizedSettings.moveSensitivity,
+      DEFAULT_CAMERA_PANNING_SENSIBILITY
+    );
+    const rotationSensibility = this.mapSceneSensitivityToCameraSensibility(
+      normalizedSettings.rotateSensitivity,
+      DEFAULT_CAMERA_ROTATION_SENSIBILITY
+    );
+    this.editorCamera.angularSensibilityX = rotationSensibility;
+    this.editorCamera.angularSensibilityY = rotationSensibility;
+  }
+
+  /** 把未知数字收敛为正有限值，避免非法 metadata 进入面板或相机参数。 */
+  private normalizePositiveNumber(value: unknown, fallback: number): number {
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+  }
+
+  /** 将面板灵敏度映射为 Babylon 相机 sensibility，保持默认 10 不改变既有手感。 */
+  private mapSceneSensitivityToCameraSensibility(sensitivity: number, defaultSensibility: number): number {
+    const normalizedSensitivity = this.normalizePositiveNumber(sensitivity, DEFAULT_SCENE_EDITOR_SETTINGS.zoomSensitivity);
+    const nextValue = (defaultSensibility * DEFAULT_SCENE_EDITOR_SETTINGS.zoomSensitivity) / normalizedSensitivity;
+    return Math.min(MAX_CAMERA_INPUT_SENSIBILITY, Math.max(MIN_CAMERA_INPUT_SENSIBILITY, nextValue));
+  }
+
+  /** 把场景编辑器设置收敛为可编辑数字，非法值回退默认值。 */
+  private normalizeSceneEditorSettings(value: Record<string, unknown>): SceneEditorSettingsSnapshot {
+    return {
+      zoomSensitivity: this.normalizePositiveNumber(value.zoomSensitivity, DEFAULT_SCENE_EDITOR_SETTINGS.zoomSensitivity),
+      moveSensitivity: this.normalizePositiveNumber(value.moveSensitivity, DEFAULT_SCENE_EDITOR_SETTINGS.moveSensitivity),
+      rotateSensitivity: this.normalizePositiveNumber(value.rotateSensitivity, DEFAULT_SCENE_EDITOR_SETTINGS.rotateSensitivity)
+    };
+  }
+
+  /** 把场景数据驱动配置收敛为稳定快照，当前只负责持久化配置。 */
+  private normalizeSceneDataDriven(value: Record<string, unknown>): SceneDataDrivenSnapshot {
+    return {
+      dataDrivenMode: this.getStringMetadata(value.dataDrivenMode, DEFAULT_SCENE_DATA_DRIVEN.dataDrivenMode),
+      defaultGenerator: this.getStringMetadata(value.defaultGenerator, DEFAULT_SCENE_DATA_DRIVEN.defaultGenerator),
+      devicePropertyInitialization: this.getStringMetadata(
+        value.devicePropertyInitialization,
+        DEFAULT_SCENE_DATA_DRIVEN.devicePropertyInitialization
+      ),
+      robotArmDriveMode: this.getStringMetadata(value.robotArmDriveMode, DEFAULT_SCENE_DATA_DRIVEN.robotArmDriveMode),
+      boxLineGenerator: this.getStringMetadata(value.boxLineGenerator, DEFAULT_SCENE_DATA_DRIVEN.boxLineGenerator),
+      size: this.getNumberMetadata(value.size, DEFAULT_SCENE_DATA_DRIVEN.size)
+    };
+  }
+
+  /** 从 metadata 中读取字符串，缺失或类型不符时使用默认值。 */
+  private getStringMetadata(value: unknown, fallback: string): string {
+    return typeof value === "string" ? value : fallback;
+  }
+
   /** 将场景环境色应用到 Babylon 背景、环境光和编辑器元数据。 */
   private applySceneEnvironmentColor(colorHex: string, renderAfterApply = true): void {
     const normalizedColor = this.normalizeHexColor(colorHex) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR;
@@ -3693,15 +3864,37 @@ export class BabylonEditorEngine {
   /** 写入场景级米制元数据，确保项目保存和重新打开后单位契约不丢失。 */
   private withMetricSceneMetadata(
     metadata: unknown,
-    editorOverrides: { savedAt?: string; assets?: AssetRecord[]; sceneEnvironment?: { backgroundColor?: string } } = {}
+    editorOverrides: {
+      savedAt?: string;
+      assets?: AssetRecord[];
+      sceneEnvironment?: { backgroundColor?: string };
+      sceneCamera?: Partial<SceneInspectorSnapshot["camera"]>;
+      sceneEditorSettings?: Partial<SceneEditorSettingsSnapshot>;
+      sceneDataDriven?: Partial<SceneDataDrivenSnapshot>;
+    } = {}
   ): Record<string, unknown> {
     const baseMetadata = this.asMetadataObject(metadata);
     const editorMetadata = this.asMetadataObject(baseMetadata.editor);
     const sceneEnvironmentMetadata = this.asMetadataObject(editorMetadata.sceneEnvironment);
+    const sceneCameraMetadata = this.asMetadataObject(editorMetadata.sceneCamera);
+    const sceneEditorSettingsMetadata = this.asMetadataObject(editorMetadata.sceneEditorSettings);
+    const sceneDataDrivenMetadata = this.asMetadataObject(editorMetadata.sceneDataDriven);
     const backgroundColor =
       this.normalizeHexColor(editorOverrides.sceneEnvironment?.backgroundColor) ??
       this.normalizeHexColor(sceneEnvironmentMetadata.backgroundColor) ??
       this.getSceneEnvironmentColor();
+    const visibleDistance = this.normalizePositiveNumber(
+      editorOverrides.sceneCamera?.visibleDistance,
+      this.normalizePositiveNumber(sceneCameraMetadata.visibleDistance, this.editorCamera.maxZ)
+    );
+    const editorSettings = this.normalizeSceneEditorSettings({
+      ...sceneEditorSettingsMetadata,
+      ...editorOverrides.sceneEditorSettings
+    });
+    const dataDriven = this.normalizeSceneDataDriven({
+      ...sceneDataDrivenMetadata,
+      ...editorOverrides.sceneDataDriven
+    });
     const nextEditorMetadata: Record<string, unknown> = {
       ...editorMetadata,
       name: "Babylon Unity-like 3D Editor",
@@ -3710,6 +3903,18 @@ export class BabylonEditorEngine {
       sceneEnvironment: {
         ...sceneEnvironmentMetadata,
         backgroundColor
+      },
+      sceneCamera: {
+        ...sceneCameraMetadata,
+        visibleDistance
+      },
+      sceneEditorSettings: {
+        ...sceneEditorSettingsMetadata,
+        ...editorSettings
+      },
+      sceneDataDriven: {
+        ...sceneDataDrivenMetadata,
+        ...dataDriven
       }
     };
 
