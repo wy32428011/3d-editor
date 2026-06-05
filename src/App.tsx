@@ -6,18 +6,23 @@ import { InspectorPanel } from "./components/InspectorPanel";
 import { ProjectLauncher } from "./components/ProjectLauncher";
 import { Toolbar } from "./components/Toolbar";
 import { ViewportCanvas } from "./components/ViewportCanvas";
+import type { CadDxfLineProgress } from "./editor/cadDxf";
+import { parseModelPackageDataDriven } from "./editor/modelPackageDataDriven";
 import { parseModelPackageDecorators } from "./editor/modelPackageDecorators";
 import { DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS } from "./editor/modelPackageRuntime";
 import { DEFAULT_SCENE_ENVIRONMENT_COLOR, type BabylonEditorEngine } from "./engine/BabylonEditorEngine";
+import { DEFAULT_SCENE_DATA_DRIVEN } from "./types/editor";
 import type {
   AssetRecord,
   EditorEngineCallbacks,
   EditorStats,
   EditorTool,
   InspectorTarget,
+  ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
   PrimitiveKind,
+  SceneDataDrivenSnapshot,
   SceneInspectorUpdate,
   SceneNodeSummary,
   TransformUpdate
@@ -76,6 +81,70 @@ function getProjectAssetMimeType(fileName: string): string {
 /** 生成与 Babylon 引擎一致的资产编号，便于项目资产文件和资产记录互相定位。 */
 function getFileAssetId(file: File): string {
   return `${file.name}-${file.size}-${file.lastModified}`;
+}
+
+/** 为 CAD 二进制线段侧车文件生成独立资产目录，避免和原 DXF 源文件混放。 */
+function createCadLineAssetId(file: File): string {
+  const randomId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `cad-lines-${file.name}-${file.size}-${file.lastModified}-${randomId}`;
+}
+
+/** 格式化进度计数，CAD 大图纸常见百万级线段，必须保持可读。 */
+function formatCadProgressCount(value: number | undefined): string {
+  return Math.max(0, Math.trunc(value ?? 0)).toLocaleString("zh-CN");
+}
+
+/** 计算当前 CAD 阶段的百分比，未知总量时返回 null 让 UI 显示不确定进度。 */
+function getCadImportProgressPercent(progress: CadDxfLineProgress | null): number | null {
+  if (!progress) {
+    return null;
+  }
+
+  if (progress.phase === "done") {
+    return 100;
+  }
+
+  if (progress.phase === "reading" && progress.totalBytes && progress.totalBytes > 0) {
+    return Math.max(0, Math.min(100, (Math.max(0, progress.loadedBytes ?? 0) / progress.totalBytes) * 100));
+  }
+
+  if (progress.phase === "emitting" && progress.totalSegments && progress.totalSegments > 0) {
+    return Math.max(0, Math.min(100, (Math.max(0, progress.emittedSegments) / progress.totalSegments) * 100));
+  }
+
+  if (progress.phase === "persisting" && progress.chunkCount && progress.chunkCount > 0) {
+    return Math.max(0, Math.min(100, (Math.max(0, progress.persistedChunks ?? 0) / progress.chunkCount) * 100));
+  }
+
+  if (progress.phase === "restoring" && progress.chunkCount && progress.chunkCount > 0) {
+    return Math.max(0, Math.min(100, (Math.max(0, progress.restoredChunks ?? 0) / progress.chunkCount) * 100));
+  }
+
+  return null;
+}
+
+/** 生成 CAD 导入或恢复状态文本，不把进度写入错误提示。 */
+function getCadImportProgressText(progress: CadDxfLineProgress): string {
+  const percent = getCadImportProgressPercent(progress);
+  const percentText = percent === null ? "" : ` · ${Math.round(percent)}%`;
+  switch (progress.phase) {
+    case "reading":
+      return `CAD 导入中 · 读取文件${percentText}`;
+    case "measuring":
+      return `CAD 导入中 · 测量图纸 · 已解析 ${formatCadProgressCount(progress.parsedEntities)} 个实体 · 已发现 ${formatCadProgressCount(progress.emittedSegments)} 条线段`;
+    case "emitting":
+      return `CAD 导入中 · 输出线段 · ${formatCadProgressCount(progress.emittedSegments)} / ${formatCadProgressCount(progress.totalSegments)} 条${percentText}`;
+    case "rendering":
+      return `CAD 导入中 · 创建网格 · 已创建 ${formatCadProgressCount(progress.chunkCount)} 个分块 · ${formatCadProgressCount(progress.emittedSegments)} 条线段`;
+    case "persisting":
+      return `CAD 导入中 · 保存分块 · ${formatCadProgressCount(progress.persistedChunks)} / ${formatCadProgressCount(progress.chunkCount)} 个${percentText}`;
+    case "restoring":
+      return `CAD 恢复中 · ${formatCadProgressCount(progress.restoredChunks)} / ${formatCadProgressCount(progress.chunkCount)} 个分块 · 已创建 ${formatCadProgressCount(progress.renderedChunks)} 个网格${percentText}`;
+    case "done":
+      return "CAD 图纸导入完成";
+    default:
+      return progress.message ?? "CAD 图纸导入中";
+  }
 }
 
 /** 从项目相对路径中取回文件名，恢复 glTF/OBJ 依赖时必须保留原始文件名。 */
@@ -229,6 +298,42 @@ function chooseModelPackageParameterScriptFile(
   return undefined;
 }
 
+/** 从模型包脚本中读取 dataDriven 语义定义，场景级连接配置仍由 Inspector 保存。 */
+function parseModelPackageDataDrivenFromScripts(
+  textFiles: Record<string, string>,
+  preferredFiles: Array<string | undefined>,
+  warnings: string[]
+): ModelDataDrivenDefinition | undefined {
+  const textFileMap = createModelPackageRelativePathMap(Object.keys(textFiles));
+  const scriptFiles = [
+    ...preferredFiles,
+    ...Object.keys(textFiles)
+      .filter((file) => file.toLowerCase().endsWith(".ts"))
+      .sort((left, right) => left.localeCompare(right))
+  ];
+  const visited = new Set<string>();
+
+  for (const scriptFile of scriptFiles) {
+    if (!scriptFile) {
+      continue;
+    }
+
+    const matchedFile = textFileMap.get(normalizeModelPackageRelativePath(scriptFile));
+    if (!matchedFile || visited.has(matchedFile)) {
+      continue;
+    }
+    visited.add(matchedFile);
+
+    const parsed = parseModelPackageDataDriven(textFiles[matchedFile] ?? "", matchedFile);
+    warnings.push(...parsed.warnings);
+    if (parsed.definition) {
+      return parsed.definition;
+    }
+  }
+
+  return undefined;
+}
+
 /** 从项目资产目录轻量恢复模型包脚本文本，避免打开项目时强制加载大 GLB。 */
 async function restoreModelPackageScriptTextsFromProject(projectPath: string, targetEngine: BabylonEditorEngine): Promise<string[]> {
   if (!window.electronApp?.projects.loadAssetFile) {
@@ -291,15 +396,26 @@ export function App() {
   const [activeProject, setActiveProject] = useState<DesktopProjectRecord | null>(null);
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
+  const [projectErrorExpanded, setProjectErrorExpanded] = useState(false);
+  const [cadImportProgress, setCadImportProgress] = useState<CadDxfLineProgress | null>(null);
+  const [cadImportActive, setCadImportActive] = useState(false);
+  const [cadRestoreProgress, setCadRestoreProgress] = useState<CadDxfLineProgress | null>(null);
+  const [cadRestoreActive, setCadRestoreActive] = useState(false);
   const [sceneLoading, setSceneLoading] = useState(false);
   const [sceneLoadFailed, setSceneLoadFailed] = useState(false);
   const [sceneDialogOpen, setSceneDialogOpen] = useState(false);
   const [sceneName, setSceneName] = useState("New Scene");
   const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
+  const [sceneDataDriven, setSceneDataDriven] = useState<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
 
   const activeScene = activeProject?.scenes.find((scene) => scene.id === activeSceneId) ?? activeProject?.scenes[0] ?? null;
   const activeSceneRef = useRef<{ projectPath: string | null; sceneId: string | null }>({ projectPath: null, sceneId: null });
   const sceneRenameRequestRef = useRef(0);
+  const cadImportRequestRef = useRef(0);
+  const cadImportActiveRef = useRef(false);
+  const cadRestoreRequestRef = useRef(0);
+  const cadRestoreActiveRef = useRef(false);
+  const cadRestoreWarningRef = useRef<string | null>(null);
   const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
   const panelInspectorTarget = useMemo<InspectorTarget | null>(() => {
     if (!inspectorTarget) {
@@ -311,15 +427,20 @@ export function App() {
         type: "scene",
         scene: {
           ...inspectorTarget.scene,
-          name: activeScene?.name ?? inspectorTarget.scene.name
+          name: activeScene?.name ?? inspectorTarget.scene.name,
+          dataDriven: sceneDataDriven
         }
       };
     }
 
     return inspectorTarget;
-  }, [activeScene?.name, inspectorTarget]);
-  const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed || previewMode));
-  const saveDisabledReason = previewMode
+  }, [activeScene?.name, inspectorTarget, sceneDataDriven]);
+  const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed || previewMode || cadImportActive || cadRestoreActive));
+  const saveDisabledReason = cadImportActive
+    ? "CAD 图纸导入完成后才能保存场景"
+    : cadRestoreActive
+    ? "CAD 图纸恢复完成后才能保存场景"
+    : previewMode
     ? "停止预览后才能保存场景"
     : sceneLoading
       ? "场景读取完成后才能保存"
@@ -327,14 +448,23 @@ export function App() {
         ? "当前场景加载失败，已阻止保存"
         : undefined;
 
+  /** 选区切换到场景属性时，同步缓存场景级配置，供对象属性面板继续显示统一数据源。 */
+  const handleSelectionChange = useCallback((target: InspectorTarget) => {
+    setInspectorTarget(target);
+    if (target.type === "scene") {
+      setSceneEnvironmentColor(target.scene.environment.backgroundColor);
+      setSceneDataDriven(target.scene.dataDriven);
+    }
+  }, []);
+
   const callbacks: EditorEngineCallbacks = useMemo(
     () => ({
       onSceneGraphChange: setNodes,
-      onSelectionChange: setInspectorTarget,
+      onSelectionChange: handleSelectionChange,
       onAssetsChange: setAssets,
       onStatsChange: setStats
     }),
-    []
+    [handleSelectionChange]
   );
 
   /** 刷新 Electron 保存的最近项目列表。 */
@@ -352,6 +482,10 @@ export function App() {
     void refreshRecentProjects();
   }, [refreshRecentProjects]);
 
+  useEffect(() => {
+    setProjectErrorExpanded(false);
+  }, [projectError]);
+
   /** 激活项目并同步默认场景选择。 */
   const activateProject = useCallback((project: DesktopProjectRecord | null) => {
     const nextSceneId = project?.activeSceneId ?? project?.scenes[0]?.id ?? null;
@@ -360,6 +494,15 @@ export function App() {
     setActiveProject(project);
     setActiveSceneId(nextSceneId);
     setProjectError(null);
+    setCadImportProgress(null);
+    setCadImportActive(false);
+    setCadRestoreProgress(null);
+    setCadRestoreActive(false);
+    cadImportActiveRef.current = false;
+    cadRestoreActiveRef.current = false;
+    cadRestoreWarningRef.current = null;
+    cadImportRequestRef.current += 1;
+    cadRestoreRequestRef.current += 1;
     setSceneLoadFailed(false);
   }, []);
 
@@ -371,10 +514,21 @@ export function App() {
   /** 切换项目场景，先同步 ref 再触发 React 状态更新，避免重命名响应竞态。 */
   const handleSceneSelectChange = useCallback(
     (sceneId: string) => {
+      if (cadImportActiveRef.current) {
+        setProjectError("CAD 图纸正在导入，请等待导入完成后再切换场景。");
+        return;
+      }
+
+      engine?.cancelCadRestore();
+      cadRestoreActiveRef.current = false;
+      cadRestoreWarningRef.current = null;
+      setCadRestoreActive(false);
+      setCadRestoreProgress(null);
+      cadRestoreRequestRef.current += 1;
       activeSceneRef.current = { projectPath: activeProject?.path ?? null, sceneId };
       setActiveSceneId(sceneId);
     },
-    [activeProject?.path]
+    [activeProject?.path, engine]
   );
 
   /** 切换项目场景时退出预览，避免旧场景动画状态泄漏到新场景。 */
@@ -431,9 +585,11 @@ export function App() {
   /** 缓存 Babylon 引擎实例，并记录它对应的场景；引擎释放时同步清空旧 UI 快照。 */
   const handleEngineReady = useCallback(
     (nextEngine: BabylonEditorEngine | null) => {
+      const sceneSnapshot = nextEngine?.getSceneInspectorSnapshot();
       setEngine(nextEngine);
       setEngineSceneId(nextEngine ? activeSceneId : null);
-      setSceneEnvironmentColor(nextEngine?.getSceneEnvironmentColor() ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
+      setSceneEnvironmentColor(sceneSnapshot?.environment.backgroundColor ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
+      setSceneDataDriven(sceneSnapshot?.dataDriven ?? DEFAULT_SCENE_DATA_DRIVEN);
       if (!nextEngine) {
         setInspectorTarget(null);
         setNodes([]);
@@ -449,10 +605,17 @@ export function App() {
       return;
     }
 
+    const projectsApi = window.electronApp.projects;
     let cancelled = false;
+    const restoreRequestId = cadRestoreRequestRef.current + 1;
+    cadRestoreRequestRef.current = restoreRequestId;
+    cadRestoreActiveRef.current = false;
+    cadRestoreWarningRef.current = null;
+    setCadRestoreActive(false);
+    setCadRestoreProgress(null);
     setSceneLoading(true);
     setSceneLoadFailed(false);
-    window.electronApp.projects
+    projectsApi
       .loadScene(activeProject.path, activeScene.id)
       .then(async (payload) => {
         if (cancelled) {
@@ -464,15 +627,74 @@ export function App() {
           setProjectError(null);
         }
         if (payload.babylonScene) {
-          await engine.loadSerializedScene(payload.babylonScene);
+          await engine.loadSerializedScene(payload.babylonScene, {
+            loadCadLineChunks: projectsApi.loadAssetFiles
+              ? async (requests) => {
+                  const results = await projectsApi.loadAssetFiles!(
+                    activeProject.path,
+                    requests.map((request) => ({
+                      projectFile: request.projectFile,
+                      expectedByteLength: request.expectedByteLength
+                    }))
+                  );
+                  return results.map((result) => ({
+                    projectFile: result.projectFile,
+                    data: result.data,
+                    lastModified: result.lastModified,
+                    error: result.error
+                  }));
+                }
+              : undefined,
+            loadCadLineChunk: async (projectFile) => {
+              if (!window.electronApp?.projects.loadAssetFile) {
+                throw new Error("当前运行环境不支持读取 CAD 线段侧车文件。");
+              }
+
+              const assetPayload = await projectsApi.loadAssetFile(activeProject.path, projectFile);
+              return assetPayload.data;
+            },
+            onCadRestoreProgress: (progress) => {
+              if (cancelled || cadRestoreRequestRef.current !== restoreRequestId) {
+                return;
+              }
+
+              if (progress.phase === "done") {
+                cadRestoreActiveRef.current = false;
+                setCadRestoreActive(false);
+                setCadRestoreProgress(null);
+                let cadRestoreWarning: string | null = null;
+                if ((progress.skippedChunks ?? 0) > 0) {
+                  cadRestoreWarning = `CAD 图纸恢复完成，但有 ${formatCadProgressCount(progress.skippedChunks)} 个线段分块缺失或损坏，已跳过。`;
+                } else if (progress.message?.includes("失败")) {
+                  cadRestoreWarning = progress.message;
+                }
+
+                cadRestoreWarningRef.current = cadRestoreWarning;
+                if (cadRestoreWarning) {
+                  setProjectError(cadRestoreWarning);
+                }
+                return;
+              }
+
+              cadRestoreActiveRef.current = true;
+              setCadRestoreActive(true);
+              setCadRestoreProgress(progress);
+            }
+          });
           const runtimeWarnings = await restoreModelPackageScriptTextsFromProject(activeProject.path, engine);
           if (!cancelled) {
             engine.initializeModelPackageRuntimesForScene();
-            setProjectError(runtimeWarnings.length > 0 ? runtimeWarnings.join("；") : null);
+            const warnings = [...runtimeWarnings];
+            if (cadRestoreWarningRef.current) {
+              warnings.push(cadRestoreWarningRef.current);
+            }
+            setProjectError(warnings.length > 0 ? warnings.join("；") : null);
           }
         }
         if (!cancelled) {
-          setSceneEnvironmentColor(engine.getSceneEnvironmentColor());
+          const sceneSnapshot = engine.getSceneInspectorSnapshot();
+          setSceneEnvironmentColor(sceneSnapshot.environment.backgroundColor);
+          setSceneDataDriven(sceneSnapshot.dataDriven);
         }
         if (!cancelled) {
           setSceneLoadFailed(false);
@@ -492,6 +714,13 @@ export function App() {
 
     return () => {
       cancelled = true;
+      engine.cancelCadRestore();
+      if (cadRestoreRequestRef.current === restoreRequestId) {
+        cadRestoreRequestRef.current += 1;
+        cadRestoreActiveRef.current = false;
+        setCadRestoreActive(false);
+        setCadRestoreProgress(null);
+      }
     };
   }, [activeProject?.path, activeScene?.id, engine, engineSceneId]);
 
@@ -503,10 +732,10 @@ export function App() {
     [engine]
   );
 
-  /** 层级面板的新建按钮默认创建一个立方体，保持与顶部创建工具一致。 */
+  /** 层级面板的新建按钮创建逻辑分组，供模型拖入后批量管理。 */
   const handleCreateHierarchyNode = useCallback(() => {
-    handleAddPrimitive("cube");
-  }, [handleAddPrimitive]);
+    engine?.createGroup();
+  }, [engine]);
 
   /** 把导入文件复制进项目资产目录，返回 File 对象到项目相对路径的映射。 */
   const persistProjectAssetFiles = useCallback(
@@ -519,12 +748,11 @@ export function App() {
 
       for (const file of Array.from(files)) {
         try {
-          const projectFile = await window.electronApp.projects.saveAssetFile(
-            activeProject.path,
-            getFileAssetId(file),
-            file.name,
-            await file.arrayBuffer()
-          );
+          const sourcePath = window.electronApp.files?.getPath?.(file);
+          const projectFile =
+            sourcePath && window.electronApp.projects.saveAssetFileFromPath
+              ? await window.electronApp.projects.saveAssetFileFromPath(activeProject.path, getFileAssetId(file), sourcePath, file.name)
+              : await window.electronApp.projects.saveAssetFile(activeProject.path, getFileAssetId(file), file.name, await file.arrayBuffer());
           projectFiles.set(file, projectFile);
         } catch (error) {
           failedFiles.add(file);
@@ -657,6 +885,11 @@ export function App() {
       const scriptText = scriptFile ? result.textFiles[scriptFile] ?? "" : "";
       const parsed = parseModelPackageDecorators(scriptText, scriptFile ?? "");
       warnings.push(...parsed.warnings);
+      const dataDriven = parseModelPackageDataDrivenFromScripts(
+        result.textFiles,
+        [runtimeScript.scriptFile, scriptFile, result.scriptFile],
+        warnings
+      );
       const manifest: ModelPackageManifest = {
         version: 1,
         packageId: result.packageId,
@@ -666,6 +899,7 @@ export function App() {
         scriptFile,
         runtimeScriptFile: runtimeScript.scriptFile,
         runtimeClassName: runtimeScript.className,
+        dataDriven,
         metaFile: result.metaFile,
         meta,
         files: mapModelPackageFiles(result.projectFiles),
@@ -682,16 +916,85 @@ export function App() {
     }
   }, [activeProject, engine, loadProjectAssetFiles]);
 
-  /** 从工具栏导入 CAD 图纸，直接在当前场景网格上创建米制矢量线。 */
+  /** 从工具栏或拖拽导入 CAD 图纸，允许同批选择图片参照文件。 */
   const handleImportCadDrawing = useCallback(
-    async (file: File) => {
+    async (input: FileList | File[]) => {
+      if (cadImportActiveRef.current) {
+        return;
+      }
+
+      if (cadRestoreActiveRef.current) {
+        setProjectError("CAD 图纸正在恢复，请等待恢复完成后再导入新的 CAD 图纸。");
+        return;
+      }
+
       if (!engine) {
         setProjectError("3D 引擎尚未准备好，请稍后再导入 CAD 图纸。");
         return;
       }
 
+      const files = Array.from(input);
+      const cadFile = files.find((file) => /\.(dxf|dwg)$/i.test(file.name));
+      if (!cadFile) {
+        setProjectError("请选择 .dxf 格式的 CAD 图纸；如图纸包含外部图片，请同时选择图片文件。");
+        return;
+      }
+
+      const importRequestId = cadImportRequestRef.current + 1;
+      cadImportRequestRef.current = importRequestId;
+      cadImportActiveRef.current = true;
+      setCadImportActive(true);
+      setCadImportProgress({
+        phase: "reading",
+        parsedEntities: 0,
+        emittedSegments: 0,
+        loadedBytes: 0,
+        totalBytes: cadFile.size,
+        message: "准备导入 CAD 图纸"
+      });
+      setProjectError(null);
+
       try {
-        const result = await engine.importCadDrawing(file);
+        const sourcePath = window.electronApp?.files?.getPath?.(cadFile);
+        const canPersistCadLines = Boolean(activeProject && window.electronApp?.projects.saveAssetFile);
+        if (canPersistCadLines) {
+          const persisted = await persistProjectAssetFiles(files);
+          if (persisted.failedFiles.size > 0) {
+            setProjectError("CAD 源文件写入项目目录失败，本次导入已取消，请修复项目目录权限后重试。");
+            return;
+          }
+        }
+
+        const cadLineAssetId = createCadLineAssetId(cadFile);
+        let lastProgressAt = 0;
+        let lastProgressPhase: CadDxfLineProgress["phase"] | null = null;
+        let lastProgressPercent: number | null = null;
+        const result = await engine.importCadDrawing(cadFile, {
+          relatedFiles: files,
+          sourcePath,
+          onProgress: (progress) => {
+            if (cadImportRequestRef.current !== importRequestId || !cadImportActiveRef.current) {
+              return;
+            }
+
+            const now = performance.now();
+            const percent = getCadImportProgressPercent(progress);
+            const phaseChanged = progress.phase !== lastProgressPhase;
+            const percentChanged = percent !== null && (lastProgressPercent === null || Math.abs(percent - lastProgressPercent) >= 1);
+            if (!phaseChanged && !percentChanged && now - lastProgressAt < 500) {
+              return;
+            }
+
+            lastProgressAt = now;
+            lastProgressPhase = progress.phase;
+            lastProgressPercent = percent;
+            setCadImportProgress(progress);
+          },
+          persistLineChunk:
+            activeProject && window.electronApp?.projects.saveAssetFile
+              ? (fileName, data) => window.electronApp!.projects.saveAssetFile(activeProject.path, cadLineAssetId, fileName, data)
+              : undefined
+        });
         setProjectError(
           result.warnings.length > 0
             ? `CAD 图纸已导入，但有提示：${result.warnings.join("；")}`
@@ -699,9 +1002,15 @@ export function App() {
         );
       } catch (error) {
         setProjectError(getErrorMessage(error, "导入 CAD 图纸失败。"));
+      } finally {
+        if (cadImportRequestRef.current === importRequestId) {
+          cadImportActiveRef.current = false;
+          setCadImportActive(false);
+          setCadImportProgress(null);
+        }
       }
     },
-    [engine]
+    [activeProject, engine, persistProjectAssetFiles]
   );
 
   /** 外部文件直接拖入视口时，保持原有立即入场景语义，同时同步写入项目资产库。 */
@@ -709,6 +1018,11 @@ export function App() {
     async (files: FileList, position: Vector3, targetEngine: BabylonEditorEngine) => {
       const fileArray = Array.from(files);
       if (fileArray.length === 0) {
+        return;
+      }
+
+      if (fileArray.some((file) => /\.(dxf|dwg)$/i.test(file.name))) {
+        await handleImportCadDrawing(fileArray);
         return;
       }
 
@@ -720,7 +1034,7 @@ export function App() {
 
       await targetEngine.importFiles(fileArray, position, persisted.projectFiles);
     },
-    [activeProject, persistProjectAssetFiles]
+    [activeProject, handleImportCadDrawing, persistProjectAssetFiles]
   );
 
   /** 从资产库拖入模型时，必要时先按项目相对路径恢复源文件，再实例化到视口。 */
@@ -766,6 +1080,22 @@ export function App() {
     [engine]
   );
 
+  /** 从层级面板切换节点锁定状态，锁定后保留树中查看和解锁能力。 */
+  const handleToggleNodeLock = useCallback(
+    (id: number, locked: boolean) => {
+      engine?.setNodeLockedById(id, locked);
+    },
+    [engine]
+  );
+
+  /** 从层级面板拖拽节点到目标分组；目标为空时移回根级。 */
+  const handleMoveNodeToGroup = useCallback(
+    (id: number, groupId: number | null) => {
+      engine?.moveNodeToGroup(id, groupId);
+    },
+    [engine]
+  );
+
   /** 删除当前选中的场景对象，支持导入模型和基础对象。 */
   const handleDeleteSelected = useCallback(() => {
     engine?.deleteSelected();
@@ -800,7 +1130,7 @@ export function App() {
         return;
       }
 
-      if (!selectedNode || (event.key !== "Delete" && event.key !== "Backspace")) {
+      if (!selectedNode || selectedNode.locked || (event.key !== "Delete" && event.key !== "Backspace")) {
         return;
       }
 
@@ -850,6 +1180,16 @@ export function App() {
 
     if (activeProject && sceneLoadFailed) {
       setProjectError("当前场景上次加载失败，为避免把空场景覆盖到磁盘，已阻止保存。请重新打开项目或切换场景。");
+      return;
+    }
+
+    if (activeProject && cadImportActiveRef.current) {
+      setProjectError("CAD 图纸仍在导入中，为避免保存半成品图纸，请等待导入完成后再保存。");
+      return;
+    }
+
+    if (activeProject && cadRestoreActiveRef.current) {
+      setProjectError("CAD 图纸仍在恢复中，为避免保存不完整线段，请等待恢复完成后再保存。");
       return;
     }
 
@@ -915,6 +1255,61 @@ export function App() {
     [engine]
   );
 
+  /** 从对象属性面板更新场景级数据源配置，保持选中模型不被强制切回场景属性。 */
+  const handleSceneDataDrivenChange = useCallback(
+    (dataDriven: Partial<SceneDataDrivenSnapshot>) => {
+      if (!engine) {
+        return;
+      }
+
+      const nextSceneSnapshot = engine.updateSceneInspector({ dataDriven });
+      const namedSceneSnapshot = {
+        ...nextSceneSnapshot,
+        name: activeScene?.name ?? nextSceneSnapshot.name
+      };
+      setSceneEnvironmentColor(namedSceneSnapshot.environment.backgroundColor);
+      setSceneDataDriven(namedSceneSnapshot.dataDriven);
+      setInspectorTarget((current) => {
+        if (current?.type !== "scene") {
+          return current;
+        }
+
+        return { type: "scene", scene: namedSceneSnapshot };
+      });
+    },
+    [activeScene?.name, engine]
+  );
+
+  /** 启动 Stacker 内置模拟预览，不依赖外部 MQTT/WebSocket 数据源。 */
+  const handleStartStackerDemoPreview = useCallback(
+    (nodeId: number) => {
+      if (!engine) {
+        return;
+      }
+
+      const nextSelection = engine.startStackerDemoPreviewForNode(nodeId);
+      if (!nextSelection) {
+        setProjectError("当前选择不可启动 Stacker 模拟，请选中拖入场景的 Stacker 模型并确认未锁定。");
+        return;
+      }
+
+      engine.setPreviewMode(true);
+      setProjectError(null);
+      const nextSceneSnapshot = engine.getSceneInspectorSnapshot();
+      setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
+      setSceneDataDriven(nextSceneSnapshot.dataDriven);
+      setInspectorTarget((current) => {
+        if (current?.type !== "node") {
+          return current;
+        }
+
+        return nextSelection ? { type: "node", node: nextSelection } : current;
+      });
+      setPreviewMode(true);
+    },
+    [engine]
+  );
+
   /** 从右侧场景属性面板提交场景配置，按字段分发到项目清单或 Babylon 场景 metadata。 */
   const handleSceneInspectorChange = useCallback(
     async (update: SceneInspectorUpdate) => {
@@ -973,6 +1368,7 @@ export function App() {
       }
 
       setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
+      setSceneDataDriven(nextSceneSnapshot.dataDriven);
       setInspectorTarget({ type: "scene", scene: nextSceneSnapshot });
     },
     [activeProject, activeScene, engine, refreshRecentProjects]
@@ -990,6 +1386,7 @@ export function App() {
 
     const nextSceneSnapshot = engine.initializeEditableScene();
     setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
+    setSceneDataDriven(nextSceneSnapshot.dataDriven);
     setInspectorTarget({
       type: "scene",
       scene: {
@@ -1006,6 +1403,20 @@ export function App() {
 
   /** 创建新场景并立即切换到该场景。 */
   const handleCreateScene = useCallback(async () => {
+    if (cadImportActiveRef.current) {
+      setProjectError("CAD 图纸正在导入，请等待导入完成后再新建场景。");
+      return;
+    }
+
+    if (cadRestoreActiveRef.current) {
+      engine?.cancelCadRestore();
+      cadRestoreActiveRef.current = false;
+      cadRestoreWarningRef.current = null;
+      setCadRestoreActive(false);
+      setCadRestoreProgress(null);
+      cadRestoreRequestRef.current += 1;
+    }
+
     if (!activeProject || !sceneName.trim()) {
       return;
     }
@@ -1022,7 +1433,18 @@ export function App() {
     } catch (error) {
       setProjectError(getErrorMessage(error, "创建场景失败。"));
     }
-  }, [activeProject, refreshRecentProjects, sceneName]);
+  }, [activeProject, engine, refreshRecentProjects, sceneName]);
+
+  const activeCadProgress = cadImportProgress ?? cadRestoreProgress;
+  const cadImportPercent = getCadImportProgressPercent(activeCadProgress);
+  const cadImportText = activeCadProgress ? getCadImportProgressText(activeCadProgress) : null;
+  const cadBusy = cadImportActive || cadRestoreActive;
+  const cadImportNavigationTitle = cadImportActive ? "CAD 图纸正在导入，请等待完成" : undefined;
+  const cadImportDisabledReason = cadImportActive
+    ? "CAD 图纸正在导入，请等待完成"
+    : cadRestoreActive
+    ? "CAD 图纸正在恢复，请等待完成后再导入新的 CAD 图纸"
+    : undefined;
 
   if (!activeProject) {
     return (
@@ -1038,7 +1460,7 @@ export function App() {
   }
 
   return (
-    <div className="editor-root">
+    <div className="editor-root" aria-busy={cadBusy}>
       <Toolbar
         tool={tool}
         performanceMode={performanceMode}
@@ -1052,6 +1474,8 @@ export function App() {
         onSave={handleSave}
         saveDisabled={projectSaveBlocked}
         saveDisabledReason={saveDisabledReason}
+        cadImportDisabled={cadBusy}
+        cadImportDisabledReason={cadImportDisabledReason}
         onToggleInspector={handleToggleInspector}
         onTogglePerformance={handleTogglePerformance}
         onTogglePreview={handleTogglePreview}
@@ -1064,7 +1488,12 @@ export function App() {
         </div>
         <label className="scene-switcher">
           <span>场景</span>
-          <select value={activeScene?.id ?? ""} onChange={(event) => handleSceneSelectChange(event.target.value)}>
+          <select
+            value={activeScene?.id ?? ""}
+            title={cadImportNavigationTitle}
+            disabled={cadImportActive}
+            onChange={(event) => handleSceneSelectChange(event.target.value)}
+          >
             {activeProject.scenes.map((scene) => (
               <option key={scene.id} value={scene.id}>
                 {scene.name}
@@ -1081,26 +1510,77 @@ export function App() {
             onChange={(event) => handleSceneEnvironmentColorChange(event.target.value)}
           />
         </label>
-        <button className="icon-text-button" type="button" onClick={() => setSceneDialogOpen(true)}>
+        <button
+          className="icon-text-button"
+          type="button"
+          title={cadImportNavigationTitle}
+          disabled={cadImportActive}
+          onClick={() => setSceneDialogOpen(true)}
+        >
           新建场景
         </button>
-        <button className="icon-text-button danger-button" type="button" disabled={!selectedNode} onClick={handleDeleteSelected}>
+        <button className="icon-text-button danger-button" type="button" disabled={!selectedNode || selectedNode.locked} onClick={handleDeleteSelected}>
           删除选中
         </button>
+        {activeCadProgress && cadImportText && (
+          <div className="cad-import-progress" title={cadImportText}>
+            <span className="cad-import-progress-text">{cadImportText}</span>
+            <div
+              className={`cad-import-progress-track ${cadImportPercent === null ? "is-indeterminate" : ""}`}
+              role="progressbar"
+              aria-label={activeCadProgress.phase === "restoring" ? "CAD 恢复进度" : "CAD 导入进度"}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={cadImportPercent === null ? undefined : Math.round(cadImportPercent)}
+            >
+              <span className="cad-import-progress-fill" style={cadImportPercent === null ? undefined : { width: `${cadImportPercent}%` }} />
+            </div>
+          </div>
+        )}
         {sceneLoading && <span className="scene-status">读取场景中</span>}
-        {projectError && <span className="scene-status scene-error">{projectError}</span>}
-        <button className="icon-text-button" type="button" onClick={() => activateProject(null)}>
+        {projectError && (
+          <>
+            <button
+              className="scene-status scene-error scene-error-button"
+              type="button"
+              title={projectError}
+              aria-expanded={projectErrorExpanded}
+              aria-controls="scene-error-popover"
+              onClick={() => setProjectErrorExpanded((expanded) => !expanded)}
+            >
+              {projectError}
+            </button>
+            {projectErrorExpanded && (
+              <div className="scene-error-popover" id="scene-error-popover" role="alert">
+                <div className="scene-error-popover-body">{projectError}</div>
+                <button className="scene-error-popover-close" type="button" onClick={() => setProjectErrorExpanded(false)}>
+                  关闭
+                </button>
+              </div>
+            )}
+          </>
+        )}
+        <button
+          className="icon-text-button"
+          type="button"
+          title={cadImportNavigationTitle}
+          disabled={cadImportActive}
+          onClick={() => activateProject(null)}
+        >
           返回项目
         </button>
       </div>
 
       <div className="workspace">
         <HierarchyPanel
+          title={activeProject.name}
           nodes={nodes}
           onSelect={handleSelectNode}
           onFocus={handleFocusNode}
           onCreateNode={handleCreateHierarchyNode}
           onToggleVisibility={handleToggleNodeVisibility}
+          onToggleLock={handleToggleNodeLock}
+          onMoveNodeToGroup={handleMoveNodeToGroup}
         />
         <ViewportCanvas
           key={activeScene?.id ?? "empty-scene"}
@@ -1114,10 +1594,15 @@ export function App() {
         />
         <InspectorPanel
           target={panelInspectorTarget}
+          sceneDataDriven={sceneDataDriven}
           onNodeChange={handleInspectorChange}
           onSceneChange={handleSceneInspectorChange}
+          onSceneDataDrivenChange={handleSceneDataDrivenChange}
+          onStartStackerDemoPreview={handleStartStackerDemoPreview}
           onSceneInitialize={handleInitializeScene}
           onImportCadDrawing={handleImportCadDrawing}
+          cadImportDisabled={cadImportActive}
+          cadImportDisabledReason="CAD 图纸正在导入，请等待完成"
         />
         <AssetBrowser assets={assets} onImportFiles={handleImportFiles} onImportModelPackage={handleImportModelPackage} />
       </div>
@@ -1134,7 +1619,13 @@ export function App() {
               <button className="icon-text-button" type="button" onClick={() => setSceneDialogOpen(false)}>
                 取消
               </button>
-              <button className="command-button" type="button" onClick={() => void handleCreateScene()}>
+              <button
+                className="command-button"
+                type="button"
+                title={cadImportNavigationTitle}
+                disabled={cadImportActive}
+                onClick={() => void handleCreateScene()}
+              >
                 创建
               </button>
             </div>

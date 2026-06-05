@@ -1,4 +1,9 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
+
+interface DesktopProjectAssetBatchRequest {
+  projectFile: string;
+  expectedByteLength?: number;
+}
 
 /** 暴露极小桌面端能力面，避免渲染进程直接接触 Node.js。 */
 contextBridge.exposeInMainWorld("electronApp", {
@@ -22,7 +27,16 @@ contextBridge.exposeInMainWorld("electronApp", {
       ipcRenderer.invoke("projects:saveScene", projectPath, sceneId, babylonScene),
     saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) =>
       ipcRenderer.invoke("projects:saveAssetFile", projectPath, assetId, fileName, data),
+    saveAssetFileFromPath: (projectPath: string, assetId: string, sourcePath: string, fileName: string) =>
+      ipcRenderer.invoke("projects:saveAssetFileFromPath", projectPath, assetId, sourcePath, fileName),
     loadAssetFile: (projectPath: string, projectFile: string) => ipcRenderer.invoke("projects:loadAssetFile", projectPath, projectFile),
+    loadAssetFiles: (projectPath: string, requests: DesktopProjectAssetBatchRequest[]) =>
+      ipcRenderer.invoke("projects:loadAssetFiles", projectPath, requests),
     importModelPackage: (projectPath: string) => ipcRenderer.invoke("projects:importModelPackage", projectPath)
+  },
+  files: {
+    getPath: (file: File) => webUtils.getPathForFile(file),
+    readLocalReference: (baseFilePath: string, referencePath: string) =>
+      ipcRenderer.invoke("files:readLocalReference", baseFilePath, referencePath)
   }
 });

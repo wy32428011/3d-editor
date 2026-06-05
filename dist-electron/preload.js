@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 /** 暴露极小桌面端能力面，避免渲染进程直接接触 Node.js。 */
 contextBridge.exposeInMainWorld("electronApp", {
     isElectron: true,
@@ -18,8 +18,14 @@ contextBridge.exposeInMainWorld("electronApp", {
         renameScene: (projectPath, sceneId, name) => ipcRenderer.invoke("projects:renameScene", projectPath, sceneId, name),
         saveScene: (projectPath, sceneId, babylonScene) => ipcRenderer.invoke("projects:saveScene", projectPath, sceneId, babylonScene),
         saveAssetFile: (projectPath, assetId, fileName, data) => ipcRenderer.invoke("projects:saveAssetFile", projectPath, assetId, fileName, data),
+        saveAssetFileFromPath: (projectPath, assetId, sourcePath, fileName) => ipcRenderer.invoke("projects:saveAssetFileFromPath", projectPath, assetId, sourcePath, fileName),
         loadAssetFile: (projectPath, projectFile) => ipcRenderer.invoke("projects:loadAssetFile", projectPath, projectFile),
+        loadAssetFiles: (projectPath, requests) => ipcRenderer.invoke("projects:loadAssetFiles", projectPath, requests),
         importModelPackage: (projectPath) => ipcRenderer.invoke("projects:importModelPackage", projectPath)
+    },
+    files: {
+        getPath: (file) => webUtils.getPathForFile(file),
+        readLocalReference: (baseFilePath, referencePath) => ipcRenderer.invoke("files:readLocalReference", baseFilePath, referencePath)
     }
 });
 //# sourceMappingURL=preload.js.map

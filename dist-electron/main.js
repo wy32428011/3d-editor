@@ -21,6 +21,25 @@ const modelPackageMaxFiles = 200;
 const modelPackageMaxTextFileBytes = 2 * 1024 * 1024;
 const modelPackageMaxReturnedTextBytes = 8 * 1024 * 1024;
 const modelPackageMaxTotalBytes = 1024 * 1024 * 1024;
+const cadReferenceMaxImageBytes = 512 * 1024 * 1024;
+const cadReferenceImageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const projectAssetCopyAllowedExtensions = new Set([
+    ".babylon",
+    ".bin",
+    ".dxf",
+    ".dwg",
+    ".glb",
+    ".gltf",
+    ".jpg",
+    ".jpeg",
+    ".ktx",
+    ".ktx2",
+    ".mtl",
+    ".obj",
+    ".png",
+    ".stl",
+    ".webp"
+]);
 const modelPackageAllowedExtensions = new Set([
     ".glb",
     ".gltf",
@@ -53,6 +72,25 @@ function isMissingPathError(error) {
 /** 把异常转成面向用户的简短文本，保留底层错误线索。 */
 function formatUnknownError(error) {
     return error instanceof Error ? error.message : String(error);
+}
+/** 根据图片扩展名返回 MIME，供渲染端 Blob URL 正确加载。 */
+function getImageMimeType(filePath) {
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === ".jpg" || extension === ".jpeg") {
+        return "image/jpeg";
+    }
+    if (extension === ".webp") {
+        return "image/webp";
+    }
+    if (extension === ".png") {
+        return "image/png";
+    }
+    return "application/octet-stream";
+}
+/** 判断目标路径是否位于给定根目录内，防止 CAD 参照路径越界读取。 */
+function isPathInsideDirectory(targetPath, directoryPath) {
+    const relative = path.relative(directoryPath, targetPath);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 /** 只允许 Electron 打开常见安全外链协议，避免自定义协议被误触发。 */
 function isSafeExternalUrl(url) {
@@ -534,18 +572,42 @@ async function backupSceneFile(projectPath, scene) {
     await fs.copyFile(scenePath, backupPath);
     await pruneSceneBackups(backupDir, `${sceneBaseName}-`);
 }
+/** 生成项目资产相对路径，保证二进制写入和本地文件复制使用同一目录规则。 */
+function getProjectAssetProjectFile(assetId, fileName) {
+    const safeAssetId = toFileSlug(assetId, "asset");
+    const safeName = sanitizeName(path.basename(fileName), "asset");
+    return path
+        .join(projectAssetsDirName, projectAssetSourceDirName, safeAssetId, safeName)
+        .replace(/\\/g, "/");
+}
 /** 把渲染端导入的资产文件保存到项目 assets/source 目录，并返回项目相对路径。 */
 async function saveProjectAssetFile(projectPath, assetId, fileName, data) {
     await readProjectManifest(projectPath);
-    const safeAssetId = toFileSlug(assetId, "asset");
-    const safeName = sanitizeName(path.basename(fileName), "asset");
-    const projectFile = path
-        .join(projectAssetsDirName, projectAssetSourceDirName, safeAssetId, safeName)
-        .replace(/\\/g, "/");
+    const projectFile = getProjectAssetProjectFile(assetId, fileName);
     const assetPath = getProjectAssetPath(projectPath, projectFile);
     await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
     await fs.mkdir(path.dirname(assetPath), { recursive: true });
     await fs.writeFile(assetPath, toBuffer(data));
+    return projectFile;
+}
+/** 从用户选择的本地文件按路径复制到项目资产目录，避免大文件在渲染进程中额外常驻一份 ArrayBuffer。 */
+async function saveProjectAssetFileFromPath(projectPath, assetId, sourcePath, fileName) {
+    await readProjectManifest(projectPath);
+    if (!sourcePath || sourcePath.includes("\0") || !path.isAbsolute(sourcePath)) {
+        throw new Error("本地资产源文件路径无效。");
+    }
+    if (!projectAssetCopyAllowedExtensions.has(path.extname(fileName).toLowerCase())) {
+        throw new Error("该类型文件不允许通过本地路径复制到项目资产。");
+    }
+    const sourceStats = await fs.stat(sourcePath);
+    if (!sourceStats.isFile()) {
+        throw new Error("本地资产源路径不是文件。");
+    }
+    const projectFile = getProjectAssetProjectFile(assetId, fileName);
+    const assetPath = getProjectAssetPath(projectPath, projectFile);
+    await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
+    await fs.mkdir(path.dirname(assetPath), { recursive: true });
+    await fs.copyFile(sourcePath, assetPath);
     return projectFile;
 }
 /** 读取项目内持久化资产文件，供渲染端重新构造 File 并继续实例化。 */
@@ -558,6 +620,107 @@ async function loadProjectAssetFile(projectPath, projectFile) {
         data: toExactArrayBuffer(buffer),
         lastModified: stats.mtimeMs
     };
+}
+/** 批量读取项目资产文件，先校验长度再返回数据，避免损坏 CAD 侧车触发渲染进程 OOM。 */
+async function loadProjectAssetFiles(projectPath, requests) {
+    await readProjectManifest(projectPath);
+    const results = [];
+    for (const request of requests) {
+        if (!request || typeof request.projectFile !== "string") {
+            results.push({
+                projectFile: "",
+                error: "项目资产批量读取请求无效。"
+            });
+            continue;
+        }
+        const { projectFile, expectedByteLength } = request;
+        try {
+            if (expectedByteLength !== undefined &&
+                (!Number.isFinite(expectedByteLength) || expectedByteLength < 0 || !Number.isInteger(expectedByteLength))) {
+                throw new Error("项目资产期望字节数无效。");
+            }
+            const assetPath = getProjectAssetPath(projectPath, projectFile);
+            await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
+            const stats = await fs.stat(assetPath);
+            if (expectedByteLength !== undefined && stats.size !== expectedByteLength) {
+                results.push({
+                    projectFile,
+                    error: `项目资产长度异常：期望 ${expectedByteLength} 字节，实际 ${stats.size} 字节。`
+                });
+                continue;
+            }
+            const buffer = await fs.readFile(assetPath);
+            results.push({
+                projectFile,
+                data: toExactArrayBuffer(buffer),
+                lastModified: stats.mtimeMs
+            });
+        }
+        catch (error) {
+            results.push({
+                projectFile,
+                error: formatUnknownError(error)
+            });
+        }
+    }
+    return results;
+}
+/** 读取 DXF 同目录下的外部图片参照，限制路径范围和文件大小，避免暴露通用文件读取能力。 */
+async function readLocalReferenceFile(baseFilePath, referencePath) {
+    if (!baseFilePath || !referencePath || referencePath.includes("\0")) {
+        return null;
+    }
+    const basePath = path.resolve(baseFilePath);
+    const baseExtension = path.extname(basePath).toLowerCase();
+    if (baseExtension !== ".dxf" && baseExtension !== ".dwg") {
+        return null;
+    }
+    try {
+        const baseStats = await fs.stat(basePath);
+        if (!baseStats.isFile()) {
+            return null;
+        }
+    }
+    catch (error) {
+        if (!isMissingPathError(error)) {
+            console.warn(`CAD 图纸路径校验失败：${basePath}`, error);
+        }
+        return null;
+    }
+    const baseDirectory = path.dirname(basePath);
+    const baseRealPath = await fs.realpath(baseDirectory);
+    const rawCandidate = path.isAbsolute(referencePath) ? path.resolve(referencePath) : path.resolve(baseDirectory, referencePath);
+    const fallbackCandidate = path.resolve(baseDirectory, path.basename(referencePath));
+    const candidates = [...new Set([rawCandidate, fallbackCandidate])];
+    for (const candidate of candidates) {
+        const extension = path.extname(candidate).toLowerCase();
+        if (!cadReferenceImageExtensions.has(extension)) {
+            continue;
+        }
+        try {
+            const realPath = await fs.realpath(candidate);
+            if (!isPathInsideDirectory(realPath, baseRealPath)) {
+                continue;
+            }
+            const stats = await fs.stat(realPath);
+            if (!stats.isFile() || stats.size > cadReferenceMaxImageBytes) {
+                continue;
+            }
+            const buffer = await fs.readFile(realPath);
+            return {
+                data: toExactArrayBuffer(buffer),
+                fileName: path.basename(realPath),
+                lastModified: stats.mtimeMs,
+                mimeType: getImageMimeType(realPath)
+            };
+        }
+        catch (error) {
+            if (!isMissingPathError(error)) {
+                console.warn(`CAD 外部图片参照读取失败：${candidate}`, error);
+            }
+        }
+    }
+    return null;
 }
 /** 判断模型包文件扩展名是否允许复制到项目资产目录。 */
 function isModelPackageAllowedFile(filePath) {
@@ -853,10 +1016,22 @@ function registerProjectIpc() {
         assertAuthorizedProjectPath(projectPath);
         return saveProjectAssetFile(projectPath, assetId, fileName, data);
     });
+    ipcMain.handle("projects:saveAssetFileFromPath", async (_event, projectPath, assetId, sourcePath, fileName) => {
+        assertAuthorizedProjectPath(projectPath);
+        return saveProjectAssetFileFromPath(projectPath, assetId, sourcePath, fileName);
+    });
     ipcMain.handle("projects:loadAssetFile", async (_event, projectPath, projectFile) => {
         assertAuthorizedProjectPath(projectPath);
         return loadProjectAssetFile(projectPath, projectFile);
     });
+    ipcMain.handle("projects:loadAssetFiles", async (_event, projectPath, requests) => {
+        assertAuthorizedProjectPath(projectPath);
+        if (!Array.isArray(requests)) {
+            throw new Error("项目资产批量读取请求必须是数组。");
+        }
+        return loadProjectAssetFiles(projectPath, requests);
+    });
+    ipcMain.handle("files:readLocalReference", async (_event, baseFilePath, referencePath) => readLocalReferenceFile(baseFilePath, referencePath));
     ipcMain.handle("projects:importModelPackage", async (_event, projectPath) => {
         assertAuthorizedProjectPath(projectPath);
         const options = {

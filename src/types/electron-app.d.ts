@@ -39,6 +39,25 @@ declare global {
     lastModified: number;
   }
 
+  interface DesktopProjectAssetBatchRequest {
+    projectFile: string;
+    expectedByteLength?: number;
+  }
+
+  interface DesktopProjectAssetBatchResult {
+    projectFile: string;
+    data?: ArrayBuffer;
+    lastModified?: number;
+    error?: string;
+  }
+
+  interface DesktopLocalReferencePayload {
+    data: ArrayBuffer;
+    fileName: string;
+    lastModified: number;
+    mimeType: string;
+  }
+
   interface DesktopModelPackageProjectFile {
     relativePath: string;
     projectFile: string;
@@ -78,8 +97,17 @@ declare global {
         renameScene: (projectPath: string, sceneId: string, name: string) => Promise<DesktopProjectRecord>;
         saveScene: (projectPath: string, sceneId: string, babylonScene: unknown) => Promise<DesktopProjectRecord>;
         saveAssetFile: (projectPath: string, assetId: string, fileName: string, data: ArrayBuffer) => Promise<string>;
+        saveAssetFileFromPath?: (projectPath: string, assetId: string, sourcePath: string, fileName: string) => Promise<string>;
         loadAssetFile: (projectPath: string, projectFile: string) => Promise<DesktopProjectAssetPayload>;
+        loadAssetFiles?: (
+          projectPath: string,
+          requests: DesktopProjectAssetBatchRequest[]
+        ) => Promise<DesktopProjectAssetBatchResult[]>;
         importModelPackage?: (projectPath: string) => Promise<DesktopModelPackageImportResult | null>;
+      };
+      files?: {
+        getPath: (file: File) => string;
+        readLocalReference: (baseFilePath: string, referencePath: string) => Promise<DesktopLocalReferencePayload | null>;
       };
     };
   }

@@ -28,11 +28,13 @@ interface ToolbarProps {
   onToolChange: (tool: EditorTool) => void;
   onAddPrimitive: (kind: PrimitiveKind) => void;
   onImportFiles: (files: FileList) => void;
-  onImportCadDrawing: (file: File) => void;
+  onImportCadDrawing: (files: FileList | File[]) => void;
   onImportModelPackage: () => void;
   onSave: () => void;
   saveDisabled?: boolean;
   saveDisabledReason?: string;
+  cadImportDisabled?: boolean;
+  cadImportDisabledReason?: string;
   onToggleInspector: () => void;
   onTogglePerformance: () => void;
   onTogglePreview: () => void;
@@ -67,6 +69,8 @@ export function Toolbar({
   onSave,
   saveDisabled = false,
   saveDisabledReason,
+  cadImportDisabled = false,
+  cadImportDisabledReason,
   onToggleInspector,
   onTogglePerformance,
   onTogglePreview
@@ -81,6 +85,10 @@ export function Toolbar({
 
   /** 打开 CAD 图纸选择器，CAD 会直接生成贴地矢量线。 */
   const openCadFilePicker = () => {
+    if (cadImportDisabled) {
+      return;
+    }
+
     cadInputRef.current?.click();
   };
 
@@ -94,9 +102,8 @@ export function Toolbar({
 
   /** 处理 CAD 图纸选择结果，并清空 input 以便重复选择同名文件。 */
   const handleCadFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      onImportCadDrawing(file);
+    if (event.target.files?.length) {
+      onImportCadDrawing(event.target.files);
       event.target.value = "";
     }
   };
@@ -140,7 +147,13 @@ export function Toolbar({
         <button className="icon-button" title="导入资源" type="button" onClick={openFilePicker}>
           <Upload size={18} />
         </button>
-        <button className="icon-button" title="导入 CAD 图纸" type="button" onClick={openCadFilePicker}>
+        <button
+          className="icon-button"
+          title={cadImportDisabled ? cadImportDisabledReason ?? "CAD 图纸正在导入，请等待完成" : "导入 CAD 图纸"}
+          type="button"
+          disabled={cadImportDisabled}
+          onClick={openCadFilePicker}
+        >
           <FileAxis3d size={18} />
         </button>
         <button className="icon-button" title="导入模型包文件夹" type="button" onClick={onImportModelPackage}>
@@ -190,7 +203,15 @@ export function Toolbar({
         accept=".glb,.gltf,.babylon,.obj,.stl,.bin,.mtl,.png,.jpg,.jpeg,.webp,.ktx,.ktx2"
         onChange={handleFileChange}
       />
-      <input ref={cadInputRef} className="hidden-input" type="file" accept=".dxf,.dwg" onChange={handleCadFileChange} />
+      <input
+        ref={cadInputRef}
+        className="hidden-input"
+        type="file"
+        multiple
+        accept=".dxf,.dwg,.png,.jpg,.jpeg,.webp"
+        disabled={cadImportDisabled}
+        onChange={handleCadFileChange}
+      />
     </header>
   );
 }

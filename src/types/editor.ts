@@ -10,7 +10,7 @@ export type PrimitiveKind = "cube" | "sphere" | "cylinder" | "ground" | "light";
 export type PoiKind = "marker" | "info" | "warning" | "camera" | "device" | "label";
 
 /** 场景层级树中的节点类别。 */
-export type SceneNodeKind = "Mesh" | "Transform" | "Light" | "Camera" | "POI" | "CAD" | "Helper";
+export type SceneNodeKind = "Mesh" | "Transform" | "Light" | "Camera" | "POI" | "CAD" | "Helper" | "Group";
 
 /** 三维向量快照，用于 React 面板和 Babylon 对象之间传值。 */
 export interface Vector3Snapshot {
@@ -47,6 +47,43 @@ export interface DynamicInspectorField {
   order: number;
 }
 
+/** 模型脚本数据驱动运动组使用的轴向。 */
+export type ModelDataDrivenAxis = "x" | "y" | "z";
+
+/** 模型脚本声明的设备匹配默认值，不包含网络连接配置。 */
+export interface ModelDataDrivenDeviceDefinition {
+  defaultAssetCode?: string;
+  deviceIdField?: string;
+  assetCodeField?: string;
+  interpolationMs?: number;
+}
+
+/** 模型脚本声明的单个运动组，描述 payload 字段、运动轴向和参与节点。 */
+export interface ModelDataDrivenMotionGroupDefinition {
+  fields: string[];
+  axis: ModelDataDrivenAxis;
+  nodes: string[];
+  fallbackPattern?: string;
+}
+
+/** Stacker 等模型用于本地模拟预览的非持久化数据范围。 */
+export interface ModelDataDrivenSimulationDefinition {
+  intervalMs?: number;
+  travelRange?: number;
+  liftBase?: number;
+  liftRange?: number;
+  forkRange?: number;
+  forkSideRange?: number;
+}
+
+/** 模型脚本导出的数据驱动语义定义；场景级连接仍保存到 sceneDataDriven。 */
+export interface ModelDataDrivenDefinition {
+  device?: ModelDataDrivenDeviceDefinition;
+  motion?: Record<string, ModelDataDrivenMotionGroupDefinition>;
+  fixedNodes?: string[];
+  simulation?: ModelDataDrivenSimulationDefinition;
+}
+
 /** 模型包中文件在导入协议中的角色。 */
 export type ModelPackageFileRole = "primaryModel" | "modelDependency" | "script" | "meta" | "texture" | "other";
 
@@ -72,6 +109,8 @@ export interface ModelPackageManifest {
   runtimeScriptFile?: string;
   /** 运行脚本中的运行类名，默认兼容 ParametricModelRuntimeComponent。 */
   runtimeClassName?: string;
+  /** 模型脚本声明的设备绑定和运动语义，网络连接仍由场景级配置提供。 */
+  dataDriven?: ModelDataDrivenDefinition;
   metaFile?: string;
   meta?: unknown;
   files: ModelPackageProjectFile[];
@@ -131,6 +170,14 @@ export interface TransformSnapshot {
   scaling: Vector3Snapshot;
   visible: boolean;
   materialColor?: string;
+  /** CAD 图纸整体显示透明度，1 表示保留原始线条不额外变淡。 */
+  cadOpacity?: number;
+  /** 当前节点自身是否被锁定，解锁按钮只修改该字段。 */
+  selfLocked: boolean;
+  /** 当前节点是否因自身或父级锁定而处于只读状态。 */
+  locked: boolean;
+  /** 当前节点是否继承了父级 group 的锁定。 */
+  lockedByAncestor: boolean;
   meshVertexModify: MeshVertexModifySnapshot;
   assetInfo: AssetInfoSnapshot;
   /** 文件夹模型包提供的动态参数面板数据；没有模型包时为空。 */
@@ -145,6 +192,8 @@ export interface TransformUpdate {
   scaling?: Vector3Snapshot;
   visible?: boolean;
   materialColor?: string;
+  /** 更新 CAD 图纸整体显示透明度，仅 CAD 根节点生效。 */
+  cadOpacity?: number;
   meshVertexModify?: Partial<MeshVertexModifySnapshot>;
   assetInfo?: Partial<Pick<AssetInfoSnapshot, "assetCode">>;
   /** 更新文件夹模型包实例的单个动态参数，并实时触发本地运行脚本应用到模型。 */
@@ -168,7 +217,10 @@ export interface SceneEnvironmentSnapshot {
   backgroundColor: string;
 }
 
-/** 场景级数据驱动组件配置，本次只负责编辑和持久化，不启动运行时。 */
+/** 场景数据源类型；浏览器端 MQTT 只支持通过 WebSocket 承载的 broker。 */
+export type SceneDataSourceType = "none" | "websocket" | "mqtt";
+
+/** 场景级数据驱动组件配置，负责保存连接参数并在预览模式驱动场景模型。 */
 export interface SceneDataDrivenSnapshot {
   dataDrivenMode: string;
   defaultGenerator: string;
@@ -176,6 +228,24 @@ export interface SceneDataDrivenSnapshot {
   robotArmDriveMode: string;
   boxLineGenerator: string;
   size: number;
+  /** 是否在预览模式启用数据订阅。 */
+  dataConnectionEnabled: boolean;
+  /** 数据源类型，MQTT 需要填写 ws:// 或 wss:// broker 地址。 */
+  dataSourceType: SceneDataSourceType;
+  /** WebSocket 服务或 MQTT over WebSocket broker 地址。 */
+  dataEndpoint: string;
+  /** WebSocket 订阅通道或 MQTT topic。 */
+  dataChannel: string;
+  /** 数据包中用于匹配模型实例的设备字段名。 */
+  deviceIdField: string;
+  /** 场景对象 metadata.editor.assetInfo 中用于匹配的字段名。 */
+  assetCodeField: string;
+  /** 数据包内业务 payload 的可选点路径，留空时直接读取根对象。 */
+  payloadPath: string;
+  /** 模型运动插值时长，0 表示收到数据后立即跳转。 */
+  interpolationMs: number;
+  /** 凭证配置引用，不在场景文件内保存真实密钥。 */
+  credentialProfileId: string;
 }
 
 /** 右侧属性面板的场景级快照。 */
@@ -208,7 +278,16 @@ export const DEFAULT_SCENE_DATA_DRIVEN: SceneDataDrivenSnapshot = {
   devicePropertyInitialization: "不初始化",
   robotArmDriveMode: "全部新能源库",
   boxLineGenerator: "",
-  size: 0
+  size: 0,
+  dataConnectionEnabled: false,
+  dataSourceType: "none",
+  dataEndpoint: "",
+  dataChannel: "",
+  deviceIdField: "deviceId",
+  assetCodeField: "assetCode",
+  payloadPath: "",
+  interpolationMs: 200,
+  credentialProfileId: ""
 };
 
 /** 场景编辑器设置默认值，沿用截图中三项灵敏度的初始数值。 */
@@ -221,12 +300,20 @@ export const DEFAULT_SCENE_EDITOR_SETTINGS: SceneEditorSettingsSnapshot = {
 /** 层级面板展示的扁平化节点数据。 */
 export interface SceneNodeSummary {
   id: number;
+  parentId?: number;
   name: string;
   kind: SceneNodeKind;
   depth: number;
   selected: boolean;
   visible: boolean;
+  hasChildren: boolean;
   childCount: number;
+  /** 当前节点自身是否被锁定，解锁按钮只修改该字段。 */
+  selfLocked: boolean;
+  /** 当前节点是否因自身或父级锁定而处于只读状态。 */
+  locked: boolean;
+  /** 当前节点是否继承了父级 group 的锁定。 */
+  lockedByAncestor: boolean;
 }
 
 /** 资产浏览器中的资源记录。 */

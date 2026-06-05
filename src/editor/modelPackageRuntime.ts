@@ -1,5 +1,6 @@
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { Color3 } from "@babylonjs/core/Maths/math.color";
 import ts from "typescript";
 
 /** 模型包运行脚本默认运行类名，兼容当前 11 个模型包的合并脚本契约。 */
@@ -62,6 +63,7 @@ export function compileModelPackageRuntime(
     const runtimeFactory = new Function(
       "TransformNode",
       "Vector3",
+      "Color3",
       "window",
       "document",
       "globalThis",
@@ -82,6 +84,7 @@ export function compileModelPackageRuntime(
     const constructor = runtimeFactory(
       TransformNode,
       Vector3,
+      Color3,
       undefined,
       undefined,
       undefined,

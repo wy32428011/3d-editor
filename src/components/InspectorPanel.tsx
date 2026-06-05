@@ -10,6 +10,7 @@ import type {
   InspectorTarget,
   MeshVertexModifySnapshot,
   SceneDataDrivenSnapshot,
+  SceneDataSourceType,
   SceneInspectorSnapshot,
   SceneInspectorUpdate,
   TransformSnapshot,
@@ -19,10 +20,15 @@ import type {
 
 interface InspectorPanelProps {
   target: InspectorTarget | null;
+  sceneDataDriven: SceneDataDrivenSnapshot;
   onNodeChange: (update: TransformUpdate) => void;
   onSceneChange: (update: SceneInspectorUpdate) => void | Promise<void>;
+  onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
+  onStartStackerDemoPreview: (nodeId: number) => void;
   onSceneInitialize: () => void;
-  onImportCadDrawing: (file: File) => void | Promise<void>;
+  onImportCadDrawing: (files: FileList | File[]) => void | Promise<void>;
+  cadImportDisabled?: boolean;
+  cadImportDisabledReason?: string;
 }
 
 const vectorKeys: Array<keyof Vector3Snapshot> = ["x", "y", "z"];
@@ -43,17 +49,36 @@ const dataDrivenModeOptions = ["RuntimeDataDrivenZD"];
 const defaultGeneratorOptions = ["注塑托盘（实体）", "空托盘", "默认实体"];
 const deviceInitializationOptions = ["不初始化", "初始化"];
 const robotArmDriveModeOptions = ["全部新能源库", "手动配置", "禁用"];
+const dataSourceTypeOptions: SceneDataSourceType[] = ["none", "websocket", "mqtt"];
+const dataSourceTypeLabels: Record<SceneDataSourceType, string> = {
+  none: "未配置",
+  websocket: "WebSocket",
+  mqtt: "MQTT"
+};
+const stackerDemoDeviceId = "stacker";
+const stackerDemoEndpoint = "ws://127.0.0.1:18083/stacker";
+const stackerDemoTopic = "digital-twin/stacker/state";
 
 /** 右侧属性面板负责按当前目标编辑对象属性或场景级属性。 */
-export function InspectorPanel({ target, onNodeChange, onSceneChange, onSceneInitialize, onImportCadDrawing }: InspectorPanelProps) {
+export function InspectorPanel({
+  target,
+  sceneDataDriven,
+  onNodeChange,
+  onSceneChange,
+  onSceneDataDrivenChange,
+  onStartStackerDemoPreview,
+  onSceneInitialize,
+  onImportCadDrawing,
+  cadImportDisabled = false,
+  cadImportDisabledReason
+}: InspectorPanelProps) {
   const cadInputRef = useRef<HTMLInputElement | null>(null);
 
   /** 从右侧场景面板选择 CAD 文件后复用外层导入逻辑。 */
   const handleCadFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0];
-    event.currentTarget.value = "";
-    if (file) {
-      void onImportCadDrawing(file);
+    if (event.currentTarget.files?.length) {
+      void onImportCadDrawing(event.currentTarget.files);
+      event.currentTarget.value = "";
     }
   };
 
@@ -71,24 +96,54 @@ export function InspectorPanel({ target, onNodeChange, onSceneChange, onSceneIni
         <SceneInspector
           scene={target.scene}
           onChange={onSceneChange}
-          onImportCad={() => cadInputRef.current?.click()}
+          onImportCad={() => {
+            if (!cadImportDisabled) {
+              cadInputRef.current?.click();
+            }
+          }}
+          cadImportDisabled={cadImportDisabled}
+          cadImportDisabledReason={cadImportDisabledReason}
           onInitialize={onSceneInitialize}
         />
-        <input ref={cadInputRef} className="hidden-input" type="file" accept=".dxf,.dwg" onChange={handleCadFileChange} />
+        <input
+          ref={cadInputRef}
+          className="hidden-input"
+          type="file"
+          multiple
+          accept=".dxf,.dwg,.png,.jpg,.jpeg,.webp"
+          disabled={cadImportDisabled}
+          onChange={handleCadFileChange}
+        />
       </aside>
     );
   }
 
-  return <NodeInspector selection={target.node} onChange={onNodeChange} />;
+  return (
+    <NodeInspector
+      selection={target.node}
+      sceneDataDriven={sceneDataDriven}
+      onChange={onNodeChange}
+      onSceneDataDrivenChange={onSceneDataDrivenChange}
+      onStartStackerDemoPreview={onStartStackerDemoPreview}
+    />
+  );
 }
 
 interface NodeInspectorProps {
   selection: TransformSnapshot;
+  sceneDataDriven: SceneDataDrivenSnapshot;
   onChange: (update: TransformUpdate) => void;
+  onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
+  onStartStackerDemoPreview: (nodeId: number) => void;
 }
 
 /** 对象属性分支，保留原有模型、组件参数和资产编号编辑能力。 */
-function NodeInspector({ selection, onChange }: NodeInspectorProps) {
+function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDrivenChange, onStartStackerDemoPreview }: NodeInspectorProps) {
+  const isLocked = selection.locked;
+  const isGroup = selection.kind === "Group";
+  const isCad = selection.kind === "CAD";
+  const isTransformReadOnly = isLocked || isGroup;
+
   return (
     <aside className="panel inspector-panel inspector-panel-redesign">
       <div className="inspector-object-bar">
@@ -96,54 +151,144 @@ function NodeInspector({ selection, onChange }: NodeInspectorProps) {
           aria-label="对象可见性"
           checked={selection.visible}
           className="inspector-object-visible"
+          disabled={isLocked}
           type="checkbox"
           onChange={(event) => onChange({ visible: event.target.checked })}
         />
         <input
           aria-label="对象名称"
           className="inspector-object-name"
+          disabled={isLocked}
           value={selection.name}
           onInput={(event) => onChange({ name: event.currentTarget.value })}
         />
       </div>
+      {isLocked && (
+        <div className="inspector-readonly-banner">
+          {selection.lockedByAncestor && !selection.selfLocked ? "父级分组已锁定，当前模型只读。" : "当前模型已锁定，只能查看属性。"}
+        </div>
+      )}
 
-      <InspectorSection title="空间信息" defaultOpen showRefreshIcon>
-        <CompactVectorEditor label="位置" unit={LENGTH_UNIT_SYMBOL} value={selection.position} onChange={(value) => onChange({ position: value })} />
-        <CompactVectorEditor label="旋转" unit={ROTATION_UNIT_SYMBOL} value={selection.rotation} onChange={(value) => onChange({ rotation: value })} />
-        <CompactVectorEditor label="缩放" unit={SCALE_UNIT_SYMBOL} value={selection.scaling} onChange={(value) => onChange({ scaling: value })} />
-      </InspectorSection>
-
-      {selection.dynamicParameters && (
-        <InspectorSection title={`${selection.dynamicParameters.displayName} 参数`} defaultOpen>
-          <DynamicParameterEditor
-            snapshot={selection.dynamicParameters}
-            onChange={(dynamicParameter) => onChange({ dynamicParameter })}
+      <fieldset className="inspector-readonly-fieldset" disabled={isTransformReadOnly}>
+        <InspectorSection title="空间信息" defaultOpen showRefreshIcon>
+          <CompactVectorEditor
+            key={`${selection.id}:position`}
+            label="位置"
+            unit={LENGTH_UNIT_SYMBOL}
+            value={selection.position}
+            onChange={(value) => onChange({ position: value })}
           />
+          <CompactVectorEditor
+            key={`${selection.id}:rotation`}
+            label="旋转"
+            unit={ROTATION_UNIT_SYMBOL}
+            value={selection.rotation}
+            onChange={(value) => onChange({ rotation: value })}
+          />
+          <CompactVectorEditor
+            key={`${selection.id}:scaling`}
+            label="缩放"
+            unit={SCALE_UNIT_SYMBOL}
+            value={selection.scaling}
+            onChange={(value) => onChange({ scaling: value })}
+          />
+        </InspectorSection>
+      </fieldset>
+
+      {isGroup && (
+        <InspectorSection title="分组" defaultOpen>
+          <div className="inspector-empty-section">当前节点是逻辑分组，可在左侧模型树拖入模型并批量高亮。</div>
         </InspectorSection>
       )}
 
-      {!selection.dynamicParameters && (
-        <InspectorSection title="MeshVertexModifyComponent" defaultOpen>
-          <MeshVertexModifyEditor
-            value={selection.meshVertexModify}
-            materialColor={selection.materialColor}
-            onChange={(meshVertexModify) => onChange({ meshVertexModify })}
-          />
-        </InspectorSection>
+      {isCad && (
+        <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
+          <InspectorSection title="CAD 显示" defaultOpen>
+            <CadDisplayEditor opacity={selection.cadOpacity ?? 1} onChange={(cadOpacity) => onChange({ cadOpacity })} />
+          </InspectorSection>
+        </fieldset>
       )}
 
-      <InspectorSection title="资产信息" defaultOpen>
-        <AssetInfoEditor value={selection.assetInfo} onChange={(assetInfo) => onChange({ assetInfo })} />
-      </InspectorSection>
+      {!isGroup && !isCad && (
+        <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
+          {selection.dynamicParameters && (
+            <InspectorSection title={`${selection.dynamicParameters.displayName} 参数`} defaultOpen>
+              <DynamicParameterEditor
+                snapshot={selection.dynamicParameters}
+                onChange={(dynamicParameter) => onChange({ dynamicParameter })}
+              />
+            </InspectorSection>
+          )}
+
+          {!selection.dynamicParameters && (
+            <InspectorSection title="MeshVertexModifyComponent" defaultOpen>
+              <MeshVertexModifyEditor
+                value={selection.meshVertexModify}
+                materialColor={selection.materialColor}
+                onChange={(meshVertexModify) => onChange({ meshVertexModify })}
+              />
+            </InspectorSection>
+          )}
+
+          <InspectorSection title="资产信息" defaultOpen>
+            <AssetInfoEditor value={selection.assetInfo} onChange={(assetInfo) => onChange({ assetInfo })} />
+          </InspectorSection>
+        </fieldset>
+      )}
 
       <InspectorSection title="关节参数">
         <div className="inspector-empty-section">暂无关节参数</div>
       </InspectorSection>
 
-      <InspectorSection title="数据驱动">
-        <div className="inspector-empty-section">暂无数据驱动配置</div>
+      <InspectorSection title="数据驱动" defaultOpen={!isGroup && !isCad}>
+        {!isGroup && !isCad ? (
+          <NodeDataDrivenEditor
+            nodeLocked={isLocked}
+            selection={selection}
+            sceneDataDriven={sceneDataDriven}
+            onNodeChange={onChange}
+            onSceneDataDrivenChange={onSceneDataDrivenChange}
+            onStartStackerDemoPreview={onStartStackerDemoPreview}
+          />
+        ) : (
+          <div className="inspector-empty-section">数据驱动仅支持模型节点，请选择拖入场景的模型实例。</div>
+        )}
       </InspectorSection>
     </aside>
+  );
+}
+
+interface CadDisplayEditorProps {
+  opacity: number;
+  onChange: (opacity: number) => void;
+}
+
+/** CAD 显示参数只作用于整张图纸根节点，不改变 DXF 原始颜色和几何数据。 */
+function CadDisplayEditor({ opacity, onChange }: CadDisplayEditorProps) {
+  const percent = Math.round(clampNumberValue(opacity, 0.05, 1) * 100);
+
+  /** 统一把百分比控件换算回 0-1 透明度倍率。 */
+  const updatePercent = (nextPercent: number) => {
+    onChange(clampNumberValue(nextPercent, 5, 100) / 100);
+  };
+
+  return (
+    <>
+      <div className="inspector-row cad-opacity-row">
+        <span className="inspector-row-label">透明度</span>
+        <input
+          aria-label="CAD 图纸透明度"
+          className="cad-opacity-slider"
+          max={100}
+          min={5}
+          step={5}
+          type="range"
+          value={percent}
+          onInput={(event) => updatePercent(Number(event.currentTarget.value))}
+        />
+      </div>
+      <InspectorNumberRow label="不透明度(%)" step="5" value={percent} onChange={updatePercent} />
+    </>
   );
 }
 
@@ -151,11 +296,20 @@ interface SceneInspectorProps {
   scene: SceneInspectorSnapshot;
   onChange: (update: SceneInspectorUpdate) => void | Promise<void>;
   onImportCad: () => void;
+  cadImportDisabled?: boolean;
+  cadImportDisabledReason?: string;
   onInitialize: () => void;
 }
 
 /** 场景属性分支，点击非模型区域后显示并编辑场景级配置。 */
-function SceneInspector({ scene, onChange, onImportCad, onInitialize }: SceneInspectorProps) {
+function SceneInspector({
+  scene,
+  onChange,
+  onImportCad,
+  cadImportDisabled = false,
+  cadImportDisabledReason,
+  onInitialize
+}: SceneInspectorProps) {
   return (
     <>
       <InspectorSection title="场景" defaultOpen>
@@ -164,7 +318,13 @@ function SceneInspector({ scene, onChange, onImportCad, onInitialize }: SceneIns
           <button className="inspector-action-button" type="button" onClick={onInitialize}>
             场景初始化
           </button>
-          <button className="inspector-action-button" type="button" onClick={onImportCad}>
+          <button
+            className="inspector-action-button"
+            type="button"
+            disabled={cadImportDisabled}
+            title={cadImportDisabled ? cadImportDisabledReason ?? "CAD 图纸正在导入，请等待完成" : "导入CAD"}
+            onClick={onImportCad}
+          >
             导入CAD
           </button>
         </div>
@@ -285,7 +445,7 @@ interface SceneDataDrivenEditorProps {
   onChange: (update: Partial<SceneDataDrivenSnapshot>) => void;
 }
 
-/** SceneDataDrivenComponent 配置编辑器，本次只写入场景 metadata，不启动运行时。 */
+/** SceneDataDrivenComponent 配置编辑器，保存连接参数并由预览模式启动真实数据驱动。 */
 function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) {
   return (
     <>
@@ -319,6 +479,138 @@ function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) 
         onChange={(boxLineGenerator) => onChange({ boxLineGenerator })}
       />
       <InspectorNumberRow label="Size" step="1" value={value.size} onChange={(size) => onChange({ size })} />
+      <DataSourceConnectionEditor value={value} onChange={onChange} />
+    </>
+  );
+}
+
+interface DataSourceConnectionEditorProps {
+  value: SceneDataDrivenSnapshot;
+  onChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
+}
+
+/** 场景统一数据源连接字段，场景属性和对象数据驱动分区共用同一套写回逻辑。 */
+function DataSourceConnectionEditor({ value, onChange }: DataSourceConnectionEditorProps) {
+  return (
+    <>
+      <InspectorCheckboxRow
+        label="启用连接"
+        checked={value.dataConnectionEnabled}
+        onChange={(dataConnectionEnabled) => onChange({ dataConnectionEnabled })}
+      />
+      <InspectorSelectRow
+        label="数据源"
+        options={dataSourceTypeOptions}
+        optionLabels={dataSourceTypeLabels}
+        value={value.dataSourceType}
+        onChange={(dataSourceType) => onChange({ dataSourceType: dataSourceType as SceneDataSourceType })}
+      />
+      <InspectorTextRow label="连接地址" value={value.dataEndpoint} onChange={(dataEndpoint) => onChange({ dataEndpoint })} />
+      <InspectorTextRow label="通道/Topic" value={value.dataChannel} onChange={(dataChannel) => onChange({ dataChannel })} />
+      <InspectorTextRow label="设备字段" value={value.deviceIdField} onChange={(deviceIdField) => onChange({ deviceIdField })} />
+      <InspectorTextRow label="匹配字段" value={value.assetCodeField} onChange={(assetCodeField) => onChange({ assetCodeField })} />
+      <InspectorTextRow label="数据路径" value={value.payloadPath} onChange={(payloadPath) => onChange({ payloadPath })} />
+      <InspectorNumberRow
+        label="插值(ms)"
+        step="50"
+        value={value.interpolationMs}
+        onChange={(interpolationMs) => onChange({ interpolationMs })}
+      />
+      <InspectorTextRow
+        label="凭证引用"
+        value={value.credentialProfileId}
+        onChange={(credentialProfileId) => onChange({ credentialProfileId })}
+      />
+    </>
+  );
+}
+
+interface NodeDataDrivenEditorProps {
+  nodeLocked: boolean;
+  selection: TransformSnapshot;
+  sceneDataDriven: SceneDataDrivenSnapshot;
+  onNodeChange: (update: TransformUpdate) => void;
+  onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
+  onStartStackerDemoPreview: (nodeId: number) => void;
+}
+
+/** 对象数据驱动入口：模型只保存设备绑定，连接参数仍写入场景级 SceneDataDrivenComponent。 */
+function NodeDataDrivenEditor({
+  nodeLocked,
+  selection,
+  sceneDataDriven,
+  onNodeChange,
+  onSceneDataDrivenChange,
+  onStartStackerDemoPreview
+}: NodeDataDrivenEditorProps) {
+  const sourceTypeLabel = dataSourceTypeLabels[sceneDataDriven.dataSourceType] ?? sceneDataDriven.dataSourceType;
+  const endpointText = sceneDataDriven.dataEndpoint.trim() || "未填写连接地址";
+  const channelText = sceneDataDriven.dataChannel.trim() || "未填写通道/Topic";
+  const connectionText = sceneDataDriven.dataConnectionEnabled ? "连接已启用" : "连接未启用";
+  /** 一键填入本地桥接 demo 配置，模型侧只写绑定设备，连接参数仍写入场景级配置。 */
+  const applyStackerDemoConfig = () => {
+    if (!nodeLocked) {
+      onNodeChange({ assetInfo: { assetCode: stackerDemoDeviceId } });
+    }
+    void onSceneDataDrivenChange({
+      dataConnectionEnabled: true,
+      dataSourceType: "websocket",
+      dataEndpoint: stackerDemoEndpoint,
+      dataChannel: stackerDemoTopic,
+      deviceIdField: "deviceId",
+      assetCodeField: "assetCode",
+      payloadPath: "",
+      interpolationMs: 200,
+      credentialProfileId: ""
+    });
+  };
+
+  return (
+    <>
+      <div className="inspector-data-driven-summary">
+        <div className="inspector-data-driven-summary-title">场景统一数据源</div>
+        <div>{`${connectionText} · ${sourceTypeLabel}`}</div>
+        <div className="inspector-data-driven-summary-line" title={endpointText}>
+          {endpointText}
+        </div>
+        <div className="inspector-data-driven-summary-line" title={channelText}>
+          {channelText}
+        </div>
+      </div>
+      <div className="inspector-data-demo-actions">
+        <button
+          className="inspector-data-demo-button is-primary"
+          disabled={nodeLocked}
+          type="button"
+          title={nodeLocked ? "当前模型已锁定，请先解锁后再启动模拟。" : "启动内置 Stacker 模拟数据并进入预览"}
+          onClick={() => onStartStackerDemoPreview(selection.id)}
+        >
+          启动 Stacker 模拟
+        </button>
+        <button
+          className="inspector-data-demo-button"
+          disabled={nodeLocked}
+          type="button"
+          title={nodeLocked ? "当前模型已锁定，请先解锁后再写入 demo 绑定。" : "填入本地 Stacker MQTT demo 桥接配置"}
+          onClick={applyStackerDemoConfig}
+        >
+          填入 Stacker Demo
+        </button>
+      </div>
+      <label className="inspector-row">
+        <span className="inspector-row-label">绑定设备</span>
+        <input
+          className="inspector-input"
+          disabled={nodeLocked}
+          placeholder="stacker"
+          title="写入对象资产编号，用于匹配数据包中的设备号"
+          value={selection.assetInfo.assetCode}
+          onInput={(event) => onNodeChange({ assetInfo: { assetCode: event.currentTarget.value } })}
+        />
+      </label>
+      <div className="inspector-data-source-editor">
+        <DataSourceConnectionEditor value={sceneDataDriven} onChange={onSceneDataDrivenChange} />
+      </div>
     </>
   );
 }
@@ -326,12 +618,13 @@ function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) 
 interface InspectorSelectRowProps {
   label: string;
   options: string[];
+  optionLabels?: Record<string, string>;
   value: string;
   onChange: (value: string) => void;
 }
 
 /** 紧凑下拉行，沿用属性面板输入框视觉。 */
-function InspectorSelectRow({ label, options, value, onChange }: InspectorSelectRowProps) {
+function InspectorSelectRow({ label, options, optionLabels = {}, value, onChange }: InspectorSelectRowProps) {
   const normalizedOptions = options.includes(value) ? options : [value, ...options].filter((item) => item.length > 0);
   return (
     <label className="inspector-row">
@@ -339,7 +632,7 @@ function InspectorSelectRow({ label, options, value, onChange }: InspectorSelect
       <select className="inspector-input" value={value} onChange={(event) => onChange(event.currentTarget.value)}>
         {normalizedOptions.map((option) => (
           <option key={option} value={option}>
-            {option}
+            {optionLabels[option] ?? option}
           </option>
         ))}
       </select>
@@ -396,12 +689,23 @@ interface CompactVectorEditorProps {
 
 /** 紧凑三轴编辑器让 X/Y/Z 在右侧窄面板中保持单行。 */
 function CompactVectorEditor({ label, unit, value, onChange }: CompactVectorEditorProps) {
-  /** 修改单个轴向数值，并保留其他轴向不变。 */
+  const [draft, setDraft] = useState(value);
+  const draftRef = useRef(value);
+
+  useEffect(() => {
+    draftRef.current = value;
+    setDraft(value);
+  }, [value.x, value.y, value.z]);
+
+  /** 修改单个轴向数值，并基于最新本地草稿保留其他轴向。 */
   const updateAxis = (axis: keyof Vector3Snapshot, nextValue: number) => {
-    onChange({
-      ...value,
+    const nextDraft = {
+      ...draftRef.current,
       [axis]: nextValue
-    });
+    };
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
+    onChange(nextDraft);
   };
 
   return (
@@ -413,9 +717,9 @@ function CompactVectorEditor({ label, unit, value, onChange }: CompactVectorEdit
             <span className="inspector-axis-label">{axis.toUpperCase()}</span>
             <InspectorNumberInput
               className="inspector-axis-input"
-              title={`${axis.toUpperCase()}: ${value[axis]} ${unit}`}
+              title={`${axis.toUpperCase()}: ${draft[axis]} ${unit}`}
               step="0.1"
-              value={value[axis]}
+              value={draft[axis]}
               onChange={(nextValue) => updateAxis(axis, nextValue)}
             />
           </label>

@@ -18,6 +18,7 @@
     "@babylonjs/core": "^9.0.0",
     "@babylonjs/inspector": "^9.0.0",
     "@babylonjs/loaders": "^9.0.0",
+    "earcut": "^3.0.2",
     "lucide-react": "^0.511.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
@@ -64,5 +65,20 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Babylon 3D Editor"
     }
-  }
+  },
+  "description": "基于 Babylon.js 技术栈实现的桌面 3D 场景编辑器原型，目标是提供接近 Unity Scene View 的基础编辑体验：层级树、中央 3D 视口、属性面板、资产浏览器、拖拽创建、拖拽导入、Gizmo 变换和场景保存。当前工程已接入 Electron，可生成 Windows 安装程序。",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wy32428011/3d-editor.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/wy32428011/3d-editor/issues"
+  },
+  "homepage": "https://github.com/wy32428011/3d-editor#readme"
 }

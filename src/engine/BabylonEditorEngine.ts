@@ -18,7 +18,7 @@ import { Light } from "@babylonjs/core/Lights/light";
 import { PointLight } from "@babylonjs/core/Lights/pointLight";
 import { HighlightLayer } from "@babylonjs/core/Layers/highlightLayer";
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
-import { Matrix, Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
 import type { Material } from "@babylonjs/core/Materials/material";
 import { MultiMaterial } from "@babylonjs/core/Materials/multiMaterial";
@@ -26,8 +26,11 @@ import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { DynamicTexture } from "@babylonjs/core/Materials/Textures/dynamicTexture";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
+import { LinesMesh } from "@babylonjs/core/Meshes/linesMesh";
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
+import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
+import { CreatePolygon } from "@babylonjs/core/Meshes/Builders/polygonBuilder";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
 import { Node } from "@babylonjs/core/node";
 import { ImportMeshAsync, LoadAssetContainerAsync } from "@babylonjs/core/Loading/sceneLoader";
@@ -37,6 +40,7 @@ import { Scene } from "@babylonjs/core/scene";
 import type { Animatable } from "@babylonjs/core/Animations/animatable";
 import type { Animation } from "@babylonjs/core/Animations/animation";
 import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
+import earcut from "earcut";
 import { applySnapshotVector, formatBytes, snapshotVector } from "../editor/math";
 import {
   compileModelPackageRuntime,
@@ -44,7 +48,23 @@ import {
   invokeModelPackageRuntimeLifecycle,
   type ModelPackageRuntimeInstance
 } from "../editor/modelPackageRuntime";
-import { parseCadDxf, type CadDxfBounds, type CadDxfParseResult, type CadDxfPolyline } from "../editor/cadDxf";
+import { SceneDataDrivenRuntime, type SceneDataDrivenTarget } from "../editor/sceneDataDrivenRuntime";
+import {
+  parseCadDxfLineStream,
+  type CadDxfBounds,
+  type CadDxfFill,
+  type CadDxfImagePrimitive,
+  type CadDxfLineChunk,
+  type CadDxfLineChunkStyle,
+  type CadDxfLineProgress,
+  type CadDxfParseResult,
+  type CadDxfPointPrimitive,
+  type CadDxfPolyline,
+  type CadDxfPrimitive,
+  type CadDxfText,
+  type CadDxfWipeoutPrimitive,
+  type CadLineImportSummary
+} from "../editor/cadDxf";
 import {
   createModelUnitMetadata,
   getPersistedModelUnitMetadata,
@@ -76,11 +96,13 @@ import type {
   EditorStats,
   EditorTool,
   MeshVertexModifySnapshot,
+  ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
   PoiKind,
   PrimitiveKind,
   SceneDataDrivenSnapshot,
+  SceneDataSourceType,
   SceneEditorSettingsSnapshot,
   SceneInspectorSnapshot,
   SceneInspectorUpdate,
@@ -93,10 +115,15 @@ import type {
 const HELPER_FLAG = "isEditorHelper";
 const ROOT_FLAG = "isEditorRoot";
 const DROP_SURFACE_FLAG = "isEditorDropSurface";
+const GROUP_NODE_TYPE = "group";
+const STACKER_DEMO_DEVICE_ID = "stacker";
+const STACKER_DEMO_ENDPOINT = "ws://127.0.0.1:18083/stacker";
+const STACKER_DEMO_TOPIC = "digital-twin/stacker/state";
 export const DEFAULT_SCENE_ENVIRONMENT_COLOR = "#26312d";
 const GRID_RENDER_ELEVATION_METERS = 0.015;
 const EDITOR_LENGTH_UNIT = "meter";
 const IMPORTED_MODEL_UNIT_POLICY = "imported-model-coordinates-are-meters";
+const CAD_LINE_CHUNK_PERSIST_CONCURRENCY = 2;
 const IMPORTED_MODEL_NORMALIZED_UNIT_POLICY = "imported-model-source-units-normalized-to-meters";
 const GRID_MAJOR_LINE_EVERY_CELLS = 5;
 const MAX_GRID_LINE_COUNT_PER_AXIS = 160;
@@ -111,7 +138,18 @@ const GRID_FLASH_PULSE_ELEVATION_OFFSET_METERS = 0.026;
 const GRID_FLASH_SWEEP_ELEVATION_OFFSET_METERS = 0.018;
 const MAX_MODEL_PACKAGE_RUNTIME_GENERATED_NODES = 5000;
 const CAD_LINE_ELEVATION_METERS = GRID_RENDER_ELEVATION_METERS + 0.045;
-const CAD_LINE_CHUNK_SEGMENTS = 20000;
+const CAD_LINE_CHUNK_SEGMENTS = 32000;
+const CAD_LINE_PACK_MAX_BYTES = 20 * 1024 * 1024;
+const CAD_RESTORE_MESH_SEGMENTS = 32000;
+const CAD_RESTORE_BATCH_CHUNKS = 48;
+const CAD_RESTORE_YIELD_MESHES = 8;
+const CAD_FILL_ELEVATION_METERS = CAD_LINE_ELEVATION_METERS - 0.012;
+const CAD_IMAGE_ELEVATION_METERS = CAD_FILL_ELEVATION_METERS - 0.01;
+const CAD_WIPEOUT_ELEVATION_METERS = CAD_FILL_ELEVATION_METERS + 0.006;
+const CAD_TEXT_ELEVATION_METERS = CAD_LINE_ELEVATION_METERS + 0.018;
+const CAD_POINT_MARKER_SIZE_METERS = 0.28;
+const CAD_TEXT_TEXTURE_MAX_SIZE = 2048;
+const IGNORED_CAD_IMAGE_EXTENSIONS = new Set([".bmp"]);
 const COORDINATE_AXIS_LENGTH_METERS = 3.2;
 const COORDINATE_AXIS_HEAD_LENGTH_METERS = 0.42;
 const COORDINATE_AXIS_HEAD_WIDTH_METERS = 0.22;
@@ -132,6 +170,19 @@ const DEFAULT_CAMERA_PANNING_SENSIBILITY = 55;
 const DEFAULT_CAMERA_ROTATION_SENSIBILITY = 1000;
 const MIN_CAMERA_INPUT_SENSIBILITY = 1;
 const MAX_CAMERA_INPUT_SENSIBILITY = 100000;
+
+/** 提取引擎内部异步错误消息，避免跨 worker/IPC 的非 Error 异常丢失上下文。 */
+function getEngineErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  return fallback;
+}
 const POI_STEM_HEIGHT_METERS = 1.35;
 const POI_STEM_DIAMETER_METERS = 0.045;
 const POI_BASE_DIAMETER_METERS = 0.42;
@@ -185,6 +236,150 @@ interface ImportedModelMetricMetadataOptions extends MetricModelMetadataOptions 
   unitNormalization: ModelUnitMetadata;
 }
 
+/** CAD 导入时的图片依赖上下文，优先同批 File，其次 Electron 受控读取 DXF 同目录引用。 */
+interface CadDrawingImportOptions {
+  relatedFiles?: File[];
+  sourcePath?: string;
+  persistLineChunk?: (fileName: string, data: ArrayBuffer) => Promise<string>;
+  onProgress?: (progress: CadDxfLineProgress) => void;
+}
+
+/** 加载项目场景时用于恢复 CAD 侧车线段文件。 */
+interface SerializedSceneLoadOptions {
+  loadCadLineChunk?: (projectFile: string) => Promise<ArrayBuffer>;
+  loadCadLineChunks?: (requests: CadLineChunkLoadRequest[]) => Promise<CadLineChunkLoadResult[]>;
+  onCadRestoreProgress?: (progress: CadDxfLineProgress) => void;
+}
+
+/** CAD 侧车 chunk manifest，只保存小型索引信息，真实线段在 .cadlines.bin 中。 */
+interface CadLineChunkManifest {
+  chunkId: string;
+  fileName: string;
+  projectFile?: string;
+  packFile?: string;
+  packProjectFile?: string;
+  byteOffset?: number;
+  byteLength?: number;
+  packByteLength?: number;
+  style: CadDxfLineChunkStyle;
+  segmentCount: number;
+  bounds: CadDxfBounds;
+}
+
+interface CadLineChunkLoadRequest {
+  projectFile: string;
+  expectedByteLength?: number;
+}
+
+interface CadLineChunkLoadResult {
+  projectFile: string;
+  data?: ArrayBuffer;
+  lastModified?: number;
+  error?: string;
+}
+
+/** CAD 根节点 metadata 中保存的侧车 chunk 清单。 */
+interface CadChunkManifestMetadata {
+  version: number;
+  sourceFile?: string;
+  sourcePath?: string;
+  bounds?: CadDxfBounds;
+  rawBounds?: CadDxfBounds;
+  unit?: unknown;
+  segmentCount?: number;
+  chunkSegmentLimit?: number;
+  chunks: CadLineChunkManifest[];
+}
+
+interface CadDxfWorkerStartMessage {
+  type: "start";
+  fileName: string;
+  text: string;
+  sourcePath?: string;
+  projectMode?: boolean;
+}
+
+interface CadDxfWorkerChunkMessage {
+  type: "chunk";
+  chunkId: string;
+  style: CadDxfLineChunkStyle;
+  segmentCount: number;
+  positionsBuffer: ArrayBuffer;
+  bounds: CadDxfBounds;
+}
+
+interface CadDxfWorkerProgressMessage {
+  type: "progress";
+  progress: CadDxfLineProgress;
+}
+
+interface CadDxfWorkerDoneMessage {
+  type: "done";
+  summary: CadLineImportSummary;
+}
+
+interface CadDxfWorkerErrorMessage {
+  type: "error";
+  message: string;
+  detail?: string;
+}
+
+type CadDxfWorkerMessage =
+  | CadDxfWorkerChunkMessage
+  | CadDxfWorkerProgressMessage
+  | CadDxfWorkerDoneMessage
+  | CadDxfWorkerErrorMessage;
+
+/** 已解析为浏览器可加载 URL 的 CAD 图片参照。 */
+interface CadResolvedImageSource {
+  url: string;
+  fileName: string;
+  source: "batch" | "local";
+  revoke: () => void;
+}
+
+/** 保存后的 CAD 图片引用恢复上下文，只依赖原始 DXF 文件路径和 IMAGE metadata。 */
+interface CadImageRestoreContext {
+  sourcePath?: string;
+}
+
+/** CAD 图片加载上下文，集中记录临时 URL 以便失败时释放。 */
+interface CadImageRenderContext {
+  sourcePath?: string;
+  relatedFiles: File[];
+  objectUrls: string[];
+}
+
+/** CAD 线段分块写入器，按样式复用 typed array，避免为超大图纸创建 Vector3/Color4 对象数组。 */
+interface CadLineChunkBuilder {
+  layer: string;
+  colorHex: string;
+  alpha: number;
+  color: Color3;
+  positions: Float32Array;
+  indices: Uint16Array;
+  positionOffset: number;
+  indexOffset: number;
+  vertexIndex: number;
+  segmentCount: number;
+  chunkIndex: number;
+}
+
+interface CadRestoreChunkTask {
+  root: TransformNode;
+  chunk: CadLineChunkManifest;
+}
+
+interface CadRestoreMergedLineBuilder {
+  root: TransformNode;
+  style: CadDxfLineChunkStyle;
+  chunkIds: string[];
+  positions: Float32Array;
+  offset: number;
+  segmentCount: number;
+  meshIndex: number;
+}
+
 /** 预览模式进入前的编辑相机状态，用于退出预览时恢复用户视角。 */
 interface PreviewCameraSnapshot {
   alpha: number;
@@ -222,6 +417,17 @@ interface ModelPackageRuntimeHandle {
   started: boolean;
 }
 
+/** 模型包运行脚本生命周期调用前后的用户可编辑状态快照。 */
+interface ModelPackageEditableStateSnapshot {
+  name: string;
+  position: Vector3;
+  rotation: Vector3;
+  rotationQuaternion: Quaternion | null;
+  scaling: Vector3;
+  modelPackageInstance: Record<string, unknown>;
+  values: Record<string, DynamicParameterValue>;
+}
+
 /** 管理 Babylon.js 运行时、编辑器交互、资产导入与场景序列化。 */
 export class BabylonEditorEngine {
   private readonly canvas: HTMLCanvasElement;
@@ -236,12 +442,15 @@ export class BabylonEditorEngine {
   private readonly assetDependencyFiles = new Map<string, File[]>();
   private readonly modelPackageScriptTexts = new Map<string, Map<string, string>>();
   private readonly modelPackageRuntimeHandles = new Map<number, ModelPackageRuntimeHandle>();
+  private readonly sceneDataDrivenRuntime: SceneDataDrivenRuntime;
   private readonly localImportFileKeys = new Set<string>();
   private readonly highlightedMeshes = new Set<Mesh>();
   private selectedNode: TransformNode | null = null;
   private currentTool: EditorTool = "move";
   private performanceMode = false;
   private previewMode = false;
+  private pendingStackerDemoSimulation = false;
+  private stackerDemoSimulationActive = false;
   private previewCameraSnapshot: PreviewCameraSnapshot | null = null;
   private previewAnimationGroupSnapshots: PreviewAnimationGroupSnapshot[] = [];
   private previewDirectAnimationSnapshots: PreviewDirectAnimationSnapshot[] = [];
@@ -250,6 +459,7 @@ export class BabylonEditorEngine {
   private clipboardPasteCount = 0;
   private readonly clipboardPasteOffset = new Vector3(0.5, 0, 0.5);
   private statsStamp = 0;
+  private dataDrivenSelectionSyncStamp = 0;
   private primitiveSeed = 1;
   private poiSeed = 1;
   private transformSyncFrame = 0;
@@ -262,6 +472,7 @@ export class BabylonEditorEngine {
   private readonly gridFlashSweepMeshes: AbstractMesh[] = [];
   private readonly observedTransformGizmos = new WeakSet<object>();
   private readonly handleResize = () => this.resize();
+  private cadRestoreGeneration = 0;
 
   /** 初始化渲染引擎、默认场景和所有编辑器输入绑定。 */
   public constructor(canvas: HTMLCanvasElement, callbacks: EditorEngineCallbacks) {
@@ -280,11 +491,19 @@ export class BabylonEditorEngine {
     this.highlightLayer = new HighlightLayer("EditorSelectionHighlight", this.scene);
 
     this.configureGizmos();
+    this.sceneDataDrivenRuntime = new SceneDataDrivenRuntime({
+      scene: this.scene,
+      getConfig: () => this.createSceneInspectorSnapshot().dataDriven,
+      getTargets: () => this.createSceneDataDrivenTargets(),
+      onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now)
+    });
     this.createDefaultScene();
     this.bindPointerSelection();
     this.bindStatsLoop();
     this.bindResize();
     this.engine.runRenderLoop(() => {
+      const now = performance.now();
+      this.updateSceneDataDrivenRuntime(now);
       this.updateDynamicGridForCamera();
       this.updateGridFlash();
       this.syncEditorCameraPanSpeed();
@@ -296,11 +515,13 @@ export class BabylonEditorEngine {
 
   /** 释放 Babylon 资源，避免切换页面后遗留 WebGL 上下文。 */
   public dispose(): void {
+    this.cancelCadRestore();
     if (this.transformSyncFrame) {
       window.cancelAnimationFrame(this.transformSyncFrame);
       this.transformSyncFrame = 0;
     }
     window.removeEventListener("resize", this.handleResize);
+    this.sceneDataDrivenRuntime.stop(false);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
     this.clearRegisteredLocalImportFiles();
@@ -308,6 +529,11 @@ export class BabylonEditorEngine {
     this.gizmoManager.dispose();
     this.scene.dispose();
     this.engine.dispose();
+  }
+
+  /** 递增 CAD 恢复代号，让正在后台运行的旧恢复任务在下一次检查时退出。 */
+  public cancelCadRestore(): void {
+    this.cadRestoreGeneration += 1;
   }
 
   /** 同步画布 CSS 尺寸和 WebGL 后备缓冲，避免布局变化后视口变黑或取景错位。 */
@@ -376,6 +602,14 @@ export class BabylonEditorEngine {
       sceneEditorSettings: editorSettings,
       sceneDataDriven: dataDriven
     });
+    if (update.dataDriven && this.previewMode) {
+      if (this.stackerDemoSimulationActive) {
+        this.sceneDataDrivenRuntime.startStackerDemoSimulation(this.createStackerDemoDataDrivenSnapshot());
+      } else {
+        this.pendingStackerDemoSimulation = false;
+        this.sceneDataDrivenRuntime.restart();
+      }
+    }
     this.scene.render();
     this.emitSelectionSnapshot();
     return this.createSceneInspectorSnapshot();
@@ -413,6 +647,47 @@ export class BabylonEditorEngine {
     this.exitPreviewMode();
   }
 
+  /** 为指定模型启动 Stacker 本地模拟预览；模拟源只存在于预览运行态，不新增场景文件字段。 */
+  public startStackerDemoPreviewForNode(id: number): TransformSnapshot | null {
+    const node = this.findTransformNodeByUniqueId(id);
+    if (!node || node.metadata?.[HELPER_FLAG]) {
+      return null;
+    }
+
+    const targetRoot = this.findSceneDataDrivenRootForNode(node);
+    if (!targetRoot || this.isNodeLocked(targetRoot) || this.isEditorGroup(targetRoot) || this.isCadDrawingNode(targetRoot)) {
+      return null;
+    }
+
+    const stackerTarget = {
+      root: targetRoot,
+      matchFields: this.createSceneDataDrivenMatchFields(targetRoot),
+      dataDriven: this.getModelDataDrivenDefinition(targetRoot)
+    };
+    if (!this.sceneDataDrivenRuntime.canDriveStackerTarget(stackerTarget)) {
+      return null;
+    }
+
+    const demoDeviceId = stackerTarget.dataDriven?.device?.defaultAssetCode?.trim() || STACKER_DEMO_DEVICE_ID;
+    this.updateNodeAssetInfo(targetRoot, { assetCode: demoDeviceId });
+    const demoConfig = this.createStackerDemoDataDrivenSnapshot(targetRoot);
+    this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata, {
+      sceneDataDriven: demoConfig
+    });
+    if (this.previewMode) {
+      this.sceneDataDrivenRuntime.startStackerDemoSimulation(demoConfig);
+      this.stackerDemoSimulationActive = true;
+    } else {
+      this.pendingStackerDemoSimulation = true;
+    }
+
+    this.refreshNodeWorldMatrices(targetRoot);
+    const snapshot = this.createTransformSnapshot(targetRoot);
+    this.scene.render();
+    this.emitSelectionSnapshot();
+    return snapshot;
+  }
+
   /** 进入预览模式时保存编辑视角、隐藏编辑辅助交互，并播放动画。 */
   private enterPreviewMode(): void {
     this.previewMode = true;
@@ -421,17 +696,163 @@ export class BabylonEditorEngine {
     this.syncGizmoMode();
     this.frameEditableSceneInView(this.selectedNode);
     this.startPreviewAnimations();
+    if (this.pendingStackerDemoSimulation) {
+      this.sceneDataDrivenRuntime.startStackerDemoSimulation(this.createStackerDemoDataDrivenSnapshot());
+      this.pendingStackerDemoSimulation = false;
+      this.stackerDemoSimulationActive = true;
+    } else {
+      this.stackerDemoSimulationActive = false;
+      this.sceneDataDrivenRuntime.start();
+    }
     this.scene.render();
   }
 
   /** 退出预览模式时停止动画，并恢复进入预览前的编辑视角与选择辅助。 */
   private exitPreviewMode(): void {
+    this.pendingStackerDemoSimulation = false;
+    this.stackerDemoSimulationActive = false;
+    this.sceneDataDrivenRuntime.stop(true);
     this.stopPreviewAnimations();
     this.restorePreviewCameraSnapshot();
     this.previewMode = false;
     this.applyHighlight(this.selectedNode);
     this.syncGizmoMode();
     this.scene.render();
+  }
+
+  /** 推进场景数据驱动插值，并在必要时同步选中面板快照。 */
+  private updateSceneDataDrivenRuntime(now: number): void {
+    const changedRoots = this.sceneDataDrivenRuntime.update(now);
+    if (changedRoots.length === 0) {
+      return;
+    }
+
+    this.handleSceneDataDrivenTargetsChanged(changedRoots, now);
+  }
+
+  /** 处理数据驱动导致的模型姿态变化，集中刷新世界矩阵和属性面板快照。 */
+  private handleSceneDataDrivenTargetsChanged(roots: TransformNode[], now: number): void {
+    const uniqueRoots = [...new Map(roots.map((root) => [root.uniqueId, root])).values()];
+    uniqueRoots.forEach((root) => this.refreshNodeWorldMatrices(root));
+    if (!this.selectedNode || now - this.dataDrivenSelectionSyncStamp < 160) {
+      return;
+    }
+
+    if (uniqueRoots.some((root) => this.isSelectedNodeUnderRoot(root))) {
+      this.dataDrivenSelectionSyncStamp = now;
+      this.emitSelectionSnapshot();
+    }
+  }
+
+  /** 生成 Stacker demo 使用的场景级连接配置；用于面板展示，真实模拟源仍是预览态临时连接。 */
+  private createStackerDemoDataDrivenSnapshot(root?: TransformNode): SceneDataDrivenSnapshot {
+    const current = this.createSceneInspectorSnapshot().dataDriven;
+    const dataDriven = root ? this.getModelDataDrivenDefinition(root) : undefined;
+    const device = dataDriven?.device;
+    return {
+      ...current,
+      dataConnectionEnabled: true,
+      dataSourceType: "websocket",
+      dataEndpoint: STACKER_DEMO_ENDPOINT,
+      dataChannel: STACKER_DEMO_TOPIC,
+      deviceIdField: device?.deviceIdField?.trim() || current.deviceIdField || "deviceId",
+      assetCodeField: device?.assetCodeField?.trim() || current.assetCodeField || "assetCode",
+      payloadPath: "",
+      interpolationMs: device?.interpolationMs ?? current.interpolationMs ?? 200,
+      credentialProfileId: ""
+    };
+  }
+
+  /** 找到节点所属的数据驱动根节点，确保模型子节点触发 demo 时也写到可匹配的根节点。 */
+  private findSceneDataDrivenRootForNode(node: TransformNode): TransformNode | null {
+    return (
+      this.createSceneDataDrivenTargets().find((target) => node === target.root || node.isDescendantOf?.(target.root))?.root ??
+      node
+    );
+  }
+
+  /** 收集当前场景中可由外部数据匹配的模型根节点。 */
+  private createSceneDataDrivenTargets(): SceneDataDrivenTarget[] {
+    const roots = new Map<number, TransformNode>();
+    const visit = (node: Node): void => {
+      if (node.metadata?.[HELPER_FLAG]) {
+        return;
+      }
+
+      if (node instanceof TransformNode && !this.isEditorGroup(node) && this.isSceneGraphDisplayNode(node)) {
+        roots.set(node.uniqueId, node);
+        return;
+      }
+
+      this.getVisibleChildren(node).forEach(visit);
+    };
+
+    this.scene.rootNodes.forEach(visit);
+    return [...roots.values()].map((root) => ({
+      root,
+      matchFields: this.createSceneDataDrivenMatchFields(root),
+      dataDriven: this.getModelDataDrivenDefinition(root)
+    }));
+  }
+
+  /** 从节点 metadata 和模型包动态参数中生成数据驱动匹配字段。 */
+  private createSceneDataDrivenMatchFields(root: TransformNode): Record<string, string> {
+    const editorMetadata = this.getNodeEditorMetadata(root);
+    const assetInfo = this.asMetadataObject(editorMetadata.assetInfo);
+    const modelPackageInstance = this.asMetadataObject(editorMetadata.modelPackageInstance);
+    const modelPackageValues = this.asMetadataObject(modelPackageInstance.values);
+    const sourceFile = this.getNodeSourceFileName(root) ?? "";
+    const fields: Record<string, string> = {
+      name: root.name,
+      uniqueId: String(root.uniqueId),
+      sourceFile,
+      sourceFileStem: this.getFileStem(sourceFile),
+      packageId: this.metadataValueToMatchString(modelPackageInstance.packageId) ?? "",
+      assetId: this.metadataValueToMatchString(modelPackageInstance.assetId) ?? ""
+    };
+
+    this.copyMetadataMatchFields(fields, assetInfo);
+    this.copyMetadataMatchFields(fields, modelPackageValues);
+    return fields;
+  }
+
+  /** 把 metadata 中的基础标量复制为可匹配字符串。 */
+  private copyMetadataMatchFields(target: Record<string, string>, source: Record<string, unknown>): void {
+    Object.entries(source).forEach(([key, value]) => {
+      const matchValue = this.metadataValueToMatchString(value);
+      if (matchValue !== undefined) {
+        target[key] = matchValue;
+      }
+    });
+  }
+
+  /** 将 metadata 标量值转换为匹配字符串，复杂对象不参与设备匹配。 */
+  private metadataValueToMatchString(value: unknown): string | undefined {
+    if (typeof value === "string") {
+      return value.trim();
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+
+    if (typeof value === "boolean") {
+      return String(value);
+    }
+
+    return undefined;
+  }
+
+  /** 从源文件名中提取无扩展名标识，便于 payload 用 Stacker 这类名称匹配。 */
+  private getFileStem(fileName: string): string {
+    const leafName = fileName.split(/[\\/]/).pop() ?? fileName;
+    const dotIndex = leafName.lastIndexOf(".");
+    return dotIndex > 0 ? leafName.slice(0, dotIndex) : leafName;
+  }
+
+  /** 判断当前选中节点是否属于某个被数据驱动更新的根节点。 */
+  private isSelectedNodeUnderRoot(root: TransformNode): boolean {
+    return Boolean(this.selectedNode && (this.selectedNode === root || this.selectedNode.isDescendantOf?.(root)));
   }
 
   /** 记录 ArcRotateCamera 的关键取景参数，避免预览取景破坏用户编辑视角。 */
@@ -614,7 +1035,7 @@ export class BabylonEditorEngine {
   /** 根据层级面板传入的 uniqueId 切换场景节点显隐，并刷新层级树和属性面板。 */
   public setNodeVisibilityById(id: number, visible: boolean): void {
     const node = this.findSceneNodeByUniqueId(id);
-    if (!node || node.metadata?.[HELPER_FLAG]) {
+    if (!node || node.metadata?.[HELPER_FLAG] || (node instanceof TransformNode && this.isNodeLocked(node))) {
       return;
     }
 
@@ -635,7 +1056,7 @@ export class BabylonEditorEngine {
   /** 删除当前选中的可编辑节点，并同步层级树、属性面板和性能统计。 */
   public deleteSelected(): void {
     const node = this.selectedNode;
-    if (!node || node.metadata?.[HELPER_FLAG]) {
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
       return;
     }
 
@@ -648,7 +1069,7 @@ export class BabylonEditorEngine {
   /** 复制当前选中的可编辑节点到引擎内部剪贴板，供后续 Ctrl+V 复用。 */
   public copySelected(): boolean {
     const sourceNode = this.selectedNode;
-    if (this.previewMode || !sourceNode || sourceNode.metadata?.[HELPER_FLAG]) {
+    if (this.previewMode || !sourceNode || sourceNode.metadata?.[HELPER_FLAG] || this.isNodeLocked(sourceNode)) {
       return false;
     }
 
@@ -722,6 +1143,68 @@ export class BabylonEditorEngine {
     this.selectNode(node);
     this.refreshSceneGraph();
     return node;
+  }
+
+  /** 创建逻辑分组节点，分组只负责组织树结构和批量高亮，不作为可变换模型使用。 */
+  public createGroup(): TransformNode {
+    const group = new TransformNode(this.createUniqueGroupName(), this.scene);
+    group.metadata = {
+      [ROOT_FLAG]: true,
+      editor: {
+        nodeType: GROUP_NODE_TYPE
+      }
+    };
+    this.selectNode(group);
+    this.refreshSceneGraph();
+    this.scene.render();
+    return group;
+  }
+
+  /** 切换节点自身锁定状态，父级锁定仍会继续让子节点保持有效锁定。 */
+  public setNodeLockedById(id: number, locked: boolean): void {
+    const node = this.findTransformNodeByUniqueId(id);
+    if (!node || node.metadata?.[HELPER_FLAG]) {
+      return;
+    }
+
+    this.mergeNodeEditorMetadata(node, { locked });
+    if (this.selectedNode?.uniqueId === node.uniqueId || (this.selectedNode && this.isNodeAncestor(node, this.selectedNode))) {
+      this.emitSelectionSnapshot();
+      this.syncGizmoMode();
+    }
+    this.refreshSceneGraph();
+    this.scene.render();
+  }
+
+  /** 把模型或分组移动到目标分组下；groupId 为空时移回场景根级。 */
+  public moveNodeToGroup(nodeId: number, groupId: number | null): void {
+    const node = this.findTransformNodeByUniqueId(nodeId);
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+      return;
+    }
+
+    let targetParent: TransformNode | null = null;
+    if (groupId !== null) {
+      const group = this.findTransformNodeByUniqueId(groupId);
+      if (!group || !this.isEditorGroup(group) || this.isNodeLocked(group)) {
+        return;
+      }
+      targetParent = group;
+    }
+
+    if (targetParent && (targetParent.uniqueId === node.uniqueId || this.isNodeAncestor(node, targetParent))) {
+      return;
+    }
+
+    node.setParent(targetParent);
+    node.metadata = {
+      ...this.asMetadataObject(node.metadata),
+      [ROOT_FLAG]: true
+    };
+    this.refreshNodeWorldMatrices(node);
+    this.refreshSceneGraph();
+    this.emitSelectionSnapshot();
+    this.scene.render();
   }
 
   /** 返回当前资产记录快照，供 React 外层恢复项目资产文件缓存。 */
@@ -902,8 +1385,8 @@ export class BabylonEditorEngine {
     this.refreshSceneGraph();
   }
 
-  /** 从工具栏导入 DXF CAD 图纸，解析器会把图纸源单位统一换算成米制矢量线。 */
-  public async importCadDrawing(file: File): Promise<CadDxfParseResult> {
+  /** 从工具栏导入 DXF CAD 图纸，Worker 会把图纸源单位统一换算成米制二进制线段 chunk。 */
+  public async importCadDrawing(file: File, options: CadDrawingImportOptions = {}): Promise<CadLineImportSummary> {
     const extension = this.getFileExtension(file.name);
     if (extension === ".dwg") {
       throw new Error("当前 CAD 导入支持 DXF 文本图纸；DWG 请先转换为 DXF 后再导入。");
@@ -913,19 +1396,272 @@ export class BabylonEditorEngine {
       throw new Error("请选择 .dxf 格式的 CAD 图纸。");
     }
 
-    const parsed = parseCadDxf(file.name, await file.text());
-    const root = this.createCadGroundDrawing(parsed, file.name);
-    this.selectNode(root);
-    this.ensureNodeGridCoverage(root);
-    this.refreshSceneGraph();
-    this.callbacks.onStatsChange(this.collectStats());
-    this.scene.render();
-    return parsed;
+    const root = this.createCadDrawingRoot(file.name, options.sourcePath);
+    try {
+      const chunkManifests: CadLineChunkManifest[] = [];
+      const persistTasks: Array<Promise<void>> = [];
+      let renderedChunks = 0;
+      let renderedSegments = 0;
+      let persistedChunks = 0;
+      let activePersistTasks = 0;
+      let lastRenderProgressAt = 0;
+      let persistProgressEnabled = false;
+      let persistProgressSummary: CadLineImportSummary | null = null;
+      let persistCancelled = false;
+      const pendingPersistRuns: Array<{ run: () => void; reject: (reason?: unknown) => void }> = [];
+      let currentPackIndex = 0;
+      let currentPackBuffers: ArrayBuffer[] = [];
+      let currentPackByteLength = 0;
+      let currentPackManifests: CadLineChunkManifest[] = [];
+      const reportPersistProgress = () => {
+        if (!persistProgressEnabled || !persistProgressSummary) {
+          return;
+        }
+
+        options.onProgress?.({
+          phase: "persisting",
+          parsedEntities: persistProgressSummary.entityCount,
+          emittedSegments: persistProgressSummary.segmentCount,
+          totalEntities: persistProgressSummary.entityCount,
+          totalSegments: persistProgressSummary.segmentCount,
+          chunkCount: persistProgressSummary.chunkCount,
+          persistedChunks,
+          message: "正在保存 CAD 线段分块"
+        });
+      };
+      const cancelPendingPersistTasks = (reason: unknown) => {
+        persistCancelled = true;
+        const pendingRuns = pendingPersistRuns.splice(0);
+        pendingRuns.forEach((pending) => pending.reject(reason));
+      };
+      const enqueuePersistPack = (fileName: string, buffers: ArrayBuffer[], byteLength: number, manifests: CadLineChunkManifest[]) => {
+        if (!options.persistLineChunk) {
+          return;
+        }
+
+        if (persistCancelled) {
+          throw new Error("CAD 线段分块保存已失败，导入已停止。");
+        }
+
+        const packData = new Uint8Array(byteLength);
+        let offset = 0;
+        buffers.forEach((buffer) => {
+          packData.set(new Uint8Array(buffer), offset);
+          offset += buffer.byteLength;
+        });
+
+        const persistTask = new Promise<void>((resolve, reject) => {
+          // 大型 CAD 使用 pack 侧车并限制 IPC 写入并发，避免上千个小文件和无上限缓冲堆积。
+          const run = () => {
+            if (persistCancelled) {
+              reject(new Error("CAD 线段分块保存已取消。"));
+              return;
+            }
+
+            activePersistTasks += 1;
+            Promise.resolve()
+              .then(() => options.persistLineChunk!(fileName, packData.buffer))
+              .then((projectFile) => {
+                manifests.forEach((manifest) => {
+                  manifest.packProjectFile = projectFile;
+                });
+                persistedChunks += manifests.length;
+                reportPersistProgress();
+                resolve();
+              }, (error) => {
+                cancelPendingPersistTasks(error);
+                reject(error);
+              })
+              .finally(() => {
+                activePersistTasks -= 1;
+                if (!persistCancelled) {
+                  pendingPersistRuns.shift()?.run();
+                }
+              });
+          };
+
+          if (activePersistTasks < CAD_LINE_CHUNK_PERSIST_CONCURRENCY) {
+            run();
+          } else {
+            pendingPersistRuns.push({ run, reject });
+          }
+        });
+        persistTasks.push(persistTask);
+      };
+      const flushCurrentPack = () => {
+        if (!options.persistLineChunk || currentPackBuffers.length === 0) {
+          return;
+        }
+
+        const fileName = `cad-lines-pack-${currentPackIndex}.cadlines.pack.bin`;
+        enqueuePersistPack(fileName, currentPackBuffers, currentPackByteLength, currentPackManifests);
+        currentPackIndex += 1;
+        currentPackBuffers = [];
+        currentPackByteLength = 0;
+        currentPackManifests = [];
+      };
+      const appendChunkToPack = (buffer: ArrayBuffer, manifest: CadLineChunkManifest) => {
+        if (!options.persistLineChunk) {
+          return;
+        }
+
+        if (currentPackByteLength > 0 && currentPackByteLength + buffer.byteLength > CAD_LINE_PACK_MAX_BYTES) {
+          flushCurrentPack();
+        }
+
+        const packFile = `cad-lines-pack-${currentPackIndex}.cadlines.pack.bin`;
+        manifest.packFile = packFile;
+        manifest.byteOffset = currentPackByteLength;
+        manifest.byteLength = buffer.byteLength;
+        currentPackBuffers.push(buffer);
+        currentPackByteLength += buffer.byteLength;
+        currentPackManifests.push(manifest);
+        currentPackManifests.forEach((item) => {
+          item.packByteLength = currentPackByteLength;
+        });
+      };
+      const text = await this.readCadDrawingTextWithProgress(file, options.onProgress);
+      const summary = await this.parseCadDrawingWithWorker(file.name, text, {
+        sourcePath: options.sourcePath,
+        projectMode: Boolean(options.persistLineChunk),
+        onProgress: options.onProgress,
+        onChunk: (chunk) => {
+          const mesh = this.createCadLineChunkMesh(root, chunk.chunkId, chunk.style, chunk.segmentCount, new Float32Array(chunk.positionsBuffer));
+          renderedChunks += 1;
+          renderedSegments += chunk.segmentCount;
+          const now = typeof performance === "undefined" ? Date.now() : performance.now();
+          if (renderedChunks === 1 || now - lastRenderProgressAt >= 500) {
+            lastRenderProgressAt = now;
+            options.onProgress?.({
+              phase: "rendering",
+              parsedEntities: 0,
+              emittedSegments: renderedSegments,
+              chunkCount: renderedChunks,
+              message: "正在创建 CAD 线段网格"
+            });
+          }
+          mesh.doNotSerialize = Boolean(options.persistLineChunk);
+          const fileName = `${chunk.chunkId}.cadlines.bin`;
+          const manifest: CadLineChunkManifest = {
+            chunkId: chunk.chunkId,
+            fileName,
+            style: chunk.style,
+            segmentCount: chunk.segmentCount,
+            bounds: chunk.bounds
+          };
+          chunkManifests.push(manifest);
+          if (options.persistLineChunk) {
+            appendChunkToPack(chunk.positionsBuffer, manifest);
+          }
+        }
+      });
+      flushCurrentPack();
+      if (persistTasks.length > 0) {
+        persistProgressSummary = summary;
+        persistProgressEnabled = true;
+        reportPersistProgress();
+      }
+      await Promise.all(persistTasks);
+      if (persistTasks.length > 0) {
+        options.onProgress?.({
+          phase: "persisting",
+          parsedEntities: summary.entityCount,
+          emittedSegments: summary.segmentCount,
+          totalEntities: summary.entityCount,
+          totalSegments: summary.segmentCount,
+          chunkCount: summary.chunkCount,
+          persistedChunks: summary.chunkCount,
+          message: "CAD 线段分块保存完成"
+        });
+      }
+      options.onProgress?.({
+        phase: "done",
+        parsedEntities: summary.entityCount,
+        emittedSegments: summary.segmentCount,
+        totalEntities: summary.entityCount,
+        totalSegments: summary.segmentCount,
+        chunkCount: summary.chunkCount,
+        persistedChunks: persistTasks.length > 0 ? summary.chunkCount : undefined,
+        message: "CAD 图纸导入完成"
+      });
+      this.applyCadDrawingSummaryMetadata(root, summary, file.name, options.sourcePath, chunkManifests);
+      this.selectNode(root);
+      this.frameCadDrawingInView(root);
+      this.refreshSceneGraph();
+      this.callbacks.onStatsChange(this.collectStats());
+      this.scene.render();
+      return summary;
+    } catch (error) {
+      this.disposeEditableNode(root);
+      this.refreshSceneGraph();
+      this.callbacks.onStatsChange(this.collectStats());
+      this.scene.render();
+      throw error;
+    }
   }
 
-  /** 根据 CAD 解析结果创建贴地矢量根节点，图纸尺寸已按项目米制单位归一。 */
-  private createCadGroundDrawing(drawing: CadDxfParseResult, sourceFile: string): TransformNode {
-    const root = new TransformNode(`CAD 图纸 - ${drawing.name}`, this.scene);
+  /** 用 FileReader 读取 DXF 文本并上报字节进度，无法监听进度时退回 File.text。 */
+  private readCadDrawingTextWithProgress(file: File, onProgress?: (progress: CadDxfLineProgress) => void): Promise<string> {
+    onProgress?.({
+      phase: "reading",
+      parsedEntities: 0,
+      emittedSegments: 0,
+      loadedBytes: 0,
+      totalBytes: file.size,
+      message: "正在读取 CAD 图纸文件"
+    });
+
+    if (typeof FileReader === "undefined") {
+      return file.text().then((text) => {
+        onProgress?.({
+          phase: "reading",
+          parsedEntities: 0,
+          emittedSegments: 0,
+          loadedBytes: file.size,
+          totalBytes: file.size,
+          message: "CAD 图纸文件读取完成"
+        });
+        return text;
+      });
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onprogress = (event) => {
+        onProgress?.({
+          phase: "reading",
+          parsedEntities: 0,
+          emittedSegments: 0,
+          loadedBytes: event.loaded,
+          totalBytes: event.lengthComputable ? event.total : file.size,
+          message: "正在读取 CAD 图纸文件"
+        });
+      };
+      reader.onload = () => {
+        if (typeof reader.result !== "string") {
+          reject(new Error("CAD 图纸文件读取结果不是文本内容。"));
+          return;
+        }
+
+        onProgress?.({
+          phase: "reading",
+          parsedEntities: 0,
+          emittedSegments: 0,
+          loadedBytes: file.size,
+          totalBytes: file.size,
+          message: "CAD 图纸文件读取完成"
+        });
+        resolve(reader.result);
+      };
+      reader.onerror = () => reject(reader.error ?? new Error("CAD 图纸文件读取失败。"));
+      reader.onabort = () => reject(new Error("CAD 图纸文件读取已取消。"));
+      reader.readAsText(file);
+    });
+  }
+
+  /** 创建 CAD 根节点，真实 bounds/单位会在 Worker 完成后回填。 */
+  private createCadDrawingRoot(sourceFile: string, sourcePath: string | undefined): TransformNode {
+    const root = new TransformNode(`CAD 图纸 - ${sourceFile.replace(/\.[^.]+$/, "")}`, this.scene);
     root.metadata = {
       ...this.withMetricModelMetadata(
         {
@@ -933,114 +1669,782 @@ export class BabylonEditorEngine {
           cad: {
             format: "DXF",
             sourceFile,
-            sourceUnit: drawing.unit.sourceUnit,
-            unitScaleToMeters: drawing.unit.unitScaleToMeters,
-            unitInferenceMethod: drawing.unit.inferenceMethod,
-            unitInferenceConfidence: drawing.unit.confidence,
-            insunitsCode: drawing.unit.insunitsCode,
-            measurementCode: drawing.unit.measurementCode,
-            bounds: drawing.bounds,
-            rawBounds: drawing.rawBounds,
-            layers: drawing.layers,
-            entityCount: drawing.entityCount,
-            segmentCount: drawing.segmentCount,
-            warnings: drawing.warnings
+            sourcePath,
+            streaming: true
           }
         },
         {
           sourceFile,
-          sourceUnit: drawing.unit.sourceUnit,
-          unitScaleToMeters: drawing.unit.unitScaleToMeters,
           modelUnitPolicy: "cad-drawing-source-units-normalized-to-meters"
         }
       ),
       [ROOT_FLAG]: true
     };
-
-    this.groupCadPolylinesByLayer(drawing.polylines).forEach((polylines, layer) => {
-      const layerIndex = Math.max(0, drawing.layers.indexOf(layer));
-      this.createCadLayerLineSystems(root, drawing.bounds, layer, polylines, this.getCadLayerColor(layerIndex));
-    });
-
     return root;
   }
 
-  /** 按图层归并 CAD 折线，便于每层使用稳定颜色和较少 LineSystem。 */
-  private groupCadPolylinesByLayer(polylines: CadDxfPolyline[]): Map<string, CadDxfPolyline[]> {
-    const grouped = new Map<string, CadDxfPolyline[]>();
-    polylines.forEach((polyline) => {
-      const layer = polyline.layer || "0";
-      const bucket = grouped.get(layer);
+  /** Worker 解析完成后回填 CAD 根节点 metadata，并写入侧车 chunk manifest。 */
+  private applyCadDrawingSummaryMetadata(
+    root: TransformNode,
+    summary: CadLineImportSummary,
+    sourceFile: string,
+    sourcePath: string | undefined,
+    chunkManifests: CadLineChunkManifest[]
+  ): void {
+    root.name = `CAD 图纸 - ${summary.name}`;
+    root.metadata = {
+      ...this.withMetricModelMetadata(
+        {
+          ...this.asMetadataObject(root.metadata),
+          cadDrawing: true,
+          cad: {
+            format: "DXF",
+            sourceFile,
+            sourcePath,
+            sourceUnit: summary.unit.sourceUnit,
+            unitScaleToMeters: summary.unit.unitScaleToMeters,
+            unitInferenceMethod: summary.unit.inferenceMethod,
+            unitInferenceConfidence: summary.unit.confidence,
+            insunitsCode: summary.unit.insunitsCode,
+            measurementCode: summary.unit.measurementCode,
+            bounds: summary.bounds,
+            rawBounds: summary.rawBounds,
+            layers: summary.layers,
+            entityCount: summary.entityCount,
+            segmentCount: summary.segmentCount,
+            primitiveCounts: summary.primitiveCounts,
+            warnings: summary.warnings,
+            chunkCount: summary.chunkCount
+          },
+          editor: {
+            ...this.asMetadataObject(this.asMetadataObject(root.metadata).editor),
+            cadChunkManifest: {
+              version: 1,
+              sourceFile,
+              sourcePath,
+              bounds: summary.bounds,
+              rawBounds: summary.rawBounds,
+              unit: summary.unit,
+              segmentCount: summary.segmentCount,
+              chunkSegmentLimit: CAD_LINE_CHUNK_SEGMENTS,
+              chunks: chunkManifests
+            }
+          }
+        },
+        {
+          sourceFile,
+          sourceUnit: summary.unit.sourceUnit,
+          unitScaleToMeters: summary.unit.unitScaleToMeters,
+          modelUnitPolicy: "cad-drawing-source-units-normalized-to-meters"
+        }
+      ),
+      [ROOT_FLAG]: true
+    };
+  }
+
+  /** 优先使用 Web Worker 后台解析 CAD，失败时回退到同线程流式解析以保持浏览器兼容。 */
+  private parseCadDrawingWithWorker(
+    fileName: string,
+    text: string,
+    options: {
+      sourcePath?: string;
+      projectMode: boolean;
+      onProgress?: (progress: CadDxfLineProgress) => void;
+      onChunk: (chunk: CadDxfWorkerChunkMessage) => void;
+    }
+  ): Promise<CadLineImportSummary> {
+    if (typeof Worker === "undefined") {
+      return Promise.resolve(this.parseCadDrawingInCurrentThread(fileName, text, options.onChunk, options.onProgress));
+    }
+
+    return new Promise<CadLineImportSummary>((resolve, reject) => {
+      const worker = new Worker(new URL("../editor/cadDxf.worker.ts", import.meta.url), { type: "module" });
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        worker.terminate();
+        callback();
+      };
+
+      worker.onmessage = (event: MessageEvent<CadDxfWorkerMessage>) => {
+        try {
+          const message = event.data;
+          if (message.type === "chunk") {
+            options.onChunk(message);
+          } else if (message.type === "progress") {
+            options.onProgress?.(message.progress);
+          } else if (message.type === "done") {
+            finish(() => resolve(message.summary));
+          } else if (message.type === "error") {
+            finish(() => reject(new Error(message.message)));
+          }
+        } catch (error) {
+          const normalizedError = error instanceof Error ? error : new Error(String(error));
+          finish(() => reject(normalizedError));
+        }
+      };
+      worker.onerror = (event) => {
+        finish(() => reject(new Error(event.message || "CAD Worker 执行失败。")));
+      };
+      worker.postMessage({
+        type: "start",
+        fileName,
+        text,
+        sourcePath: options.sourcePath,
+        projectMode: options.projectMode
+      } satisfies CadDxfWorkerStartMessage);
+    });
+  }
+
+  /** Worker 不可用时的同步兜底，仍然使用二进制 chunk sink，避免回到 primitive 数组路径。 */
+  private parseCadDrawingInCurrentThread(
+    fileName: string,
+    text: string,
+    onChunk: (chunk: CadDxfWorkerChunkMessage) => void,
+    onProgress?: (progress: CadDxfLineProgress) => void
+  ): CadLineImportSummary {
+    return parseCadDxfLineStream(fileName, text, {
+      emitChunk: (chunk) => {
+        const positionsBuffer = chunk.positions.buffer.slice(0) as ArrayBuffer;
+        onChunk({
+          type: "chunk",
+          chunkId: chunk.chunkId,
+          style: chunk.style,
+          segmentCount: chunk.segmentCount,
+          positionsBuffer,
+          bounds: chunk.bounds
+        });
+      },
+      reportProgress: onProgress
+    });
+  }
+
+  /** 直接从二进制 CAD 线段 chunk 创建 LinesMesh，不经过 Vector3/Color4 对象数组。 */
+  private createCadLineChunkMesh(
+    root: TransformNode,
+    chunkId: string,
+    style: CadDxfLineChunkStyle,
+    segmentCount: number,
+    positions: Float32Array
+  ): LinesMesh {
+    const finalAlpha = this.getCadDisplayAlpha(root, style.alpha);
+    const mesh = new LinesMesh(`${root.name} / ${style.layer} / ${style.color} / ${chunkId}`, this.scene, null, null, undefined, false, finalAlpha < 1);
+    const indices = this.createCadLineChunkIndices(segmentCount);
+    const vertexData = new VertexData();
+    vertexData.positions = positions;
+    vertexData.indices = indices;
+    vertexData.applyToMesh(mesh, false);
+    mesh.parent = root;
+    mesh.position.y = CAD_LINE_ELEVATION_METERS;
+    mesh.color = Color3.FromHexString(style.color);
+    mesh.alpha = finalAlpha;
+    mesh.isPickable = true;
+    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.metadata = {
+      cadPrimitive: "polyline",
+      cadLayer: style.layer,
+      cadColor: style.color,
+      cadAlpha: style.alpha,
+      cadEntityType: style.entityType,
+      cadChunkId: chunkId
+    };
+    return mesh;
+  }
+
+  /** 生成顺序线段索引，chunk 上限保持在 Uint16 可表达范围内。 */
+  private createCadLineChunkIndices(segmentCount: number): Uint16Array {
+    const indices = new Uint16Array(segmentCount * 2);
+    for (let index = 0; index < indices.length; index += 1) {
+      indices[index] = index;
+    }
+    return indices;
+  }
+
+  /** 按图层、颜色和透明度归并点标记，点也走 LineSystem 分块以减少 mesh 数量。 */
+  private groupCadPointsByStyle(points: CadDxfPointPrimitive[]): Map<string, CadDxfPointPrimitive[]> {
+    const grouped = new Map<string, CadDxfPointPrimitive[]>();
+    points.forEach((point) => {
+      const key = this.getCadPrimitiveStyleKey(point);
+      const bucket = grouped.get(key);
       if (bucket) {
-        bucket.push(polyline);
+        bucket.push(point);
       } else {
-        grouped.set(layer, [polyline]);
+        grouped.set(key, [point]);
       }
     });
     return grouped;
   }
 
-  /** 为单个 CAD 图层创建一个或多个 LineSystem，分块避免超大图纸单网格过重。 */
-  private createCadLayerLineSystems(
+  /** 流式创建 CAD 线段 mesh，避免先按样式复制完整 polyline 引用数组导致内存峰值叠加。 */
+  private createCadLineSystemsFromPrimitives(
     root: TransformNode,
     bounds: CadDxfBounds,
-    layer: string,
-    polylines: CadDxfPolyline[],
-    color: Color4
+    primitives: CadDxfPrimitive[]
   ): void {
-    let lines: Vector3[][] = [];
-    let colors: Color4[][] = [];
-    let segmentCount = 0;
-    let chunkIndex = 1;
-    const flushChunk = () => {
-      if (lines.length === 0) {
+    const builders = new Map<string, CadLineChunkBuilder>();
+    primitives.forEach((primitive) => {
+      if (primitive.type !== "polyline") {
         return;
       }
 
-      const lineSystem = MeshBuilder.CreateLineSystem(
-        `${root.name} / ${layer} #${chunkIndex}`,
-        { lines, colors, useVertexAlpha: true },
-        this.scene
-      );
-      lineSystem.parent = root;
-      lineSystem.isPickable = true;
-      lineSystem.alwaysSelectAsActiveMesh = true;
-      lineSystem.metadata = { cadDrawingLine: true, cadLayer: layer };
-      lines = [];
-      colors = [];
-      segmentCount = 0;
-      chunkIndex += 1;
+      const key = this.getCadPrimitiveStyleKey(primitive);
+      let builder = builders.get(key);
+      if (!builder) {
+        builder = this.createCadLineChunkBuilder(primitive);
+        builders.set(key, builder);
+      }
+      this.pushCadPolylineToChunkBuilder(root, bounds, builder, primitive);
+    });
+    builders.forEach((builder) => this.flushCadLineChunk(root, builder, false));
+  }
+
+  /** 创建某一 CAD 样式的 typed-array 分块写入器。 */
+  private createCadLineChunkBuilder(polyline: CadDxfPolyline): CadLineChunkBuilder {
+    return {
+      layer: polyline.layer,
+      colorHex: polyline.color,
+      alpha: polyline.alpha,
+      color: Color3.FromHexString(polyline.color),
+      positions: new Float32Array(CAD_LINE_CHUNK_SEGMENTS * 2 * 3),
+      indices: new Uint16Array(CAD_LINE_CHUNK_SEGMENTS * 2),
+      positionOffset: 0,
+      indexOffset: 0,
+      vertexIndex: 0,
+      segmentCount: 0,
+      chunkIndex: 1
     };
+  }
 
-    polylines.forEach((polyline) => {
-      const points = polyline.points.map((point) => this.toCadGroundPoint(point, bounds));
-      const nextSegmentCount = Math.max(0, points.length - 1);
-      if (nextSegmentCount <= 0) {
-        return;
+  /** 将一条 CAD 折线写入对应样式的分块缓冲，disjoint 折线按点对解释为离散线段。 */
+  private pushCadPolylineToChunkBuilder(
+    root: TransformNode,
+    bounds: CadDxfBounds,
+    builder: CadLineChunkBuilder,
+    polyline: CadDxfPolyline
+  ): void {
+    const step = polyline.disjoint ? 2 : 1;
+    for (let index = 0; index + 1 < polyline.points.length; index += step) {
+      this.pushCadLineSegmentToChunkBuilder(root, bounds, builder, polyline.points[index], polyline.points[index + 1]);
+    }
+  }
+
+  /** 写入单条 CAD 线段，满块时立即生成 mesh 并复用新的 typed array 继续写。 */
+  private pushCadLineSegmentToChunkBuilder(
+    root: TransformNode,
+    bounds: CadDxfBounds,
+    builder: CadLineChunkBuilder,
+    start: CadDxfPolyline["points"][number],
+    end: CadDxfPolyline["points"][number]
+  ): void {
+    if (builder.segmentCount >= CAD_LINE_CHUNK_SEGMENTS) {
+      this.flushCadLineChunk(root, builder, true);
+    }
+
+    if (start.x === end.x && start.y === end.y) {
+      return;
+    }
+
+    builder.positions[builder.positionOffset] = start.x - bounds.centerX;
+    builder.positions[builder.positionOffset + 1] = CAD_LINE_ELEVATION_METERS;
+    builder.positions[builder.positionOffset + 2] = -(start.y - bounds.centerY);
+    builder.positions[builder.positionOffset + 3] = end.x - bounds.centerX;
+    builder.positions[builder.positionOffset + 4] = CAD_LINE_ELEVATION_METERS;
+    builder.positions[builder.positionOffset + 5] = -(end.y - bounds.centerY);
+    builder.indices[builder.indexOffset] = builder.vertexIndex;
+    builder.indices[builder.indexOffset + 1] = builder.vertexIndex + 1;
+    builder.positionOffset += 6;
+    builder.indexOffset += 2;
+    builder.vertexIndex += 2;
+    builder.segmentCount += 1;
+
+    if (builder.segmentCount >= CAD_LINE_CHUNK_SEGMENTS) {
+      this.flushCadLineChunk(root, builder, true);
+    }
+  }
+
+  /** 将当前 CAD 线段块提交为 LinesMesh，并清空写入器等待下一块数据。 */
+  private flushCadLineChunk(root: TransformNode, builder: CadLineChunkBuilder, keepBuffer = true): void {
+    if (builder.segmentCount === 0) {
+      if (!keepBuffer) {
+        builder.positions = new Float32Array(0);
+        builder.indices = new Uint16Array(0);
       }
+      return;
+    }
 
-      if (segmentCount > 0 && segmentCount + nextSegmentCount > CAD_LINE_CHUNK_SEGMENTS) {
-        flushChunk();
-      }
+    const lineSystem = new LinesMesh(
+      `${root.name} / ${builder.layer} / ${builder.colorHex} #${builder.chunkIndex}`,
+      this.scene,
+      null,
+      null,
+      undefined,
+      false,
+      builder.alpha < 1
+    );
+    const vertexData = new VertexData();
+    const isFullChunk = builder.segmentCount === CAD_LINE_CHUNK_SEGMENTS;
+    vertexData.positions = isFullChunk ? builder.positions : builder.positions.slice(0, builder.positionOffset);
+    vertexData.indices = isFullChunk ? builder.indices : builder.indices.slice(0, builder.indexOffset);
+    vertexData.applyToMesh(lineSystem, false);
+    lineSystem.parent = root;
+    lineSystem.color = builder.color.clone();
+    lineSystem.alpha = builder.alpha;
+    lineSystem.isPickable = true;
+    lineSystem.alwaysSelectAsActiveMesh = true;
+    lineSystem.metadata = { cadPrimitive: "polyline", cadLayer: builder.layer, cadColor: builder.colorHex, cadAlpha: builder.alpha };
+    builder.positions = keepBuffer ? new Float32Array(CAD_LINE_CHUNK_SEGMENTS * 2 * 3) : new Float32Array(0);
+    builder.indices = keepBuffer ? new Uint16Array(CAD_LINE_CHUNK_SEGMENTS * 2) : new Uint16Array(0);
+    builder.positionOffset = 0;
+    builder.indexOffset = 0;
+    builder.vertexIndex = 0;
+    builder.segmentCount = 0;
+    builder.chunkIndex += 1;
+  }
 
-      lines.push(points);
-      colors.push(points.map(() => color.clone()));
-      segmentCount += nextSegmentCount;
+  /** 为 CAD 点 primitive 创建十字线标记。 */
+  private createCadPointLineSystems(root: TransformNode, bounds: CadDxfBounds, points: CadDxfPointPrimitive[]): void {
+    const first = points[0];
+    if (!first) {
+      return;
+    }
+
+    const color = this.cadPrimitiveColor4(first);
+    const lines: Vector3[][] = [];
+    const colors: Color4[][] = [];
+    points.forEach((primitive) => {
+      const center = this.toCadGroundPoint(primitive.point, bounds, CAD_LINE_ELEVATION_METERS);
+      const size = Math.max(CAD_POINT_MARKER_SIZE_METERS, primitive.size);
+      lines.push([new Vector3(center.x - size / 2, center.y, center.z), new Vector3(center.x + size / 2, center.y, center.z)]);
+      lines.push([new Vector3(center.x, center.y, center.z - size / 2), new Vector3(center.x, center.y, center.z + size / 2)]);
+      colors.push([color.clone(), color.clone()]);
+      colors.push([color.clone(), color.clone()]);
     });
 
-    flushChunk();
+    const markerSystem = MeshBuilder.CreateLineSystem(
+      `${root.name} / ${first.layer} / 点标记`,
+      { lines, colors, useVertexAlpha: true },
+      this.scene
+    );
+    markerSystem.parent = root;
+    markerSystem.isPickable = true;
+    markerSystem.alwaysSelectAsActiveMesh = true;
+    markerSystem.metadata = { cadPrimitive: "point", cadLayer: first.layer, cadColor: first.color, cadAlpha: first.alpha };
+  }
+
+  /** 为 CAD IMAGE primitive 创建真实四角贴图，尽量还原扫描底图或外部栅格参照。 */
+  private async createCadImageMesh(
+    root: TransformNode,
+    bounds: CadDxfBounds,
+    image: CadDxfImagePrimitive,
+    index: number,
+    context: CadImageRenderContext
+  ): Promise<string | null> {
+    if (this.isIgnoredCadImageReference(image.sourcePath)) {
+      return null;
+    }
+
+    const source = await this.resolveCadImageSource(image, context);
+    if (!source) {
+      return `IMAGE 图片文件 ${image.sourcePath ?? image.imageDefHandle ?? "(未命名)"} 未随 DXF 提供或无法从本地路径读取，已保留图片范围用于取景。`;
+    }
+
+    const mesh = new Mesh(`${root.name} / ${image.layer} / 图片 #${index}`, this.scene);
+    const corners = image.corners.map((point) => this.toCadGroundPoint(point, bounds, CAD_IMAGE_ELEVATION_METERS));
+    const vertexData = new VertexData();
+    vertexData.positions = corners.flatMap((point) => [point.x, point.y, point.z]);
+    vertexData.indices = [0, 1, 2, 0, 2, 3];
+    vertexData.normals = [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0];
+    vertexData.uvs = [0, 1, 1, 1, 1, 0, 0, 0];
+    vertexData.applyToMesh(mesh);
+
+    const material = this.createCadImageMaterial(`${root.name} / ${image.layer} / 图片材质 #${index}`, source);
+
+    mesh.parent = root;
+    mesh.isPickable = true;
+    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.material = material;
+    mesh.metadata = {
+      cadPrimitive: "image",
+      cadLayer: image.layer,
+      cadEntityType: image.entityType,
+      cadImage: {
+        sourcePath: image.sourcePath,
+        resolvedFileName: source.fileName,
+        source: source.source,
+        imageDefHandle: image.imageDefHandle,
+        pixelWidth: image.pixelWidth,
+        pixelHeight: image.pixelHeight
+      }
+    };
+    return null;
+  }
+
+  /** 创建 CAD 图片自发光材质，导入和保存恢复共用同一套贴图参数。 */
+  private createCadImageMaterial(name: string, source: CadResolvedImageSource): StandardMaterial {
+    const texture = new Texture(
+      source.url,
+      this.scene,
+      false,
+      false,
+      Texture.TRILINEAR_SAMPLINGMODE,
+      () => source.revoke(),
+      () => source.revoke()
+    );
+    texture.hasAlpha = true;
+
+    const material = new StandardMaterial(name, this.scene);
+    material.diffuseTexture = texture;
+    material.emissiveTexture = texture;
+    material.opacityTexture = texture;
+    material.disableLighting = true;
+    material.backFaceCulling = false;
+    material.metadata = { cadImageMaterial: true };
+    return material;
+  }
+
+  /** 解析 CAD IMAGE 的图片来源：先匹配同批 File，再走 Electron 受控本地读取。 */
+  private async resolveCadImageSource(image: CadDxfImagePrimitive, context: CadImageRenderContext): Promise<CadResolvedImageSource | null> {
+    if (!image.sourcePath || this.isIgnoredCadImageReference(image.sourcePath)) {
+      return null;
+    }
+
+    const batchFile = this.findCadImageRelatedFile(image.sourcePath, context.relatedFiles);
+    if (batchFile) {
+      const url = URL.createObjectURL(batchFile);
+      context.objectUrls.push(url);
+      return {
+        url,
+        fileName: batchFile.name,
+        source: "batch",
+        revoke: () => this.revokeCadImageObjectUrl(context, url)
+      };
+    }
+
+    if (!context.sourcePath || !window.electronApp?.files?.readLocalReference) {
+      return null;
+    }
+
+    try {
+      const payload = await window.electronApp.files.readLocalReference(context.sourcePath, image.sourcePath);
+      if (!payload) {
+        return null;
+      }
+      const blob = new Blob([payload.data], { type: payload.mimeType || this.getImageMimeType(payload.fileName) });
+      const url = URL.createObjectURL(blob);
+      context.objectUrls.push(url);
+      return {
+        url,
+        fileName: payload.fileName,
+        source: "local",
+        revoke: () => this.revokeCadImageObjectUrl(context, url)
+      };
+    } catch (error) {
+      console.warn("CAD IMAGE 外部图片读取失败。", error);
+      return null;
+    }
+  }
+
+  /** 从同批导入文件中按路径尾段或文件名匹配 CAD IMAGE 引用。 */
+  private findCadImageRelatedFile(sourcePath: string, files: File[]): File | null {
+    if (this.isIgnoredCadImageReference(sourcePath)) {
+      return null;
+    }
+
+    const normalizedSource = this.normalizeCadReferencePath(sourcePath);
+    const sourceName = normalizedSource.split("/").pop() ?? normalizedSource;
+    return (
+      files.find((file) => {
+        if (!this.isTextureFile(this.getFileExtension(file.name))) {
+          return false;
+        }
+        const relativePath = this.normalizeCadReferencePath(file.webkitRelativePath || file.name);
+        return relativePath === normalizedSource || relativePath.endsWith(`/${normalizedSource}`) || file.name.toLowerCase() === sourceName;
+      }) ?? null
+    );
+  }
+
+  /** 统一 CAD 外部参照路径分隔符和大小写，便于跨 Windows/Linux DXF 匹配。 */
+  private normalizeCadReferencePath(value: string): string {
+    return value.replace(/\\/g, "/").replace(/^\.\/+/, "").trim().toLowerCase();
+  }
+
+  /** 根据图片文件扩展名给 Blob 补 MIME，避免部分本地文件加载失败。 */
+  private getImageMimeType(fileName: string): string {
+    const extension = this.getFileExtension(fileName);
+    if (extension === ".jpg" || extension === ".jpeg") {
+      return "image/jpeg";
+    }
+    if (extension === ".webp") {
+      return "image/webp";
+    }
+    if (extension === ".png") {
+      return "image/png";
+    }
+    return "application/octet-stream";
+  }
+
+  /** 判断 CAD 外部图片参照是否按产品要求忽略，当前 BMP 不参与导入和提示。 */
+  private isIgnoredCadImageReference(sourcePath: string | undefined): boolean {
+    return IGNORED_CAD_IMAGE_EXTENSIONS.has(this.getFileExtension(sourcePath ?? ""));
+  }
+
+  /** 释放 CAD 图片临时 URL，避免重复导入大图后泄漏内存。 */
+  private revokeCadImageObjectUrl(context: CadImageRenderContext, url: string): void {
+    URL.revokeObjectURL(url);
+    const index = context.objectUrls.indexOf(url);
+    if (index >= 0) {
+      context.objectUrls.splice(index, 1);
+    }
+  }
+
+  /** 为 CAD 填充 primitive 创建贴地 polygon mesh，复杂面失败时保留解析器生成的边界线。 */
+  private createCadFillMesh(root: TransformNode, bounds: CadDxfBounds, fill: CadDxfFill, index: number): void {
+    const rings = fill.rings.map((ring) => ring.map((point) => this.toCadGroundPoint(point, bounds, CAD_FILL_ELEVATION_METERS)));
+    this.splitCadFillRings(rings).forEach((polygon, polygonIndex) => {
+      let mesh: Mesh;
+      try {
+        mesh = CreatePolygon(
+          `${root.name} / ${fill.layer} / 填充 #${index}.${polygonIndex + 1}`,
+          { shape: polygon.shape, holes: polygon.holes, sideOrientation: Mesh.DOUBLESIDE },
+          this.scene,
+          earcut
+        );
+      } catch (error) {
+        console.warn("CAD HATCH 填充三角化失败，已保留边界线。", error);
+        return;
+      }
+
+      mesh.parent = root;
+      mesh.position.y = CAD_FILL_ELEVATION_METERS;
+      mesh.isPickable = true;
+      mesh.alwaysSelectAsActiveMesh = true;
+      mesh.material = this.createCadColorMaterial(`CAD 填充材质 ${fill.layer} ${fill.color} ${fill.alpha}`, fill.color, fill.alpha);
+      mesh.metadata = {
+        cadPrimitive: "fill",
+        cadLayer: fill.layer,
+        cadColor: fill.color,
+        cadAlpha: fill.alpha,
+        cadEntityType: fill.entityType
+      };
+    });
+  }
+
+  /** 为 WIPEOUT 创建遮罩面；在缺少完整 draw-order 时只遮图片/填充，不压住主体矢量线。 */
+  private createCadWipeoutMesh(root: TransformNode, bounds: CadDxfBounds, wipeout: CadDxfWipeoutPrimitive, index: number): void {
+    const ring = wipeout.ring.map((point) => this.toCadGroundPoint(point, bounds, 0));
+    const shape = this.normalizeCadFillRing(ring);
+    if (shape.length < 3 || Math.abs(this.getCadFillRingArea(shape)) <= 1e-10) {
+      return;
+    }
+
+    let mesh: Mesh;
+    try {
+      mesh = CreatePolygon(
+        `${root.name} / ${wipeout.layer} / WIPEOUT #${index}`,
+        { shape, sideOrientation: Mesh.DOUBLESIDE },
+        this.scene,
+        earcut
+      );
+    } catch (error) {
+      console.warn("CAD WIPEOUT 遮罩三角化失败，已跳过该遮罩。", error);
+      return;
+    }
+
+    mesh.parent = root;
+    mesh.position.y = CAD_WIPEOUT_ELEVATION_METERS;
+    mesh.isPickable = true;
+    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.material = this.createCadColorMaterial(
+      `CAD WIPEOUT 遮罩材质 ${wipeout.layer}`,
+      this.color4ToHex(this.scene.clearColor, DEFAULT_SCENE_ENVIRONMENT_COLOR),
+      1
+    );
+    mesh.metadata = {
+      cadPrimitive: "wipeout",
+      cadLayer: wipeout.layer,
+      cadColor: wipeout.color,
+      cadAlpha: wipeout.alpha,
+      cadEntityType: wipeout.entityType
+    };
+  }
+
+  /** 将 HATCH/SOLID 的多个闭合环拆成外轮廓和孔洞，避免多个填充岛只渲染第一个。 */
+  private splitCadFillRings(rings: Vector3[][]): Array<{ shape: Vector3[]; holes: Vector3[][] }> {
+    const normalized = rings
+      .map((ring) => this.normalizeCadFillRing(ring))
+      .filter((ring) => ring.length >= 3)
+      .map((ring) => ({ ring, area: Math.abs(this.getCadFillRingArea(ring)) }))
+      .filter((entry) => entry.area > 1e-10)
+      .sort((left, right) => right.area - left.area);
+    const groups: Array<{ shape: Vector3[]; holes: Vector3[][]; area: number }> = [];
+
+    normalized.forEach((entry) => {
+      const samplePoint = this.getCadFillRingCentroid(entry.ring);
+      const containerCount = normalized.filter((candidate) => candidate.area > entry.area && this.isPointInsideCadFillRing(samplePoint, candidate.ring)).length;
+      if (containerCount % 2 === 1) {
+        const parent = groups
+          .filter((group) => this.isPointInsideCadFillRing(samplePoint, group.shape))
+          .sort((left, right) => left.area - right.area)[0];
+        if (parent) {
+          parent.holes.push(entry.ring);
+          return;
+        }
+      }
+
+      groups.push({ shape: entry.ring, holes: [], area: entry.area });
+    });
+
+    return groups.map(({ shape, holes }) => ({ shape, holes }));
+  }
+
+  /** 去掉闭合环尾部重复点，Babylon polygon builder 会自行处理闭合。 */
+  private normalizeCadFillRing(ring: Vector3[]): Vector3[] {
+    if (ring.length < 2) {
+      return ring;
+    }
+
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    return first.equalsWithEpsilon(last, 1e-7) ? ring.slice(0, -1) : ring.slice();
+  }
+
+  /** 计算 XZ 平面多边形面积，用于区分外轮廓和孔洞。 */
+  private getCadFillRingArea(ring: Vector3[]): number {
+    return ring.reduce((area, point, index) => {
+      const next = ring[(index + 1) % ring.length];
+      return area + point.x * next.z - next.x * point.z;
+    }, 0) / 2;
+  }
+
+  /** 计算填充环的中心采样点，供包含关系判断使用。 */
+  private getCadFillRingCentroid(ring: Vector3[]): Vector3 {
+    const total = ring.reduce((sum, point) => sum.add(point), Vector3.Zero());
+    return total.scale(1 / Math.max(1, ring.length));
+  }
+
+  /** 在 XZ 平面判断点是否位于闭合环内部。 */
+  private isPointInsideCadFillRing(point: Vector3, ring: Vector3[]): boolean {
+    let inside = false;
+    for (let index = 0, previousIndex = ring.length - 1; index < ring.length; previousIndex = index, index += 1) {
+      const current = ring[index];
+      const previous = ring[previousIndex];
+      const intersects =
+        current.z > point.z !== previous.z > point.z &&
+        point.x < ((previous.x - current.x) * (point.z - current.z)) / (previous.z - current.z || Number.EPSILON) + current.x;
+      if (intersects) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  /** 为 CAD 文字 primitive 创建贴地 DynamicTexture 平面，支持中文标注。 */
+  private createCadTextMesh(root: TransformNode, bounds: CadDxfBounds, text: CadDxfText, index: number): void {
+    const textLines = text.text.split(/\r?\n/).filter(Boolean);
+    const lineCount = Math.max(1, textLines.length);
+    const width = Math.max(text.height, text.width ?? Math.max(text.height, text.text.length * text.height * text.widthFactor * 0.62));
+    const height = Math.max(text.height, text.height * lineCount * 1.25);
+    const material = this.createCadTextMaterial(
+      `${root.name} / ${text.layer} / 文字材质 #${index}`,
+      `${root.name} / ${text.layer} / 文字纹理 #${index}`,
+      text
+    );
+
+    const plane = MeshBuilder.CreatePlane(`${root.name} / ${text.layer} / 文字 #${index}`, { width, height }, this.scene);
+    plane.parent = root;
+    plane.position = this.toCadGroundPoint(text.position, bounds, CAD_TEXT_ELEVATION_METERS);
+    plane.rotation.x = Math.PI / 2;
+    plane.rotation.y = (-text.rotationDegrees * Math.PI) / 180;
+    plane.isPickable = true;
+    plane.alwaysSelectAsActiveMesh = true;
+    plane.material = material;
+    plane.metadata = {
+      cadPrimitive: "text",
+      cadLayer: text.layer,
+      cadColor: text.color,
+      cadAlpha: text.alpha,
+      cadEntityType: text.entityType,
+      cadText: text
+    };
+  }
+
+  /** 创建 CAD 文字材质，保存场景后可根据 cadText metadata 重新绘制 DynamicTexture。 */
+  private createCadTextMaterial(materialName: string, textureName: string, text: CadDxfText): StandardMaterial {
+    const texture = this.createCadTextTexture(textureName, text);
+    const material = new StandardMaterial(materialName, this.scene);
+    material.diffuseTexture = texture;
+    material.opacityTexture = texture;
+    material.emissiveColor = Color3.FromHexString(text.color);
+    material.alpha = text.alpha;
+    material.disableLighting = true;
+    material.useAlphaFromDiffuseTexture = true;
+    material.backFaceCulling = false;
+    material.metadata = { cadTextMaterial: true };
+    return material;
+  }
+
+  /** 把 CAD 文字内容绘制到动态纹理，保留中文字体和 MTEXT 多行。 */
+  private createCadTextTexture(textureName: string, text: CadDxfText): DynamicTexture {
+    const textLines = text.text.split(/\r?\n/).filter(Boolean);
+    const lineCount = Math.max(1, textLines.length);
+    const width = Math.max(text.height, text.width ?? Math.max(text.height, text.text.length * text.height * text.widthFactor * 0.62));
+    const textureWidth = Math.min(CAD_TEXT_TEXTURE_MAX_SIZE, Math.max(128, Math.ceil(width / Math.max(text.height, 0.001) * 96)));
+    const textureHeight = Math.min(CAD_TEXT_TEXTURE_MAX_SIZE, Math.max(64, Math.ceil(lineCount * 96)));
+    const texture = new DynamicTexture(textureName, { width: textureWidth, height: textureHeight }, this.scene, true);
+    texture.hasAlpha = true;
+    const context = texture.getContext() as CanvasRenderingContext2D;
+    context.clearRect(0, 0, textureWidth, textureHeight);
+    context.font = `bold ${Math.floor(textureHeight / (lineCount * 1.25))}px Microsoft YaHei, SimHei, Arial`;
+    context.fillStyle = text.color;
+    context.textBaseline = "top";
+    context.textAlign = text.align === "center" ? "center" : text.align === "right" ? "right" : "left";
+    const x = text.align === "center" ? textureWidth / 2 : text.align === "right" ? textureWidth : 0;
+    textLines.forEach((line, lineIndex) => context.fillText(line, x, lineIndex * (textureHeight / lineCount)));
+    texture.update();
+    return texture;
   }
 
   /** 将已换算为米的 CAD XY 平面映射到 Babylon XZ 网格，整张图纸居中到世界原点。 */
-  private toCadGroundPoint(point: { x: number; y: number }, bounds: CadDxfBounds): Vector3 {
-    return new Vector3(point.x - bounds.centerX, CAD_LINE_ELEVATION_METERS, -(point.y - bounds.centerY));
+  private toCadGroundPoint(point: { x: number; y: number }, bounds: CadDxfBounds, elevation = CAD_LINE_ELEVATION_METERS): Vector3 {
+    return new Vector3(point.x - bounds.centerX, elevation, -(point.y - bounds.centerY));
   }
 
-  /** 为 CAD 图层生成稳定高对比颜色，便于在深色网格上区分不同图层。 */
-  private getCadLayerColor(layerIndex: number): Color4 {
-    const palette = ["#52d6a6", "#77aaff", "#f4c542", "#fb7770", "#b58cff", "#62d0ff", "#f0a45d", "#9ddc62"];
-    const color = this.hexToColor3(palette[layerIndex % palette.length]);
-    return new Color4(color.r, color.g, color.b, 0.98);
+  /** 创建 CAD 纯色自发光材质，尽量贴近黑底 CAD 查看器的可读性。 */
+  private createCadColorMaterial(name: string, colorHex: string, alpha: number): StandardMaterial {
+    const material = new StandardMaterial(name, this.scene);
+    const color = Color3.FromHexString(colorHex);
+    material.diffuseColor = color;
+    material.emissiveColor = color.scale(0.75);
+    material.alpha = alpha;
+    material.disableLighting = true;
+    material.backFaceCulling = false;
+    return material;
+  }
+
+  /** 将 CAD primitive 颜色转成 LineSystem 顶点色。 */
+  private cadPrimitiveColor4(primitive: Pick<CadDxfPrimitive, "color" | "alpha">): Color4 {
+    const color = Color3.FromHexString(primitive.color);
+    return new Color4(color.r, color.g, color.b, primitive.alpha);
+  }
+
+  /** 构造 CAD primitive 分组 key。 */
+  private getCadPrimitiveStyleKey(primitive: Pick<CadDxfPrimitive, "layer" | "color" | "alpha">): string {
+    return `${primitive.layer}\u0000${primitive.color}\u0000${primitive.alpha}`;
+  }
+
+  /** CAD 导入完成后执行专用取景，不改变普通模型拖入时的相机语义。 */
+  private frameCadDrawingInView(root: TransformNode): void {
+    this.refreshNodeWorldMatrices(root);
+    const bounds = this.getNodeWorldBounds(root);
+    if (!bounds) {
+      this.ensureNodeGridCoverage(root);
+      return;
+    }
+
+    this.frameBoundsInView(bounds);
   }
 
   /** 将当前场景序列化为 .babylon 文件并触发浏览器下载。 */
@@ -1077,11 +2481,12 @@ export class BabylonEditorEngine {
   }
 
   /** 从项目场景文件恢复 Babylon 内容，并保留编辑器自己的相机、网格和交互辅助对象。 */
-  public async loadSerializedScene(serializedScene: unknown): Promise<void> {
+  public async loadSerializedScene(serializedScene: unknown, options: SerializedSceneLoadOptions = {}): Promise<void> {
     if (!this.isSerializedScene(serializedScene)) {
       return;
     }
 
+    this.cancelCadRestore();
     if (this.previewMode) {
       this.exitPreviewMode();
     }
@@ -1103,7 +2508,7 @@ export class BabylonEditorEngine {
     }
     this.scene.activeCamera = this.editorCamera;
     this.editorCamera.attachControl(this.canvas, true);
-    this.prepareLoadedScene(loadableScene);
+    await this.prepareLoadedScene(loadableScene, options);
     const selectedNode = this.selectFirstEditableNode();
     this.frameEditableSceneInView(selectedNode);
     this.refreshSceneGraph();
@@ -1166,6 +2571,10 @@ export class BabylonEditorEngine {
       return null;
     }
 
+    if (this.isNodeLocked(node)) {
+      return this.createTransformSnapshot(node);
+    }
+
     const graphDirty = this.applyTransformUpdateToNode(node, update);
     this.refreshNodeWorldMatrices(node);
     const snapshot = this.createTransformSnapshot(node);
@@ -1179,22 +2588,23 @@ export class BabylonEditorEngine {
   /** 把属性面板更新应用到指定节点，返回是否需要刷新左侧层级树。 */
   private applyTransformUpdateToNode(node: TransformNode, update: TransformUpdate): boolean {
     let graphDirty = false;
+    const transformEditable = !this.isEditorGroup(node);
 
     if (update.name !== undefined) {
       node.name = update.name.trim() || node.name;
       graphDirty = true;
     }
 
-    if (update.position) {
+    if (transformEditable && update.position) {
       applySnapshotVector(node.position, update.position);
     }
 
-    if (update.rotation) {
+    if (transformEditable && update.rotation) {
       node.rotationQuaternion = null;
       applySnapshotVector(node.rotation, update.rotation, "degrees");
     }
 
-    if (update.scaling) {
+    if (transformEditable && update.scaling) {
       applySnapshotVector(node.scaling, update.scaling);
     }
 
@@ -1203,23 +2613,27 @@ export class BabylonEditorEngine {
       graphDirty = true;
     }
 
-    if (update.materialColor) {
+    if (transformEditable && update.materialColor && !this.isCadDrawingNode(node)) {
       this.updateNodeMaterialColor(node, update.materialColor);
       this.updateNodeMeshVertexModify(node, { mainColor: update.materialColor });
     }
 
-    if (update.meshVertexModify) {
+    if (transformEditable && update.cadOpacity !== undefined && node.metadata?.cadDrawing) {
+      this.applyCadDisplayOpacity(node, update.cadOpacity);
+    }
+
+    if (transformEditable && update.meshVertexModify) {
       this.updateNodeMeshVertexModify(node, update.meshVertexModify);
-      if (update.meshVertexModify.mainColor) {
+      if (update.meshVertexModify.mainColor && !this.isCadDrawingNode(node)) {
         this.updateNodeMaterialColor(node, update.meshVertexModify.mainColor);
       }
     }
 
-    if (update.assetInfo) {
+    if (transformEditable && update.assetInfo) {
       this.updateNodeAssetInfo(node, update.assetInfo);
     }
 
-    if (update.dynamicParameter) {
+    if (transformEditable && update.dynamicParameter) {
       this.updateNodeDynamicParameter(node, update.dynamicParameter);
       graphDirty = true;
     }
@@ -1486,6 +2900,7 @@ export class BabylonEditorEngine {
 
   /** 清空可编辑内容，必要时同步清空资产库，避免加载项目场景时和默认对象叠加。 */
   private clearEditableScene(clearAssets = true): void {
+    this.cancelCadRestore();
     this.selectNode(null);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
@@ -1508,7 +2923,7 @@ export class BabylonEditorEngine {
   }
 
   /** 恢复加载后节点的可编辑元数据，并从序列化数据中取回资产列表。 */
-  private prepareLoadedScene(serializedScene: Record<string, unknown>): void {
+  private async prepareLoadedScene(serializedScene: Record<string, unknown>, options: SerializedSceneLoadOptions = {}): Promise<void> {
     this.scene.rootNodes
       .filter((node) => !node.metadata?.[HELPER_FLAG])
       .forEach((node) => {
@@ -1523,12 +2938,613 @@ export class BabylonEditorEngine {
           node.getChildMeshes().forEach((mesh) => {
             mesh.isPickable = true;
           });
+          if (node.metadata?.cadDrawing) {
+            this.applyCadDisplayOpacity(node, this.getCadDisplayOpacity(node));
+          }
         }
       });
+
+    this.startLoadedCadChunkRestore(options);
+    await this.restoreLoadedCadMedia();
+    this.scene.rootNodes.forEach((node) => {
+      if (node instanceof TransformNode && node.metadata?.cadDrawing) {
+        this.applyCadDisplayOpacity(node, this.getCadDisplayOpacity(node));
+      }
+    });
 
     const restoredAssets = this.getSerializedAssets(serializedScene);
     this.assets.splice(0, this.assets.length, ...restoredAssets);
     this.callbacks.onAssetsChange([...this.assets]);
+  }
+
+  /** 启动后台 CAD 侧车恢复，避免项目重开被百万级线段阻塞。 */
+  private startLoadedCadChunkRestore(options: SerializedSceneLoadOptions): void {
+    if (!options.loadCadLineChunk && !options.loadCadLineChunks) {
+      return;
+    }
+
+    const tasks: CadRestoreChunkTask[] = [];
+    this.scene.rootNodes.forEach((root) => {
+      if (!(root instanceof TransformNode)) {
+        return;
+      }
+
+      const manifest = this.getCadChunkManifest(root);
+      if (!manifest) {
+        return;
+      }
+
+      this.disposeCadChunkMeshes(root);
+      manifest.chunks.forEach((chunk) => tasks.push({ root, chunk }));
+    });
+
+    if (tasks.length === 0) {
+      return;
+    }
+
+    const generation = this.cadRestoreGeneration;
+    void this.restoreLoadedCadChunkMeshes(tasks, options, generation);
+  }
+
+  /** 后台分批读取 CAD 侧车并合并创建 LinesMesh。 */
+  private async restoreLoadedCadChunkMeshes(
+    tasks: CadRestoreChunkTask[],
+    options: SerializedSceneLoadOptions,
+    generation: number
+  ): Promise<void> {
+    const builders = new Map<string, CadRestoreMergedLineBuilder>();
+    const totalChunks = tasks.length;
+    const totalSegments = tasks.reduce((sum, task) => sum + task.chunk.segmentCount, 0);
+    let restoredChunks = 0;
+    let renderedChunks = 0;
+    let skippedChunks = 0;
+
+    const report = (message: string) => {
+      options.onCadRestoreProgress?.({
+        phase: "restoring",
+        parsedEntities: 0,
+        emittedSegments: totalSegments,
+        totalSegments,
+        chunkCount: totalChunks,
+        restoredChunks,
+        renderedChunks,
+        skippedChunks,
+        message
+      });
+    };
+
+    const isActive = () => generation === this.cadRestoreGeneration && !this.scene.isDisposed;
+    report("正在恢复 CAD 线段侧车");
+
+    try {
+      for (let index = 0; index < tasks.length && isActive(); index += CAD_RESTORE_BATCH_CHUNKS) {
+        const batch = tasks.slice(index, index + CAD_RESTORE_BATCH_CHUNKS);
+        const buffers = await this.loadCadRestoreBatch(batch, options);
+        if (!isActive()) {
+          return;
+        }
+
+        for (const task of batch) {
+          const buffer = buffers.get(task.chunk.chunkId);
+          if (!buffer) {
+            skippedChunks += 1;
+            continue;
+          }
+
+          try {
+            renderedChunks += this.appendCadRestoreChunkToBuilders(builders, task.root, task.chunk, buffer);
+            restoredChunks += 1;
+          } catch (error) {
+            skippedChunks += 1;
+            this.addCadMetadataWarning(task.root, getEngineErrorMessage(error, `CAD 线段块 ${task.chunk.chunkId} 恢复失败，已跳过。`));
+          }
+
+          if (renderedChunks > 0 && renderedChunks % CAD_RESTORE_YIELD_MESHES === 0) {
+            report("正在创建 CAD 线段网格");
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+            if (!isActive()) {
+              return;
+            }
+          }
+        }
+
+        report("正在读取 CAD 线段侧车");
+      }
+
+      builders.forEach((builder) => {
+        if (builder.segmentCount > 0 && isActive()) {
+          this.flushCadRestoreBuilder(builder);
+          renderedChunks += 1;
+        }
+      });
+
+      if (!isActive()) {
+        return;
+      }
+
+      report("CAD 线段恢复完成");
+      this.refreshSceneGraph();
+      this.callbacks.onStatsChange(this.collectStats());
+      this.scene.render();
+      options.onCadRestoreProgress?.({
+        phase: "done",
+        parsedEntities: 0,
+        emittedSegments: totalSegments,
+        totalSegments,
+        chunkCount: totalChunks,
+        restoredChunks,
+        renderedChunks,
+        skippedChunks,
+        message: "CAD 图纸恢复完成"
+      });
+    } catch (error) {
+      if (isActive()) {
+        options.onCadRestoreProgress?.({
+          phase: "done",
+          parsedEntities: 0,
+          emittedSegments: totalSegments,
+          totalSegments,
+          chunkCount: totalChunks,
+          restoredChunks,
+          renderedChunks,
+          skippedChunks,
+          message: getEngineErrorMessage(error, "CAD 图纸恢复失败。")
+        });
+      }
+    }
+  }
+
+  /** 删除 CAD 根节点下旧的线段 mesh，避免侧车恢复后和序列化残留重复显示。 */
+  private disposeCadChunkMeshes(root: TransformNode): void {
+    root.getChildMeshes(false).forEach((mesh) => {
+      const metadata = this.asMetadataObject(mesh.metadata);
+      if (metadata.cadPrimitive === "polyline") {
+        mesh.dispose(false, false);
+      }
+    });
+  }
+
+  /** 批量读取一组 CAD chunk，pack 文件只读取一次，再按 manifest 偏移切出单个 chunk。 */
+  private async loadCadRestoreBatch(
+    tasks: CadRestoreChunkTask[],
+    options: SerializedSceneLoadOptions
+  ): Promise<Map<string, ArrayBuffer>> {
+    const requests = new Map<string, CadLineChunkLoadRequest>();
+    tasks.forEach((task) => {
+      const projectFile = this.getCadChunkProjectFile(task.chunk);
+      if (!projectFile) {
+        this.addCadMetadataWarning(task.root, `CAD 线段块 ${task.chunk.chunkId} 缺少项目侧车文件路径，已跳过恢复。`);
+        return;
+      }
+
+      const expectedByteLength = task.chunk.packProjectFile ? task.chunk.packByteLength : this.getCadChunkExpectedByteLength(task.chunk);
+      const previous = requests.get(projectFile);
+      if (!previous) {
+        requests.set(projectFile, { projectFile, expectedByteLength });
+      } else if (previous.expectedByteLength === undefined && expectedByteLength !== undefined) {
+        previous.expectedByteLength = expectedByteLength;
+      }
+    });
+
+    const loaded = new Map<string, ArrayBuffer>();
+    if (requests.size === 0) {
+      return loaded;
+    }
+
+    const requestList = [...requests.values()];
+    const results = options.loadCadLineChunks
+      ? await options.loadCadLineChunks(requestList)
+      : await Promise.all(
+          requestList.map(async (request): Promise<CadLineChunkLoadResult> => {
+            if (!options.loadCadLineChunk) {
+              return { projectFile: request.projectFile, error: "当前运行环境不支持读取 CAD 线段侧车文件。" };
+            }
+
+            try {
+              const data = await options.loadCadLineChunk(request.projectFile);
+              return { projectFile: request.projectFile, data };
+            } catch (error) {
+              return { projectFile: request.projectFile, error: getEngineErrorMessage(error, "CAD 线段侧车文件读取失败。") };
+            }
+          })
+        );
+
+    const loadedFiles = new Map<string, CadLineChunkLoadResult>();
+    results.forEach((result) => loadedFiles.set(result.projectFile, result));
+    tasks.forEach((task) => {
+      const projectFile = this.getCadChunkProjectFile(task.chunk);
+      if (!projectFile) {
+        return;
+      }
+
+      const result = loadedFiles.get(projectFile);
+      if (!result?.data) {
+        this.addCadMetadataWarning(task.root, result?.error ?? `CAD 线段块 ${task.chunk.chunkId} 读取失败，已跳过恢复。`);
+        return;
+      }
+
+      const chunkBuffer = this.sliceCadChunkBuffer(task.chunk, result.data);
+      if (!chunkBuffer) {
+        this.addCadMetadataWarning(task.root, `CAD 线段块 ${task.chunk.chunkId} 数据长度异常，已跳过恢复。`);
+        return;
+      }
+
+      loaded.set(task.chunk.chunkId, chunkBuffer);
+    });
+    return loaded;
+  }
+
+  /** 取得 CAD chunk 所在的项目资产文件，优先新 pack 格式，兼容旧单 chunk 文件。 */
+  private getCadChunkProjectFile(chunk: CadLineChunkManifest): string | undefined {
+    return chunk.packProjectFile ?? chunk.projectFile;
+  }
+
+  /** 单个 chunk 按 Float32 positions 计算应有字节数。 */
+  private getCadChunkExpectedByteLength(chunk: CadLineChunkManifest): number {
+    return chunk.segmentCount * 2 * 3 * Float32Array.BYTES_PER_ELEMENT;
+  }
+
+  /** 从旧 chunk 文件或新 pack 文件中切出单个 chunk 的精确 ArrayBuffer。 */
+  private sliceCadChunkBuffer(chunk: CadLineChunkManifest, source: ArrayBuffer): ArrayBuffer | null {
+    const expectedByteLength = this.getCadChunkExpectedByteLength(chunk);
+    if (chunk.packProjectFile) {
+      const byteOffset = chunk.byteOffset ?? -1;
+      const byteLength = chunk.byteLength ?? -1;
+      if (byteOffset < 0 || byteLength !== expectedByteLength || byteOffset + byteLength > source.byteLength) {
+        return null;
+      }
+
+      return source.slice(byteOffset, byteOffset + byteLength);
+    }
+
+    return source.byteLength === expectedByteLength ? source : null;
+  }
+
+  /** 将一个 CAD chunk 追加到同样式合并 builder，达到顶点上限后刷出 mesh。 */
+  private appendCadRestoreChunkToBuilders(
+    builders: Map<string, CadRestoreMergedLineBuilder>,
+    root: TransformNode,
+    chunk: CadLineChunkManifest,
+    buffer: ArrayBuffer
+  ): number {
+    let renderedMeshes = 0;
+    let sourceOffset = 0;
+    const source = new Float32Array(buffer);
+    let remainingSegments = chunk.segmentCount;
+
+    while (remainingSegments > 0) {
+      const builder = this.getCadRestoreBuilder(builders, root, chunk.style);
+      const writableSegments = Math.min(remainingSegments, CAD_RESTORE_MESH_SEGMENTS - builder.segmentCount);
+      const floatCount = writableSegments * 2 * 3;
+      builder.positions.set(source.subarray(sourceOffset, sourceOffset + floatCount), builder.offset);
+      builder.offset += floatCount;
+      builder.segmentCount += writableSegments;
+      builder.chunkIds.push(chunk.chunkId);
+      sourceOffset += floatCount;
+      remainingSegments -= writableSegments;
+
+      if (builder.segmentCount >= CAD_RESTORE_MESH_SEGMENTS) {
+        this.flushCadRestoreBuilder(builder);
+        renderedMeshes += 1;
+      }
+    }
+
+    return renderedMeshes;
+  }
+
+  /** 获取同 CAD 根节点、同图层颜色透明度的恢复合并 builder。 */
+  private getCadRestoreBuilder(
+    builders: Map<string, CadRestoreMergedLineBuilder>,
+    root: TransformNode,
+    style: CadDxfLineChunkStyle
+  ): CadRestoreMergedLineBuilder {
+    const key = `${root.uniqueId}|${style.layer}|${style.color}|${style.alpha}|${style.entityType}`;
+    let builder = builders.get(key);
+    if (!builder) {
+      builder = {
+        root,
+        style,
+        chunkIds: [],
+        positions: new Float32Array(CAD_RESTORE_MESH_SEGMENTS * 2 * 3),
+        offset: 0,
+        segmentCount: 0,
+        meshIndex: 0
+      };
+      builders.set(key, builder);
+    }
+    return builder;
+  }
+
+  /** 把恢复合并 builder 刷成一个 LinesMesh，并复用统一的 chunk mesh 创建路径。 */
+  private flushCadRestoreBuilder(builder: CadRestoreMergedLineBuilder): void {
+    if (builder.segmentCount === 0) {
+      return;
+    }
+
+    const positions = builder.segmentCount === CAD_RESTORE_MESH_SEGMENTS ? builder.positions : builder.positions.slice(0, builder.offset);
+    const chunkId = `cad-restore-${builder.root.uniqueId}-${builder.style.layer}-${builder.meshIndex}`;
+    const mesh = this.createCadLineChunkMesh(builder.root, chunkId, builder.style, builder.segmentCount, positions);
+    mesh.doNotSerialize = true;
+    mesh.metadata = {
+      ...this.asMetadataObject(mesh.metadata),
+      cadRestoredChunkIds: [...new Set(builder.chunkIds)]
+    };
+    builder.meshIndex += 1;
+    builder.positions = new Float32Array(CAD_RESTORE_MESH_SEGMENTS * 2 * 3);
+    builder.offset = 0;
+    builder.segmentCount = 0;
+    builder.chunkIds = [];
+  }
+
+  /** 从 CAD 根节点 metadata 安全读取侧车 chunk manifest。 */
+  private getCadChunkManifest(root: TransformNode): CadChunkManifestMetadata | null {
+    const rootMetadata = this.asMetadataObject(root.metadata);
+    if (!rootMetadata.cadDrawing) {
+      return null;
+    }
+
+    const editorMetadata = this.asMetadataObject(rootMetadata.editor);
+    const manifest = this.asMetadataObject(editorMetadata.cadChunkManifest);
+    if (manifest.version !== 1 || !Array.isArray(manifest.chunks)) {
+      return null;
+    }
+
+    const chunks = manifest.chunks.filter((chunk): chunk is CadLineChunkManifest => this.isCadLineChunkManifest(chunk));
+    if (chunks.length === 0) {
+      return null;
+    }
+
+    return {
+      version: 1,
+      sourceFile: typeof manifest.sourceFile === "string" ? manifest.sourceFile : undefined,
+      sourcePath: typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined,
+      bounds: this.isCadDxfBounds(manifest.bounds) ? manifest.bounds : undefined,
+      rawBounds: this.isCadDxfBounds(manifest.rawBounds) ? manifest.rawBounds : undefined,
+      unit: manifest.unit,
+      segmentCount: this.getOptionalFiniteNumber(manifest.segmentCount),
+      chunkSegmentLimit: this.getOptionalFiniteNumber(manifest.chunkSegmentLimit),
+      chunks
+    };
+  }
+
+  /** 校验单个 CAD chunk manifest，避免损坏项目文件触发无效 typed array 构建。 */
+  private isCadLineChunkManifest(value: unknown): value is CadLineChunkManifest {
+    const chunk = this.asMetadataObject(value);
+    return (
+      typeof chunk.chunkId === "string" &&
+      typeof chunk.fileName === "string" &&
+      (chunk.projectFile === undefined || typeof chunk.projectFile === "string") &&
+      (chunk.packFile === undefined || typeof chunk.packFile === "string") &&
+      (chunk.packProjectFile === undefined || typeof chunk.packProjectFile === "string") &&
+      (chunk.byteOffset === undefined || this.isSafeNonNegativeInteger(chunk.byteOffset)) &&
+      (chunk.byteLength === undefined || this.isSafeNonNegativeInteger(chunk.byteLength, CAD_LINE_PACK_MAX_BYTES)) &&
+      (chunk.packByteLength === undefined || this.isSafeNonNegativeInteger(chunk.packByteLength, CAD_LINE_PACK_MAX_BYTES)) &&
+      this.isCadLineChunkStyle(chunk.style) &&
+      this.isSafeNonNegativeInteger(chunk.segmentCount, CAD_RESTORE_MESH_SEGMENTS) &&
+      this.isCadDxfBounds(chunk.bounds)
+    );
+  }
+
+  /** 校验 CAD 线段样式 metadata，保证恢复时颜色和图层可用。 */
+  private isCadLineChunkStyle(value: unknown): value is CadDxfLineChunkStyle {
+    const style = this.asMetadataObject(value);
+    return (
+      typeof style.layer === "string" &&
+      typeof style.color === "string" &&
+      /^#[0-9a-fA-F]{6}$/.test(style.color) &&
+      typeof style.alpha === "number" &&
+      Number.isFinite(style.alpha) &&
+      typeof style.entityType === "string" &&
+      this.asMetadataObject(style.style) !== null
+    );
+  }
+
+  /** 校验 CAD 二维 bounds，恢复相机和诊断信息时不能信任旧项目 JSON。 */
+  private isCadDxfBounds(value: unknown): value is CadDxfBounds {
+    const bounds = this.asMetadataObject(value);
+    return ["minX", "minY", "maxX", "maxY", "centerX", "centerY", "width", "height"].every(
+      (key) => typeof bounds[key] === "number" && Number.isFinite(bounds[key])
+    );
+  }
+
+  /** 读取可选数值 metadata，非数值直接忽略。 */
+  private getOptionalFiniteNumber(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  }
+
+  /** 读取 CAD 根节点显示透明度，默认 1 表示不额外降低原始 CAD 线条 alpha。 */
+  private getCadDisplayOpacity(root: TransformNode): number {
+    const metadata = this.asMetadataObject(root.metadata);
+    const editorMetadata = this.asMetadataObject(metadata.editor);
+    const cadMetadata = this.asMetadataObject(metadata.cad);
+    return this.clampCadDisplayOpacity(
+      this.getNumberMetadata(editorMetadata.cadDisplayOpacity, this.getNumberMetadata(cadMetadata.displayOpacity, 1))
+    );
+  }
+
+  /** CAD 透明度限制在可见范围内，隐藏整张图纸仍使用节点显隐开关。 */
+  private clampCadDisplayOpacity(value: number): number {
+    return Math.max(0.05, Math.min(1, Number.isFinite(value) ? value : 1));
+  }
+
+  /** 把 CAD primitive 自身 alpha 与整张图纸显示透明度相乘。 */
+  private getCadDisplayAlpha(root: TransformNode, primitiveAlpha: number): number {
+    const baseAlpha = Math.max(0, Math.min(1, Number.isFinite(primitiveAlpha) ? primitiveAlpha : 1));
+    return Math.max(0, Math.min(1, baseAlpha * this.getCadDisplayOpacity(root)));
+  }
+
+  /** 更新 CAD 根节点透明度 metadata，并同步已创建的所有 CAD 子 mesh。 */
+  private applyCadDisplayOpacity(root: TransformNode, opacity: number): void {
+    const nextOpacity = this.clampCadDisplayOpacity(opacity);
+    const metadata = this.asMetadataObject(root.metadata);
+    const editorMetadata = this.asMetadataObject(metadata.editor);
+    const cadMetadata = this.asMetadataObject(metadata.cad);
+    root.metadata = {
+      ...metadata,
+      cad: {
+        ...cadMetadata,
+        displayOpacity: nextOpacity
+      },
+      editor: {
+        ...editorMetadata,
+        cadDisplayOpacity: nextOpacity
+      }
+    };
+
+    root.getChildMeshes(false).forEach((mesh) => {
+      if (this.asMetadataObject(mesh.metadata).cadPrimitive) {
+        this.applyCadMeshDisplayOpacity(mesh, nextOpacity);
+      }
+    });
+  }
+
+  /** 对单个 CAD mesh 应用整体透明度，不覆盖 metadata 中保存的原始 cadAlpha。 */
+  private applyCadMeshDisplayOpacity(mesh: AbstractMesh, opacity: number): void {
+    const metadata = this.asMetadataObject(mesh.metadata);
+    const fallbackAlpha = mesh instanceof LinesMesh ? mesh.alpha : mesh.material && !(mesh.material instanceof MultiMaterial) ? mesh.material.alpha : 1;
+    const baseAlpha = this.getNumberMetadata(metadata.cadAlpha, fallbackAlpha || 1);
+    if (typeof metadata.cadAlpha !== "number" || !Number.isFinite(metadata.cadAlpha)) {
+      mesh.metadata = { ...metadata, cadAlpha: baseAlpha };
+    }
+    const finalAlpha = Math.max(0, Math.min(1, baseAlpha * opacity));
+    if (mesh instanceof LinesMesh) {
+      mesh.alpha = finalAlpha;
+    }
+    const material = mesh.material;
+    if (material && !(material instanceof MultiMaterial)) {
+      material.alpha = finalAlpha;
+    }
+  }
+
+  /** 校验来自项目 JSON 的非负整数，避免损坏 manifest 触发超大 typed array 分配。 */
+  private isSafeNonNegativeInteger(value: unknown, maxValue = Number.MAX_SAFE_INTEGER): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maxValue;
+  }
+
+  /** 将 CAD 恢复问题写回根节点 metadata，供属性面板和保存后的项目诊断。 */
+  private addCadMetadataWarning(root: TransformNode, warning: string): void {
+    const rootMetadata = this.asMetadataObject(root.metadata);
+    const cadMetadata = this.asMetadataObject(rootMetadata.cad);
+    const existingWarnings = Array.isArray(cadMetadata.warnings)
+      ? cadMetadata.warnings.filter((item): item is string => typeof item === "string")
+      : [];
+    root.metadata = {
+      ...rootMetadata,
+      cad: {
+        ...cadMetadata,
+        warnings: [...new Set([...existingWarnings, warning])]
+      },
+      [ROOT_FLAG]: rootMetadata[ROOT_FLAG] ?? true
+    };
+  }
+
+  /** 保存场景后恢复 CAD 文字和图片贴图，避免 blob URL 或 DynamicTexture 丢失导致图纸空白。 */
+  private async restoreLoadedCadMedia(): Promise<void> {
+    const tasks: Array<Promise<void>> = [];
+    this.scene.rootNodes.forEach((root) => {
+      if (!(root instanceof TransformNode)) {
+        return;
+      }
+
+      const rootMetadata = this.asMetadataObject(root.metadata);
+      if (!rootMetadata.cadDrawing) {
+        return;
+      }
+
+      const cadMetadata = this.asMetadataObject(rootMetadata.cad);
+      const context: CadImageRestoreContext = {
+        sourcePath: typeof cadMetadata.sourcePath === "string" ? cadMetadata.sourcePath : undefined
+      };
+
+      root.getChildMeshes(false).forEach((mesh) => {
+        const metadata = this.asMetadataObject(mesh.metadata);
+        if (metadata.cadPrimitive === "text") {
+          this.restoreCadTextMaterial(mesh);
+        } else if (metadata.cadPrimitive === "image") {
+          tasks.push(this.restoreCadImageMaterial(mesh, context));
+        }
+      });
+    });
+
+    await Promise.all(tasks);
+  }
+
+  /** 根据 CAD 文字 metadata 重建 DynamicTexture，供项目重开后继续显示中文标注。 */
+  private restoreCadTextMaterial(mesh: AbstractMesh): void {
+    const text = this.getCadTextMetadata(mesh);
+    if (!text) {
+      return;
+    }
+
+    const previousMaterial = mesh.material;
+    mesh.material = this.createCadTextMaterial(`${mesh.name} / 恢复文字材质`, `${mesh.name} / 恢复文字纹理`, text);
+    if (previousMaterial?.metadata?.cadTextMaterial === true) {
+      previousMaterial.dispose(false, true, false);
+    }
+  }
+
+  /** 根据 CAD 图片 metadata 和原始 DXF 路径重建图片贴图；浏览器无本地路径时保持现状。 */
+  private async restoreCadImageMaterial(mesh: AbstractMesh, context: CadImageRestoreContext): Promise<void> {
+    const metadata = this.asMetadataObject(mesh.metadata);
+    const cadImage = this.asMetadataObject(metadata.cadImage);
+    const sourcePath = typeof cadImage.sourcePath === "string" ? cadImage.sourcePath : undefined;
+    if (!sourcePath || !context.sourcePath || !window.electronApp?.files?.readLocalReference) {
+      return;
+    }
+
+    const source = await this.resolveCadImageSource({ sourcePath } as CadDxfImagePrimitive, {
+      sourcePath: context.sourcePath,
+      relatedFiles: [],
+      objectUrls: []
+    });
+    if (!source) {
+      return;
+    }
+
+    const previousMaterial = mesh.material;
+    mesh.material = this.createCadImageMaterial(`${mesh.name} / 恢复图片材质`, source);
+    mesh.metadata = {
+      ...metadata,
+      cadImage: {
+        ...cadImage,
+        resolvedFileName: source.fileName,
+        source: source.source
+      }
+    };
+    if (previousMaterial?.metadata?.cadImageMaterial === true) {
+      previousMaterial.dispose(false, true, false);
+    }
+  }
+
+  /** 从序列化 metadata 中恢复 CAD 文字绘制所需的最小数据。 */
+  private getCadTextMetadata(mesh: AbstractMesh): CadDxfText | null {
+    const metadata = this.asMetadataObject(mesh.metadata);
+    const rawText = this.asMetadataObject(metadata.cadText);
+    if (typeof rawText.text !== "string" || rawText.text.length === 0) {
+      return null;
+    }
+
+    const color = this.normalizeHexColor(rawText.color) ?? this.normalizeHexColor(metadata.cadColor) ?? "#ffffff";
+    const alpha = Math.max(0.01, Math.min(1, this.getNumberMetadata(rawText.alpha, this.getNumberMetadata(metadata.cadAlpha, 1))));
+    const height = Math.max(0.001, this.getNumberMetadata(rawText.height, 0.25));
+    const width = rawText.width === undefined ? undefined : Math.max(0.001, this.getNumberMetadata(rawText.width, height));
+    const align = rawText.align === "center" || rawText.align === "right" ? rawText.align : "left";
+
+    return {
+      type: "text",
+      entityType: typeof rawText.entityType === "string" ? rawText.entityType : "TEXT",
+      layer: typeof rawText.layer === "string" ? rawText.layer : this.getStringMetadata(metadata.cadLayer, "0"),
+      color,
+      alpha,
+      style: this.asMetadataObject(rawText.style) as unknown as CadDxfText["style"],
+      text: rawText.text,
+      position: { x: 0, y: 0 },
+      height,
+      rotationDegrees: this.getNumberMetadata(rawText.rotationDegrees, 0),
+      widthFactor: Math.max(0.001, this.getNumberMetadata(rawText.widthFactor, 1)),
+      align,
+      width
+    };
   }
 
   /** 释放单个可编辑节点，包含其子网格和不再被场景引用的独立材质。 */
@@ -1582,7 +3598,7 @@ export class BabylonEditorEngine {
         return;
       }
       // MultiMaterial 的子材质已由 collectMaterialTree 递归收集，逐个经过引用检查后再释放。
-      material.dispose(false, false, false);
+      material.dispose(false, material.metadata?.cadTextMaterial === true || material.metadata?.cadImageMaterial === true, false);
     });
   }
 
@@ -1701,6 +3717,18 @@ export class BabylonEditorEngine {
     let index = 2;
     while (this.scene.getNodeByName(candidate)) {
       candidate = `${copyBaseName} ${index}`;
+      index += 1;
+    }
+    return candidate;
+  }
+
+  /** 生成当前场景中唯一的分组名称，避免连续新建时树中出现重名。 */
+  private createUniqueGroupName(): string {
+    const baseName = "新建Group";
+    let candidate = baseName;
+    let index = 2;
+    while (this.scene.getNodeByName(candidate)) {
+      candidate = `${baseName} ${index}`;
       index += 1;
     }
     return candidate;
@@ -1923,6 +3951,11 @@ export class BabylonEditorEngine {
         }
 
         const root = this.findSelectableRoot(mesh);
+        if (this.isNodeLocked(root)) {
+          this.selectNode(null);
+          return;
+        }
+
         this.selectNode(root);
         this.frameNodeInView(root);
         return;
@@ -1938,7 +3971,8 @@ export class BabylonEditorEngine {
         return;
       }
 
-      this.selectNode(this.findSelectableRoot(mesh));
+      const root = this.findSelectableRoot(mesh);
+      this.selectNode(this.isNodeLocked(root) ? null : root);
     });
   }
 
@@ -2869,7 +4903,11 @@ export class BabylonEditorEngine {
 
   /** 根据当前工具模式开启对应 Gizmo，并附着到选中节点。 */
   private syncGizmoMode(): void {
-    if (this.previewMode) {
+    const canTransformSelection = Boolean(
+      this.selectedNode && !this.isEditorGroup(this.selectedNode) && !this.isNodeLocked(this.selectedNode)
+    );
+
+    if (this.previewMode || !canTransformSelection) {
       this.gizmoManager.positionGizmoEnabled = false;
       this.gizmoManager.rotationGizmoEnabled = false;
       this.gizmoManager.scaleGizmoEnabled = false;
@@ -2881,7 +4919,8 @@ export class BabylonEditorEngine {
     this.gizmoManager.positionGizmoEnabled = this.currentTool === "move";
     this.gizmoManager.rotationGizmoEnabled = this.currentTool === "rotate";
     this.gizmoManager.scaleGizmoEnabled = this.currentTool === "scale";
-    this.gizmoManager.boundingBoxGizmoEnabled = this.currentTool === "select" && Boolean(this.selectedNode);
+    this.gizmoManager.boundingBoxGizmoEnabled =
+      this.currentTool === "select" && Boolean(this.selectedNode) && !this.isCadDrawingNode(this.selectedNode);
     this.bindGizmoRealtimeSync();
     this.gizmoManager.attachToNode(this.selectedNode);
   }
@@ -2968,12 +5007,12 @@ export class BabylonEditorEngine {
     this.highlightedMeshes.forEach((mesh) => this.highlightLayer.removeMesh(mesh));
     this.highlightedMeshes.clear();
 
-    if (!node) {
+    if (!node || this.isCadDrawingNode(node)) {
       return;
     }
 
     this.getEditableMeshes(node)
-      .filter((mesh): mesh is Mesh => mesh instanceof Mesh && !mesh.metadata?.[HELPER_FLAG])
+      .filter((mesh): mesh is Mesh => mesh instanceof Mesh && !mesh.metadata?.[HELPER_FLAG] && !this.isCadDrawingNode(mesh))
       .forEach((mesh) => {
         this.highlightLayer.addMesh(mesh, Color3.FromHexString("#f4c542"));
         this.highlightedMeshes.add(mesh);
@@ -2995,6 +5034,8 @@ export class BabylonEditorEngine {
     const rotation = node.rotationQuaternion ? node.rotationQuaternion.toEulerAngles() : node.rotation;
     const bounds = this.getNodeWorldBounds(node);
     const materialColor = this.getNodeMaterialColor(node);
+    const selfLocked = this.isNodeSelfLocked(node);
+    const lockedByAncestor = this.isNodeLockedByAncestor(node);
     return {
       id: node.uniqueId,
       name: node.name,
@@ -3005,6 +5046,10 @@ export class BabylonEditorEngine {
       scaling: snapshotVector(node.scaling),
       visible: this.getNodeVisibility(node),
       materialColor,
+      cadOpacity: node.metadata?.cadDrawing ? this.getCadDisplayOpacity(node) : undefined,
+      selfLocked,
+      locked: selfLocked || lockedByAncestor,
+      lockedByAncestor,
       meshVertexModify: this.getNodeMeshVertexModify(node, materialColor),
       assetInfo: this.getNodeAssetInfo(node),
       dynamicParameters: this.getNodeDynamicParameters(node)
@@ -3111,6 +5156,53 @@ export class BabylonEditorEngine {
   /** 读取节点 metadata.editor，统一兼容旧场景中的空 metadata。 */
   private getNodeEditorMetadata(node: Node): Record<string, unknown> {
     return this.asMetadataObject(this.asMetadataObject(node.metadata).editor);
+  }
+
+  /** 判断节点是否是编辑器逻辑分组，分组只承载树结构和批量操作。 */
+  private isEditorGroup(node: Node | null | undefined): boolean {
+    if (!node) {
+      return false;
+    }
+
+    return this.getNodeEditorMetadata(node).nodeType === GROUP_NODE_TYPE;
+  }
+
+  /** 判断节点自身是否被锁定，不包含父级继承状态。 */
+  private isNodeSelfLocked(node: Node | null | undefined): boolean {
+    if (!node) {
+      return false;
+    }
+
+    return this.getNodeEditorMetadata(node).locked === true;
+  }
+
+  /** 判断节点是否继承了父级锁定，供树图标显示和编辑拦截复用。 */
+  private isNodeLockedByAncestor(node: Node | null | undefined): boolean {
+    let current = node?.parent ?? null;
+    while (current) {
+      if (this.isNodeSelfLocked(current)) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
+  /** 判断节点当前是否有效锁定，父级 group 锁定会覆盖子模型。 */
+  private isNodeLocked(node: Node | null | undefined): boolean {
+    return this.isNodeSelfLocked(node) || this.isNodeLockedByAncestor(node);
+  }
+
+  /** 判断 ancestor 是否是 node 的父级链路成员，避免拖拽形成循环层级。 */
+  private isNodeAncestor(ancestor: Node, node: Node): boolean {
+    let current = node.parent;
+    while (current) {
+      if (current.uniqueId === ancestor.uniqueId) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
   }
 
   /** 从 metadata 中读取布尔值，缺失或类型不符时使用默认值。 */
@@ -3232,8 +5324,11 @@ export class BabylonEditorEngine {
       return;
     }
 
+    const values = this.getModelPackageValues(root, manifest);
+    this.syncModelPackageScriptMetadata(root, manifest, values);
+    this.assignModelPackageRuntimeValues(handle.instance, values, manifest.dynamicFields);
     const methodName = handle.started ? "onUpdate" : "onStart";
-    const warning = this.runModelPackageLifecycleWithPositionGuard(root, () =>
+    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, () =>
       invokeModelPackageRuntimeLifecycle(handle.instance, methodName, scriptFile)
     );
     if (warning) {
@@ -3302,7 +5397,13 @@ export class BabylonEditorEngine {
       return;
     }
 
-    const warning = this.runModelPackageLifecycleWithPositionGuard(root, () =>
+    const manifest = this.getModelPackageAssetForRoot(root)?.modelPackage;
+    const values = manifest ? this.getModelPackageValues(root, manifest) : this.getRawModelPackageValues(root);
+    if (manifest) {
+      this.syncModelPackageScriptMetadata(root, manifest, values);
+    }
+    this.assignModelPackageRuntimeValues(handle.instance, values, manifest?.dynamicFields);
+    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, () =>
       invokeModelPackageRuntimeLifecycle(handle.instance, "onStop", handle.scriptFile)
     );
     if (warning) {
@@ -3325,15 +5426,56 @@ export class BabylonEditorEngine {
     }
   }
 
-  /** 包住生命周期调用，只保护模型包根节点位置，缩放和角度仍允许由脚本参数驱动。 */
-  private runModelPackageLifecycleWithPositionGuard(root: TransformNode, action: () => string | undefined): string | undefined {
-    const position = root.position.clone();
+  /** 包住模型包生命周期调用，避免保存时 onStop/onStart 把用户编辑的根节点状态和参数还原。 */
+  private runModelPackageLifecycleWithEditableStateGuard(
+    root: TransformNode,
+    manifest: ModelPackageManifest | undefined,
+    values: Record<string, DynamicParameterValue>,
+    action: () => string | undefined
+  ): string | undefined {
+    const editableState = this.captureModelPackageEditableState(root, values);
     try {
       return action();
     } finally {
-      root.position.copyFrom(position);
+      this.restoreModelPackageEditableState(root, editableState);
+      if (manifest) {
+        this.syncModelPackageScriptMetadata(root, manifest, editableState.values);
+      }
       this.refreshNodeWorldMatrices(root);
     }
+  }
+
+  /** 捕获模型包根节点用户可编辑状态，供运行脚本生命周期结束后恢复。 */
+  private captureModelPackageEditableState(
+    root: TransformNode,
+    values: Record<string, DynamicParameterValue>
+  ): ModelPackageEditableStateSnapshot {
+    const editorMetadata = this.getNodeEditorMetadata(root);
+    const modelPackageInstance = this.deepCloneMetadata(editorMetadata.modelPackageInstance);
+    return {
+      name: root.name,
+      position: root.position.clone(),
+      rotation: root.rotation.clone(),
+      rotationQuaternion: root.rotationQuaternion?.clone() ?? null,
+      scaling: root.scaling.clone(),
+      modelPackageInstance,
+      values: this.cloneDynamicParameterValues(values)
+    };
+  }
+
+  /** 恢复模型包根节点状态，只回写权威动态参数，不干扰运行时告警等其它 editor metadata。 */
+  private restoreModelPackageEditableState(root: TransformNode, snapshot: ModelPackageEditableStateSnapshot): void {
+    root.name = snapshot.name;
+    root.position.copyFrom(snapshot.position);
+    root.rotation.copyFrom(snapshot.rotation);
+    root.rotationQuaternion = snapshot.rotationQuaternion?.clone() ?? null;
+    root.scaling.copyFrom(snapshot.scaling);
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageInstance: {
+        ...snapshot.modelPackageInstance,
+        values: this.cloneDynamicParameterValues(snapshot.values)
+      }
+    });
   }
 
   /** 同步脚本读取的 metadata.scripts[]，桥接编辑器内部参数存储和模型包运行脚本契约。 */
@@ -3372,7 +5514,7 @@ export class BabylonEditorEngine {
             step: field.step
           }
         })),
-        values
+        values: this.cloneDynamicParameterValues(values)
       }
     ];
 
@@ -3380,7 +5522,7 @@ export class BabylonEditorEngine {
       scripts.push({
         scriptFilename: runtimeScriptFile,
         className: runtimeClassName,
-        values: {}
+        values: this.cloneDynamicParameterValues(values)
       });
     }
 
@@ -3400,6 +5542,53 @@ export class BabylonEditorEngine {
     } as Record<string, DynamicParameterValue>;
   }
 
+  /** 在缺少资产 manifest 时读取原始模型包参数，用于停止运行脚本时兜底保护用户输入。 */
+  private getRawModelPackageValues(root: TransformNode): Record<string, DynamicParameterValue> {
+    const editorMetadata = this.getNodeEditorMetadata(root);
+    const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
+    return this.cloneDynamicParameterValues(this.asMetadataObject(instance.values) as Record<string, DynamicParameterValue>);
+  }
+
+  /** 把动态参数注入运行脚本实例，兼容脚本通过 this.xxx 读取参数的写法。 */
+  private assignModelPackageRuntimeValues(
+    instance: ModelPackageRuntimeInstance,
+    values: Record<string, DynamicParameterValue>,
+    fields?: DynamicInspectorField[]
+  ): void {
+    const target = instance as Record<string, unknown>;
+    const fieldsByKey = new Map((fields ?? []).map((field) => [field.key, field]));
+    Object.entries(values).forEach(([key, value]) => {
+      target[key] = this.cloneDynamicParameterValueForRuntime(value, fieldsByKey.get(key));
+    });
+  }
+
+  /** 克隆动态参数字典，避免运行脚本修改 metadata.scripts[].values 时污染权威参数。 */
+  private cloneDynamicParameterValues(values: Record<string, DynamicParameterValue>): Record<string, DynamicParameterValue> {
+    return Object.entries(values).reduce<Record<string, DynamicParameterValue>>((output, [key, value]) => {
+      output[key] = this.cloneDynamicParameterValue(value);
+      return output;
+    }, {});
+  }
+
+  /** 克隆单个动态参数值，颜色对象按普通 metadata 深拷贝，标量直接复用。 */
+  private cloneDynamicParameterValue(value: DynamicParameterValue): DynamicParameterValue {
+    if (value && typeof value === "object") {
+      return this.deepCloneMetadata(value) as unknown as DynamicParameterValue;
+    }
+
+    return value;
+  }
+
+  /** 克隆注入运行脚本实例的参数值，颜色字段转为 Babylon Color3 以兼容 this.xxx 用法。 */
+  private cloneDynamicParameterValueForRuntime(value: DynamicParameterValue, field?: DynamicInspectorField): unknown {
+    if ((field?.kind === "color3" || (!field && this.isColor3ParameterValue(value))) && this.isColor3ParameterValue(value)) {
+      const color = this.asMetadataObject(value);
+      return new Color3(Number(color.r), Number(color.g), Number(color.b));
+    }
+
+    return this.cloneDynamicParameterValue(value);
+  }
+
   /** 根据根节点 metadata 找到对应资产记录。 */
   private getModelPackageAssetForRoot(root: TransformNode): AssetRecord | undefined {
     const editorMetadata = this.getNodeEditorMetadata(root);
@@ -3407,6 +5596,11 @@ export class BabylonEditorEngine {
     const assetId = typeof instance.assetId === "string" ? instance.assetId : "";
     const packageId = typeof instance.packageId === "string" ? instance.packageId : "";
     return this.assets.find((item) => item.id === assetId && item.modelPackage?.packageId === packageId);
+  }
+
+  /** 读取模型包声明的数据驱动语义，旧资产没有该字段时返回 undefined。 */
+  private getModelDataDrivenDefinition(root: TransformNode): ModelDataDrivenDefinition | undefined {
+    return this.getModelPackageAssetForRoot(root)?.modelPackage?.dataDriven;
   }
 
   /** 收集场景内所有带模型包实例 metadata 的根节点。 */
@@ -3443,10 +5637,16 @@ export class BabylonEditorEngine {
 
   /** 兜底清理运行脚本标记的生成节点，避免 onStop 缺失时保存进场景。 */
   private disposeGeneratedModelPackageRuntimeNodes(root: TransformNode): void {
-    this.getNodeHierarchy(root)
+    const generatedNodes = this.getNodeHierarchy(root)
       .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
-      .filter((node) => Boolean(this.asMetadataObject(node.metadata).generatedByParametricRuntime))
-      .forEach((node) => node.dispose(false, false));
+      .filter((node) => Boolean(this.asMetadataObject(node.metadata).generatedByParametricRuntime));
+    const materials = new Set<Material>();
+    generatedNodes.forEach((node) => {
+      const meshes = node instanceof AbstractMesh ? [node, ...node.getChildMeshes()] : node.getChildMeshes();
+      meshes.forEach((mesh) => this.collectMaterialTree(mesh.material, materials));
+    });
+    generatedNodes.forEach((node) => node.dispose(false, false));
+    this.disposeUnusedMaterials(materials);
   }
 
   /** 写入最近一次模型包运行告警，属性栏会随选中快照显示。 */
@@ -3583,31 +5783,53 @@ export class BabylonEditorEngine {
   private refreshSceneGraph(): void {
     const nodes: SceneNodeSummary[] = [];
     const roots = this.scene.rootNodes.filter((node) => !node.metadata?.[HELPER_FLAG]);
-    roots.forEach((node) => this.pushTopLevelNodeSummary(nodes, node));
+    roots.forEach((node) => this.pushSceneNodeSummary(nodes, node, 0));
     this.callbacks.onSceneGraphChange(nodes);
   }
 
-  /** 将场景顶层对象压入层级列表，导入模型的内部子节点不在左侧面板展开。 */
-  private pushTopLevelNodeSummary(output: SceneNodeSummary[], node: Node): void {
+  /** 将可展示节点递归压入层级列表，导入模型内部节点仍保持折叠为单个模型。 */
+  private pushSceneNodeSummary(output: SceneNodeSummary[], node: Node, depth: number, parentId?: number): void {
     if (node.metadata?.[HELPER_FLAG]) {
       return;
     }
 
-    const children = this.getVisibleChildren(node);
-    output.push({
-      id: node.uniqueId,
-      name: node.name,
-      kind: this.getNodeKind(node),
-      depth: 0,
-      selected: this.selectedNode?.uniqueId === node.uniqueId,
-      visible: node instanceof TransformNode ? this.getNodeVisibility(node) : node.isEnabled(),
-      childCount: children.length
-    });
+    const displayable = this.isSceneGraphDisplayNode(node);
+    const childNodes = this.getVisibleChildren(node).filter((child) => this.isSceneGraphDisplayNode(child));
+    if (displayable) {
+      const selfLocked = this.isNodeSelfLocked(node);
+      const lockedByAncestor = this.isNodeLockedByAncestor(node);
+      output.push({
+        id: node.uniqueId,
+        parentId,
+        name: node.name,
+        kind: this.getNodeKind(node),
+        depth,
+        selected: this.selectedNode?.uniqueId === node.uniqueId,
+        visible: node instanceof TransformNode ? this.getNodeVisibility(node) : node.isEnabled(),
+        hasChildren: childNodes.length > 0,
+        childCount: childNodes.length,
+        selfLocked,
+        locked: selfLocked || lockedByAncestor,
+        lockedByAncestor
+      });
+
+      if (this.isEditorGroup(node)) {
+        childNodes.forEach((child) => this.pushSceneNodeSummary(output, child, depth + 1, node.uniqueId));
+      }
+      return;
+    }
+
+    this.getVisibleChildren(node).forEach((child) => this.pushSceneNodeSummary(output, child, depth, parentId));
   }
 
   /** 获取层级树可展示的子节点，兼容不同 Babylon Node 类型。 */
   private getVisibleChildren(node: Node): Node[] {
     return this.getSceneChildren(node, false);
+  }
+
+  /** 判断节点是否应该作为左侧树节点展示，避免展开导入模型内部 TransformNode。 */
+  private isSceneGraphDisplayNode(node: Node): boolean {
+    return this.isEditorGroup(node) || node.metadata?.[ROOT_FLAG] === true || node.parent === null;
   }
 
   /** 获取 Babylon 场景中指定节点的直接子节点，可选择是否包含编辑器 helper。 */
@@ -3624,10 +5846,26 @@ export class BabylonEditorEngine {
     });
   }
 
+  /** 判断节点是否属于 CAD 图纸根节点或其派生 primitive，避免选中态和颜色编辑破坏原 CAD 配色。 */
+  private isCadDrawingNode(node: Node | null | undefined): boolean {
+    let current: Node | null | undefined = node;
+    while (current) {
+      if (current.metadata?.cadDrawing || current.metadata?.cadPrimitive) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
   /** 判断节点类别，供层级树和属性面板显示。 */
   private getNodeKind(node: Node): SceneNodeKind {
     if (node.metadata?.[HELPER_FLAG]) {
       return "Helper";
+    }
+
+    if (this.isEditorGroup(node)) {
+      return "Group";
     }
 
     if (node.metadata?.primitive === "light") {
@@ -3746,7 +5984,7 @@ export class BabylonEditorEngine {
     };
   }
 
-  /** 把场景数据驱动配置收敛为稳定快照，当前只负责持久化配置。 */
+  /** 把场景数据驱动配置收敛为稳定快照，非法字段会回退默认值。 */
   private normalizeSceneDataDriven(value: Record<string, unknown>): SceneDataDrivenSnapshot {
     return {
       dataDrivenMode: this.getStringMetadata(value.dataDrivenMode, DEFAULT_SCENE_DATA_DRIVEN.dataDrivenMode),
@@ -3757,8 +5995,22 @@ export class BabylonEditorEngine {
       ),
       robotArmDriveMode: this.getStringMetadata(value.robotArmDriveMode, DEFAULT_SCENE_DATA_DRIVEN.robotArmDriveMode),
       boxLineGenerator: this.getStringMetadata(value.boxLineGenerator, DEFAULT_SCENE_DATA_DRIVEN.boxLineGenerator),
-      size: this.getNumberMetadata(value.size, DEFAULT_SCENE_DATA_DRIVEN.size)
+      size: this.getNumberMetadata(value.size, DEFAULT_SCENE_DATA_DRIVEN.size),
+      dataConnectionEnabled: this.getBooleanMetadata(value.dataConnectionEnabled, DEFAULT_SCENE_DATA_DRIVEN.dataConnectionEnabled),
+      dataSourceType: this.normalizeSceneDataSourceType(value.dataSourceType),
+      dataEndpoint: this.getStringMetadata(value.dataEndpoint, DEFAULT_SCENE_DATA_DRIVEN.dataEndpoint),
+      dataChannel: this.getStringMetadata(value.dataChannel, DEFAULT_SCENE_DATA_DRIVEN.dataChannel),
+      deviceIdField: this.getStringMetadata(value.deviceIdField, DEFAULT_SCENE_DATA_DRIVEN.deviceIdField),
+      assetCodeField: this.getStringMetadata(value.assetCodeField, DEFAULT_SCENE_DATA_DRIVEN.assetCodeField),
+      payloadPath: this.getStringMetadata(value.payloadPath, DEFAULT_SCENE_DATA_DRIVEN.payloadPath),
+      interpolationMs: Math.max(0, this.getNumberMetadata(value.interpolationMs, DEFAULT_SCENE_DATA_DRIVEN.interpolationMs)),
+      credentialProfileId: this.getStringMetadata(value.credentialProfileId, DEFAULT_SCENE_DATA_DRIVEN.credentialProfileId)
     };
+  }
+
+  /** 收敛场景数据源类型，避免旧文件或手写 metadata 写入非法连接类型。 */
+  private normalizeSceneDataSourceType(value: unknown): SceneDataSourceType {
+    return value === "websocket" || value === "mqtt" || value === "none" ? value : DEFAULT_SCENE_DATA_DRIVEN.dataSourceType;
   }
 
   /** 从 metadata 中读取字符串，缺失或类型不符时使用默认值。 */
@@ -3989,12 +6241,7 @@ export class BabylonEditorEngine {
   /** 旧项目缺少源文件副本时，尝试从当前场景已有同源且已米制归一的模型克隆一个新实例。 */
   private instantiateAssetFromSceneTemplate(asset: AssetRecord, position: Vector3): TransformNode | null {
     const assetUnitMetadata = getPersistedModelUnitMetadata(asset);
-    const sourceNode = this.scene.rootNodes.find(
-      (node): node is TransformNode =>
-        node instanceof TransformNode &&
-        !node.metadata?.[HELPER_FLAG] &&
-        this.isSceneTemplateMatchForAsset(node, asset, assetUnitMetadata)
-    );
+    const sourceNode = this.getSceneTemplateCandidates().find((node) => this.isSceneTemplateMatchForAsset(node, asset, assetUnitMetadata));
     if (!sourceNode) {
       return null;
     }
@@ -4043,6 +6290,26 @@ export class BabylonEditorEngine {
     }
 
     return this.getNodeSourceFileName(node) === asset.name;
+  }
+
+  /** 递归收集可作为资产克隆模板的模型根节点，模型移入 group 后仍可兜底复用。 */
+  private getSceneTemplateCandidates(): TransformNode[] {
+    const candidates = new Map<number, TransformNode>();
+    const visit = (node: Node): void => {
+      if (node.metadata?.[HELPER_FLAG]) {
+        return;
+      }
+
+      if (node instanceof TransformNode && !this.isEditorGroup(node) && this.isSceneGraphDisplayNode(node)) {
+        candidates.set(node.uniqueId, node);
+        return;
+      }
+
+      this.getVisibleChildren(node).forEach(visit);
+    };
+
+    this.scene.rootNodes.forEach(visit);
+    return [...candidates.values()];
   }
 
   /** 判断场景模板的单位归一化记录是否足够安全，可用于资产源文件缺失时克隆。 */
@@ -4126,6 +6393,7 @@ export class BabylonEditorEngine {
       (manifest.scriptFile === undefined || typeof manifest.scriptFile === "string") &&
       (manifest.runtimeScriptFile === undefined || typeof manifest.runtimeScriptFile === "string") &&
       (manifest.runtimeClassName === undefined || typeof manifest.runtimeClassName === "string") &&
+      (manifest.dataDriven === undefined || this.isModelDataDrivenDefinition(manifest.dataDriven)) &&
       Array.isArray(manifest.files) &&
       manifest.files.every((file) => this.isModelPackageProjectFile(file)) &&
       Array.isArray(manifest.dynamicFields) &&
@@ -4134,6 +6402,68 @@ export class BabylonEditorEngine {
       manifest.warnings.every((warning) => typeof warning === "string") &&
       typeof manifest.importedAt === "number"
     );
+  }
+
+  /** 校验模型包 dataDriven 语义定义，保持旧项目可选兼容。 */
+  private isModelDataDrivenDefinition(value: unknown): value is ModelDataDrivenDefinition {
+    const definition = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      (definition.device === undefined || this.isModelDataDrivenDeviceDefinition(definition.device)) &&
+      (definition.motion === undefined || this.isModelDataDrivenMotionDefinitions(definition.motion)) &&
+      (definition.fixedNodes === undefined || this.isStringArray(definition.fixedNodes)) &&
+      (definition.simulation === undefined || this.isModelDataDrivenSimulationDefinition(definition.simulation))
+    );
+  }
+
+  /** 校验模型包 dataDriven.device 设备默认绑定字段。 */
+  private isModelDataDrivenDeviceDefinition(value: unknown): boolean {
+    const device = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      (device.defaultAssetCode === undefined || typeof device.defaultAssetCode === "string") &&
+      (device.deviceIdField === undefined || typeof device.deviceIdField === "string") &&
+      (device.assetCodeField === undefined || typeof device.assetCodeField === "string") &&
+      (device.interpolationMs === undefined || (typeof device.interpolationMs === "number" && Number.isFinite(device.interpolationMs)))
+    );
+  }
+
+  /** 校验模型包 dataDriven.motion 中的运动组定义。 */
+  private isModelDataDrivenMotionDefinitions(value: unknown): boolean {
+    const motion = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      Object.values(motion).every((group) => this.isModelDataDrivenMotionGroupDefinition(group))
+    );
+  }
+
+  /** 校验单个数据驱动运动组。 */
+  private isModelDataDrivenMotionGroupDefinition(value: unknown): boolean {
+    const group = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      this.isStringArray(group.fields) &&
+      ["x", "y", "z"].includes(String(group.axis)) &&
+      this.isStringArray(group.nodes) &&
+      (group.fallbackPattern === undefined || typeof group.fallbackPattern === "string")
+    );
+  }
+
+  /** 校验模型包本地模拟范围定义。 */
+  private isModelDataDrivenSimulationDefinition(value: unknown): boolean {
+    const simulation = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      ["intervalMs", "travelRange", "liftBase", "liftRange", "forkRange", "forkSideRange"].every((key) => {
+        const item = simulation[key];
+        return item === undefined || (typeof item === "number" && Number.isFinite(item));
+      })
+    );
+  }
+
+  /** 校验字符串数组。 */
+  private isStringArray(value: unknown): value is string[] {
+    return Array.isArray(value) && value.every((item) => typeof item === "string");
   }
 
   /** 校验模型包文件记录，避免损坏项目文件污染资产恢复。 */
