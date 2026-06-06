@@ -669,6 +669,30 @@ input {
   outline-offset: 0;
 }
 
+.inspector-range-row {
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+
+.inspector-range-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px 12px;
+  gap: 6px;
+  align-items: center;
+}
+
+.inspector-range-input {
+  width: 100%;
+  accent-color: #7f9b71;
+}
+
+.inspector-percent-input {
+  text-align: right;
+}
+
+.inspector-percent-symbol {
+  color: #d6d6d6;
+}
+
 .inspector-vector-row {
   grid-template-columns: 72px minmax(0, 1fr);
 }

@@ -180,6 +180,8 @@ export interface TransformSnapshot {
   lockedByAncestor: boolean;
   meshVertexModify: MeshVertexModifySnapshot;
   assetInfo: AssetInfoSnapshot;
+  /** CAD 根节点的整体显示透明度，按 0-1 保存并作用到所有 CAD 线块。 */
+  cadOpacity?: number;
   /** 文件夹模型包提供的动态参数面板数据；没有模型包时为空。 */
   dynamicParameters?: DynamicParameterSnapshot;
 }
@@ -196,6 +198,8 @@ export interface TransformUpdate {
   cadOpacity?: number;
   meshVertexModify?: Partial<MeshVertexModifySnapshot>;
   assetInfo?: Partial<Pick<AssetInfoSnapshot, "assetCode">>;
+  /** 更新 CAD 根节点整体透明度，不改原始线段颜色和坐标。 */
+  cadOpacity?: number;
   /** 更新文件夹模型包实例的单个动态参数，并实时触发本地运行脚本应用到模型。 */
   dynamicParameter?: DynamicParameterUpdate;
 }
