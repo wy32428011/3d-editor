@@ -9,6 +9,11 @@ import type {
   DynamicParameterValue,
   InspectorTarget,
   MeshVertexModifySnapshot,
+  PoiConditionOperator,
+  PoiConfigSnapshot,
+  PoiConfigUpdate,
+  PoiSenderOutputType,
+  PoiTriggerMode,
   SceneDataDrivenSnapshot,
   SceneDataSourceType,
   SceneInspectorSnapshot,
@@ -52,6 +57,26 @@ const robotArmDriveModeOptions = ["全部新能源库", "手动配置", "禁用"
 const dataSourceTypeOptions: SceneDataSourceType[] = ["none", "websocket", "mqtt"];
 const dataSourceTypeLabels: Record<SceneDataSourceType, string> = {
   none: "未配置",
+  websocket: "WebSocket",
+  mqtt: "MQTT"
+};
+const poiTriggerModeOptions: PoiTriggerMode[] = ["click", "dataCondition", "timer"];
+const poiTriggerModeLabels: Record<PoiTriggerMode, string> = {
+  click: "点击触发",
+  dataCondition: "数据条件",
+  timer: "定时触发"
+};
+const poiConditionOperatorOptions: PoiConditionOperator[] = ["exists", "equals", "notEquals", "greaterThan", "lessThan"];
+const poiConditionOperatorLabels: Record<PoiConditionOperator, string> = {
+  exists: "存在",
+  equals: "等于",
+  notEquals: "不等于",
+  greaterThan: "大于",
+  lessThan: "小于"
+};
+const poiSenderOutputOptions: PoiSenderOutputType[] = ["internal", "websocket", "mqtt"];
+const poiSenderOutputLabels: Record<PoiSenderOutputType, string> = {
+  internal: "内部事件",
   websocket: "WebSocket",
   mqtt: "MQTT"
 };
@@ -142,6 +167,7 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
   const isLocked = selection.locked;
   const isGroup = selection.kind === "Group";
   const isCad = selection.kind === "CAD";
+  const isPoi = selection.kind === "POI" && Boolean(selection.poi);
   const isTransformReadOnly = isLocked || isGroup;
 
   return (
@@ -209,7 +235,17 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
         </fieldset>
       )}
 
-      {!isGroup && !isCad && (
+      {isPoi && selection.poi && (
+        <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
+          <PoiConfigEditor
+            value={selection.poi}
+            runtime={selection.poiRuntime}
+            onChange={(poi) => onChange({ poi })}
+          />
+        </fieldset>
+      )}
+
+      {!isGroup && !isCad && !isPoi && (
         <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
           {selection.dynamicParameters && (
             <InspectorSection title={`${selection.dynamicParameters.displayName} 参数`} defaultOpen>
@@ -240,8 +276,8 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
         <div className="inspector-empty-section">暂无关节参数</div>
       </InspectorSection>
 
-      <InspectorSection title="数据驱动" defaultOpen={!isGroup && !isCad}>
-        {!isGroup && !isCad ? (
+      <InspectorSection title="数据驱动" defaultOpen={!isGroup && !isCad && !isPoi}>
+        {!isGroup && !isCad && !isPoi ? (
           <NodeDataDrivenEditor
             nodeLocked={isLocked}
             selection={selection}
@@ -256,6 +292,163 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
       </InspectorSection>
     </aside>
   );
+}
+
+interface PoiConfigEditorProps {
+  value: PoiConfigSnapshot;
+  runtime?: TransformSnapshot["poiRuntime"];
+  onChange: (update: PoiConfigUpdate) => void;
+}
+
+/** POI 专属配置面板，只编辑可持久化配置，运行态状态单独只读展示。 */
+function PoiConfigEditor({ value, runtime, onChange }: PoiConfigEditorProps) {
+  return (
+    <>
+      <InspectorSection title="POI 业务组件" defaultOpen>
+        <InspectorTextRow label="标题" value={value.title} onChange={(title) => onChange({ title })} />
+        <InspectorTextRow label="描述" value={value.description} onChange={(description) => onChange({ description })} />
+        <InspectorCheckboxRow label="启用" checked={value.enabled} onChange={(enabled) => onChange({ enabled })} />
+        <div className="inspector-row">
+          <span className="inspector-row-label">颜色</span>
+          <input className="inspector-color-input" type="color" value={value.colorHex} onInput={(event) => onChange({ colorHex: event.currentTarget.value })} />
+        </div>
+      </InspectorSection>
+
+      <InspectorSection title="触发条件" defaultOpen>
+        <InspectorSelectRow
+          label="触发方式"
+          options={poiTriggerModeOptions}
+          optionLabels={poiTriggerModeLabels}
+          value={value.triggerMode}
+          onChange={(triggerMode) => onChange({ triggerMode: triggerMode as PoiTriggerMode })}
+        />
+        <InspectorTextRow label="事件名" value={value.eventName} onChange={(eventName) => onChange({ eventName })} />
+        {value.triggerMode === "timer" && (
+          <InspectorNumberRow label="间隔(ms)" step="100" value={value.triggerIntervalMs} onChange={(triggerIntervalMs) => onChange({ triggerIntervalMs })} />
+        )}
+        {value.triggerMode === "dataCondition" && (
+          <PoiConditionFields value={value} onChange={onChange} />
+        )}
+      </InspectorSection>
+
+      {value.kind === "sender" && (
+        <InspectorSection title="发送器输出" defaultOpen>
+          <InspectorSelectRow
+            label="输出"
+            options={poiSenderOutputOptions}
+            optionLabels={poiSenderOutputLabels}
+            value={value.outputType}
+            onChange={(outputType) => onChange({ outputType: outputType as PoiSenderOutputType })}
+          />
+          <InspectorTextRow label="输出事件" value={value.outputEventName} onChange={(outputEventName) => onChange({ outputEventName })} />
+          <InspectorTextRow label="WS地址" value={value.websocketEndpoint} onChange={(websocketEndpoint) => onChange({ websocketEndpoint })} />
+          <InspectorTextRow label="MQTT Topic" value={value.mqttTopic} onChange={(mqttTopic) => onChange({ mqttTopic })} />
+        </InspectorSection>
+      )}
+
+      {(value.kind === "chartMarker" || value.kind === "chartPanel") && (
+        <InspectorSection title="图表绑定" defaultOpen>
+          <InspectorTextRow label="显示字段" value={value.displayField} onChange={(displayField) => onChange({ displayField })} />
+          <InspectorTextRow label="状态字段" value={value.statusField} onChange={(statusField) => onChange({ statusField })} />
+          <InspectorTextRow label="绑定字段" value={value.bindingField} onChange={(bindingField) => onChange({ bindingField })} />
+        </InspectorSection>
+      )}
+
+      {value.kind === "alarmManager" && (
+        <InspectorSection title="报警规则" defaultOpen>
+          <InspectorTextRow label="报警字段" value={value.alarmField} onChange={(alarmField) => onChange({ alarmField })} />
+          <PoiConditionFields value={value} onChange={onChange} />
+          <InspectorTextRow label="级别" value={value.alarmLevel} onChange={(alarmLevel) => onChange({ alarmLevel })} />
+          <InspectorTextRow label="消息" value={value.alarmMessage} onChange={(alarmMessage) => onChange({ alarmMessage })} />
+        </InspectorSection>
+      )}
+
+      {(value.kind === "modelSpawner" || value.kind === "receiver" || value.kind === "groupEventBinding") && (
+        <InspectorSection title="目标绑定" defaultOpen>
+          {value.kind === "modelSpawner" && (
+            <>
+              <InspectorTextRow label="资产ID" value={value.assetId} onChange={(assetId) => onChange({ assetId })} />
+              <InspectorTextRow label="复用Key" value={value.reuseKey} onChange={(reuseKey) => onChange({ reuseKey })} />
+              <InspectorNumberRow label="实例上限" step="1" value={value.maxInstances} onChange={(maxInstances) => onChange({ maxInstances })} />
+            </>
+          )}
+          <InspectorTextRow label="目标选择" value={value.targetSelector} onChange={(targetSelector) => onChange({ targetSelector })} />
+        </InspectorSection>
+      )}
+
+      {(value.kind === "path" || value.kind === "autoInspection") && (
+        <InspectorSection title="路径/巡检" defaultOpen>
+          <InspectorNumberRow label="速度(m/s)" step="0.1" value={value.speedMetersPerSecond} onChange={(speedMetersPerSecond) => onChange({ speedMetersPerSecond })} />
+          <InspectorNumberRow label="进度" step="0.01" value={value.progress} onChange={(progress) => onChange({ progress })} />
+          <InspectorCheckboxRow label="循环" checked={value.loop} onChange={(loop) => onChange({ loop })} />
+          <InspectorNumberRow label="停留(ms)" step="100" value={value.dwellMs} onChange={(dwellMs) => onChange({ dwellMs })} />
+          <label className="inspector-row poi-path-row">
+            <span className="inspector-row-label">路径点</span>
+            <textarea
+              className="inspector-input poi-path-textarea"
+              value={formatPoiPathPoints(value.pathPoints)}
+              onChange={(event) => onChange({ pathPoints: parsePoiPathPoints(event.currentTarget.value, value.pathPoints) })}
+            />
+          </label>
+          {value.kind === "path" && (
+            <InspectorTextRow label="绑定对象" value={value.targetSelector} onChange={(targetSelector) => onChange({ targetSelector })} />
+          )}
+        </InspectorSection>
+      )}
+
+      <InspectorSection title="运行态" defaultOpen>
+        <div className="poi-runtime-grid">
+          <span>状态</span>
+          <strong>{runtime?.status ?? "idle"}</strong>
+          <span>最近事件</span>
+          <strong>{runtime?.lastEventName || "--"}</strong>
+          <span>最新值</span>
+          <strong>{runtime?.latestValue || "--"}</strong>
+          <span>生成数</span>
+          <strong>{runtime?.generatedCount ?? 0}</strong>
+        </div>
+      </InspectorSection>
+    </>
+  );
+}
+
+interface PoiConditionFieldsProps {
+  value: PoiConfigSnapshot;
+  onChange: (update: PoiConfigUpdate) => void;
+}
+
+/** POI 数据条件字段，触发器和报警规则共用。 */
+function PoiConditionFields({ value, onChange }: PoiConditionFieldsProps) {
+  return (
+    <>
+      <InspectorTextRow label="数据字段" value={value.dataField} onChange={(dataField) => onChange({ dataField })} />
+      <InspectorSelectRow
+        label="比较"
+        options={poiConditionOperatorOptions}
+        optionLabels={poiConditionOperatorLabels}
+        value={value.conditionOperator}
+        onChange={(conditionOperator) => onChange({ conditionOperator: conditionOperator as PoiConditionOperator })}
+      />
+      {value.conditionOperator !== "exists" && (
+        <InspectorTextRow label="比较值" value={value.conditionValue} onChange={(conditionValue) => onChange({ conditionValue })} />
+      )}
+    </>
+  );
+}
+
+/** 将路径点显示为每行 x,y,z，便于用户直接编辑米制点列。 */
+function formatPoiPathPoints(points: PoiConfigSnapshot["pathPoints"]): string {
+  return points.map((point) => `${point.x},${point.y},${point.z}`).join("\n");
+}
+
+/** 解析路径点文本，非法输入保留上一份合法点列，避免把路径配置写坏。 */
+function parsePoiPathPoints(text: string, fallback: PoiConfigSnapshot["pathPoints"]): PoiConfigSnapshot["pathPoints"] {
+  const points = text
+    .split(/\r?\n/)
+    .map((line) => line.split(",").map((item) => Number(item.trim())))
+    .filter((items) => items.length === 3 && items.every(Number.isFinite))
+    .map(([x, y, z]) => ({ x, y, z }));
+  return points.length >= 2 ? points : fallback;
 }
 
 interface CadDisplayEditorProps {

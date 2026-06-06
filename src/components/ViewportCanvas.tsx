@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { BabylonEditorEngine } from "../engine/BabylonEditorEngine";
+import { isPoiKind } from "../editor/poiCatalog";
 import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind } from "../types/editor";
 
 interface ViewportCanvasProps {
@@ -110,9 +111,4 @@ export function ViewportCanvas({
       <canvas ref={canvasRef} className="viewport-canvas" />
     </main>
   );
-}
-
-/** 校验拖拽中的 POI 类型，避免外部拖拽伪造 payload 导致引擎创建异常。 */
-function isPoiKind(value: string): value is PoiKind {
-  return ["marker", "info", "warning", "camera", "device", "label"].includes(value);
 }

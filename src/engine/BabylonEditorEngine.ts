@@ -43,12 +43,20 @@ import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
 import earcut from "earcut";
 import { applySnapshotVector, formatBytes, snapshotVector } from "../editor/math";
 import {
+  createDefaultPoiConfig,
+  getPoiCatalogItem,
+  normalizePoiConfig,
+  normalizePoiKind,
+  type PoiCatalogItem
+} from "../editor/poiCatalog";
+import {
   compileModelPackageRuntime,
   DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS,
   invokeModelPackageRuntimeLifecycle,
   type ModelPackageRuntimeInstance
 } from "../editor/modelPackageRuntime";
 import { SceneDataDrivenRuntime, type SceneDataDrivenTarget } from "../editor/sceneDataDrivenRuntime";
+import { SceneBusinessRuntime } from "../editor/sceneBusinessRuntime";
 import {
   parseCadDxfLineStream,
   type CadDxfBounds,
@@ -99,6 +107,7 @@ import type {
   ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
+  PoiConfigSnapshot,
   PoiKind,
   PrimitiveKind,
   SceneDataDrivenSnapshot,
@@ -204,14 +213,8 @@ const DEFAULT_MESH_VERTEX_MODIFY: MeshVertexModifySnapshot = {
   rollerDensity: 0.5
 };
 
-/** POI 模板的基础视觉参数，便于 UI 库和场景实例保持一致语义。 */
-interface PoiDefinition {
-  name: string;
-  text: string;
-  colorHex: string;
-  emissiveHex: string;
-  shape: "pin" | "panel" | "camera" | "device";
-}
+/** POI 模板直接复用 catalog 条目，保证 UI 和三维创建语义一致。 */
+type PoiDefinition = PoiCatalogItem;
 
 /** 节点世界包围盒信息，用于导入落点、相机取景和自适应网格。 */
 interface NodeWorldBounds {
@@ -443,6 +446,7 @@ export class BabylonEditorEngine {
   private readonly modelPackageScriptTexts = new Map<string, Map<string, string>>();
   private readonly modelPackageRuntimeHandles = new Map<number, ModelPackageRuntimeHandle>();
   private readonly sceneDataDrivenRuntime: SceneDataDrivenRuntime;
+  private readonly sceneBusinessRuntime: SceneBusinessRuntime;
   private readonly localImportFileKeys = new Set<string>();
   private readonly highlightedMeshes = new Set<Mesh>();
   private selectedNode: TransformNode | null = null;
@@ -497,13 +501,25 @@ export class BabylonEditorEngine {
       getTargets: () => this.createSceneDataDrivenTargets(),
       onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now)
     });
+    this.sceneBusinessRuntime = new SceneBusinessRuntime({
+      scene: this.scene,
+      camera: this.editorCamera,
+      getConfig: () => this.createSceneInspectorSnapshot().dataDriven,
+      getPoiNodes: () => this.getScenePoiNodes(),
+      getPoiConfig: (node) => this.getNodePoiConfig(node),
+      getEditableRoots: () => this.getEditableRuntimeRoots(),
+      getAssets: () => this.getAssetsSnapshot(),
+      onPoiChanged: (nodes, now) => this.handleSceneBusinessPoiChanged(nodes, now)
+    });
     this.createDefaultScene();
+    this.sceneBusinessRuntime.start();
     this.bindPointerSelection();
     this.bindStatsLoop();
     this.bindResize();
     this.engine.runRenderLoop(() => {
       const now = performance.now();
       this.updateSceneDataDrivenRuntime(now);
+      this.updateSceneBusinessRuntime(now);
       this.updateDynamicGridForCamera();
       this.updateGridFlash();
       this.syncEditorCameraPanSpeed();
@@ -521,6 +537,7 @@ export class BabylonEditorEngine {
       this.transformSyncFrame = 0;
     }
     window.removeEventListener("resize", this.handleResize);
+    this.sceneBusinessRuntime.dispose();
     this.sceneDataDrivenRuntime.stop(false);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
@@ -609,6 +626,9 @@ export class BabylonEditorEngine {
         this.pendingStackerDemoSimulation = false;
         this.sceneDataDrivenRuntime.restart();
       }
+    }
+    if (update.dataDriven) {
+      this.sceneBusinessRuntime.restart();
     }
     this.scene.render();
     this.emitSelectionSnapshot();
@@ -712,6 +732,8 @@ export class BabylonEditorEngine {
     this.pendingStackerDemoSimulation = false;
     this.stackerDemoSimulationActive = false;
     this.sceneDataDrivenRuntime.stop(true);
+    this.sceneBusinessRuntime.stop(true);
+    this.sceneBusinessRuntime.start();
     this.stopPreviewAnimations();
     this.restorePreviewCameraSnapshot();
     this.previewMode = false;
@@ -730,6 +752,16 @@ export class BabylonEditorEngine {
     this.handleSceneDataDrivenTargetsChanged(changedRoots, now);
   }
 
+  /** 推进 POI 业务运行态，并在必要时同步属性面板快照。 */
+  private updateSceneBusinessRuntime(now: number): void {
+    const changedNodes = this.sceneBusinessRuntime.update(now);
+    if (changedNodes.length === 0) {
+      return;
+    }
+
+    this.handleSceneBusinessPoiChanged(changedNodes, now);
+  }
+
   /** 处理数据驱动导致的模型姿态变化，集中刷新世界矩阵和属性面板快照。 */
   private handleSceneDataDrivenTargetsChanged(roots: TransformNode[], now: number): void {
     const uniqueRoots = [...new Map(roots.map((root) => [root.uniqueId, root])).values()];
@@ -739,6 +771,20 @@ export class BabylonEditorEngine {
     }
 
     if (uniqueRoots.some((root) => this.isSelectedNodeUnderRoot(root))) {
+      this.dataDrivenSelectionSyncStamp = now;
+      this.emitSelectionSnapshot();
+    }
+  }
+
+  /** 处理 POI 运行态导致的可视变化，避免高频刷新 React 面板。 */
+  private handleSceneBusinessPoiChanged(nodes: TransformNode[], now: number): void {
+    const uniqueNodes = [...new Map(nodes.map((node) => [node.uniqueId, node])).values()];
+    uniqueNodes.forEach((node) => this.refreshNodeWorldMatrices(node));
+    if (!this.selectedNode || now - this.dataDrivenSelectionSyncStamp < 160) {
+      return;
+    }
+
+    if (uniqueNodes.some((node) => node.uniqueId === this.selectedNode?.uniqueId)) {
       this.dataDrivenSelectionSyncStamp = now;
       this.emitSelectionSnapshot();
     }
@@ -779,7 +825,7 @@ export class BabylonEditorEngine {
         return;
       }
 
-      if (node instanceof TransformNode && !this.isEditorGroup(node) && this.isSceneGraphDisplayNode(node)) {
+      if (node instanceof TransformNode && !this.isEditorGroup(node) && !this.isPoiNode(node) && this.isSceneGraphDisplayNode(node)) {
         roots.set(node.uniqueId, node);
         return;
       }
@@ -793,6 +839,34 @@ export class BabylonEditorEngine {
       matchFields: this.createSceneDataDrivenMatchFields(root),
       dataDriven: this.getModelDataDrivenDefinition(root)
     }));
+  }
+
+  /** 收集当前场景中的 POI 根节点，运行态只消费这些轻量业务组件。 */
+  private getScenePoiNodes(): TransformNode[] {
+    const nodes = new Map<number, TransformNode>();
+    [...this.scene.rootNodes, ...this.scene.transformNodes, ...this.scene.meshes].forEach((node) => {
+      if (node instanceof TransformNode && !node.metadata?.[HELPER_FLAG] && this.isPoiNode(node)) {
+        nodes.set(node.uniqueId, node);
+      }
+    });
+    return [...nodes.values()];
+  }
+
+  /** 收集运行态可绑定的业务根节点，排除 POI 自身和临时生成节点。 */
+  private getEditableRuntimeRoots(): TransformNode[] {
+    const nodes = new Map<number, TransformNode>();
+    [...this.scene.rootNodes, ...this.scene.transformNodes, ...this.scene.meshes].forEach((node) => {
+      if (
+        node instanceof TransformNode &&
+        !node.metadata?.[HELPER_FLAG] &&
+        !node.metadata?.isPoiRuntimeGenerated &&
+        !this.isPoiNode(node) &&
+        this.isSceneGraphDisplayNode(node)
+      ) {
+        nodes.set(node.uniqueId, node);
+      }
+    });
+    return [...nodes.values()];
   }
 
   /** 从节点 metadata 和模型包动态参数中生成数据驱动匹配字段。 */
@@ -1061,6 +1135,7 @@ export class BabylonEditorEngine {
     }
 
     this.selectNode(null);
+    this.cleanupPoiRuntimeInHierarchy(node);
     this.disposeEditableNode(node);
     this.refreshSceneGraph();
     this.callbacks.onStatsChange(this.collectStats());
@@ -1075,6 +1150,7 @@ export class BabylonEditorEngine {
 
     const sourcePackageRoot = this.findModelPackageRoot(sourceNode) ?? sourceNode;
     const sourceModelPackage = this.getModelPackageAssetForRoot(sourcePackageRoot)?.modelPackage;
+    this.cleanupPoiRuntimeInHierarchy(sourceNode);
     if (sourceModelPackage) {
       this.stopModelPackageRuntime(sourcePackageRoot, true);
     }
@@ -2465,6 +2541,7 @@ export class BabylonEditorEngine {
       this.exitPreviewMode();
     }
 
+    this.sceneBusinessRuntime.stop(true);
     this.stopAllModelPackageRuntimes(true);
     try {
       const serialized = SceneSerializer.Serialize(this.scene) as Record<string, unknown>;
@@ -2477,6 +2554,7 @@ export class BabylonEditorEngine {
       return serialized;
     } finally {
       this.applyModelPackageRuntimeToScene("serialize");
+      this.sceneBusinessRuntime.start();
     }
   }
 
@@ -2490,29 +2568,34 @@ export class BabylonEditorEngine {
     if (this.previewMode) {
       this.exitPreviewMode();
     }
+    this.sceneBusinessRuntime.stop(true);
 
     const loadableScene = this.createLoadableSerializedScene(serializedScene);
     const sceneUrl = this.createSerializedSceneUrl(loadableScene);
     try {
-      // 先完整解析到资产容器，成功后再替换视口内容，避免坏场景把当前场景清空。
-      const container = await LoadAssetContainerAsync(sceneUrl, this.scene, { pluginExtension: ".babylon" });
-      this.clearEditableScene();
-      container.addAllToScene();
-      this.applySceneEnvironmentColor(this.getSerializedSceneEnvironmentColor(loadableScene) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
-      this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata);
-      const sceneInspector = this.createSceneInspectorSnapshot();
-      this.applySceneCameraSettings(sceneInspector.camera);
-      this.applySceneEditorSettings(sceneInspector.editorSettings);
+      try {
+        // 先完整解析到资产容器，成功后再替换视口内容，避免坏场景把当前场景清空。
+        const container = await LoadAssetContainerAsync(sceneUrl, this.scene, { pluginExtension: ".babylon" });
+        this.clearEditableScene();
+        container.addAllToScene();
+        this.applySceneEnvironmentColor(this.getSerializedSceneEnvironmentColor(loadableScene) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
+        this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata);
+        const sceneInspector = this.createSceneInspectorSnapshot();
+        this.applySceneCameraSettings(sceneInspector.camera);
+        this.applySceneEditorSettings(sceneInspector.editorSettings);
+      } finally {
+        URL.revokeObjectURL(sceneUrl);
+      }
+      this.scene.activeCamera = this.editorCamera;
+      this.editorCamera.attachControl(this.canvas, true);
+      await this.prepareLoadedScene(loadableScene, options);
+      const selectedNode = this.selectFirstEditableNode();
+      this.frameEditableSceneInView(selectedNode);
+      this.refreshSceneGraph();
+      this.callbacks.onStatsChange(this.collectStats());
     } finally {
-      URL.revokeObjectURL(sceneUrl);
+      this.sceneBusinessRuntime.start();
     }
-    this.scene.activeCamera = this.editorCamera;
-    this.editorCamera.attachControl(this.canvas, true);
-    await this.prepareLoadedScene(loadableScene, options);
-    const selectedNode = this.selectFirstEditableNode();
-    this.frameEditableSceneInView(selectedNode);
-    this.refreshSceneGraph();
-    this.callbacks.onStatsChange(this.collectStats());
   }
 
   /** 将序列化场景包装为 Blob URL，避免 data URL 被 #、中文或贴图地址截断。 */
@@ -2636,6 +2719,10 @@ export class BabylonEditorEngine {
     if (transformEditable && update.dynamicParameter) {
       this.updateNodeDynamicParameter(node, update.dynamicParameter);
       graphDirty = true;
+    }
+
+    if (transformEditable && update.poi && this.isPoiNode(node)) {
+      this.updateNodePoiConfig(node, update.poi);
     }
 
     return graphDirty;
@@ -2902,6 +2989,7 @@ export class BabylonEditorEngine {
   private clearEditableScene(clearAssets = true): void {
     this.cancelCadRestore();
     this.selectNode(null);
+    this.sceneBusinessRuntime.stop(true);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
     [...this.scene.rootNodes].filter((node) => !node.metadata?.[HELPER_FLAG]).forEach((node) => node.dispose());
@@ -2920,6 +3008,7 @@ export class BabylonEditorEngine {
     }
     this.refreshSceneGraph();
     this.callbacks.onStatsChange(this.collectStats());
+    this.sceneBusinessRuntime.start();
   }
 
   /** 恢复加载后节点的可编辑元数据，并从序列化数据中取回资产列表。 */
@@ -2943,6 +3032,7 @@ export class BabylonEditorEngine {
           }
         }
       });
+    this.getScenePoiNodes().forEach((node) => this.ensureNodePoiMetadata(node));
 
     this.startLoadedCadChunkRestore(options);
     await this.restoreLoadedCadMedia();
@@ -3560,6 +3650,15 @@ export class BabylonEditorEngine {
     this.disposeUnusedMaterials(materials);
   }
 
+  /** 清理某个节点层级下所有 POI 的运行态对象，复制和删除前都需要先调用。 */
+  private cleanupPoiRuntimeInHierarchy(node: TransformNode): void {
+    this.getNodeHierarchy(node).forEach((item) => {
+      if (item instanceof TransformNode && this.isPoiNode(item)) {
+        this.sceneBusinessRuntime.cleanupPoi(item);
+      }
+    });
+  }
+
   /** 释放内部剪贴板模板，并重置复制粘贴状态。 */
   private disposeClipboardTemplate(): void {
     if (this.clipboardTemplateNode) {
@@ -4081,14 +4180,21 @@ export class BabylonEditorEngine {
 
   /** 创建可编辑 POI 根节点和其基础可视部件。 */
   private createPoi(kind: PoiKind, position: Vector3): TransformNode {
-    const definition = this.getPoiDefinition(kind);
-    const name = `${definition.name} ${this.poiSeed++}`;
+    const normalizedKind = normalizePoiKind(kind);
+    const definition = this.getPoiDefinition(normalizedKind);
+    const poiConfig = createDefaultPoiConfig(normalizedKind);
+    const name = `${definition.title} ${this.poiSeed++}`;
     const root = new TransformNode(name, this.scene);
     root.position.copyFrom(position);
+    const metricMetadata = this.withMetricModelMetadata({ poi: normalizedKind });
     root.metadata = {
-      ...this.withMetricModelMetadata({ poi: kind }),
+      ...metricMetadata,
       [ROOT_FLAG]: true,
-      poi: kind
+      poi: normalizedKind,
+      editor: {
+        ...this.asMetadataObject(metricMetadata.editor),
+        poiConfig
+      }
     };
 
     this.createPoiBase(root, name, definition);
@@ -4125,18 +4231,28 @@ export class BabylonEditorEngine {
 
   /** 按 POI 类型创建主体形状，避免所有点位在场景中看起来完全相同。 */
   private createPoiShape(root: TransformNode, name: string, definition: PoiDefinition): void {
-    if (definition.shape === "camera") {
+    if (definition.shape === "roam" || definition.shape === "inspection") {
       this.createCameraPoiShape(root, name, definition);
       return;
     }
 
-    if (definition.shape === "device") {
+    if (definition.shape === "spawner") {
       this.createDevicePoiShape(root, name, definition);
       return;
     }
 
-    if (definition.shape === "panel") {
+    if (definition.shape === "panel" || definition.shape === "chart") {
       this.createPanelPoiShape(root, name, definition);
+      return;
+    }
+
+    if (definition.shape === "path") {
+      this.createPathPoiShape(root, name, definition);
+      return;
+    }
+
+    if (definition.shape === "sender" || definition.shape === "receiver" || definition.shape === "group") {
+      this.createDirectionalPoiShape(root, name, definition);
       return;
     }
 
@@ -4194,6 +4310,46 @@ export class BabylonEditorEngine {
     panel.isPickable = true;
   }
 
+  /** 创建发送、回收和群组绑定类 POI 的方向箭头外观。 */
+  private createDirectionalPoiShape(root: TransformNode, name: string, definition: PoiDefinition): void {
+    const material = this.createPoiMaterial(`${name} 方向材质`, definition.colorHex, definition.emissiveHex);
+    const shaft = MeshBuilder.CreateCylinder(`${name} 箭身`, { height: 0.46, diameter: 0.13, tessellation: 18 }, this.scene);
+    shaft.parent = root;
+    shaft.position.y = POI_STEM_HEIGHT_METERS + 0.2;
+    shaft.rotation.z = Math.PI / 2;
+    shaft.material = material;
+    shaft.isPickable = true;
+
+    const head = MeshBuilder.CreateCylinder(`${name} 箭头`, { height: 0.22, diameterTop: 0, diameterBottom: 0.28, tessellation: 24 }, this.scene);
+    head.parent = root;
+    head.position = new Vector3(0.34, POI_STEM_HEIGHT_METERS + 0.2, 0);
+    head.rotation.z = -Math.PI / 2;
+    head.material = material;
+    head.isPickable = true;
+  }
+
+  /** 创建路径类 POI 的折线节点外观，真实路径线由运行态根据配置重建。 */
+  private createPathPoiShape(root: TransformNode, name: string, definition: PoiDefinition): void {
+    const material = this.createPoiMaterial(`${name} 路径材质`, definition.colorHex, definition.emissiveHex);
+    const nodeA = MeshBuilder.CreateSphere(`${name} 起点`, { diameter: 0.22, segments: 16 }, this.scene);
+    nodeA.parent = root;
+    nodeA.position = new Vector3(-0.24, POI_STEM_HEIGHT_METERS + 0.18, -0.08);
+    nodeA.material = material;
+    nodeA.isPickable = true;
+
+    const nodeB = MeshBuilder.CreateSphere(`${name} 中点`, { diameter: 0.18, segments: 16 }, this.scene);
+    nodeB.parent = root;
+    nodeB.position = new Vector3(0.08, POI_STEM_HEIGHT_METERS + 0.32, 0.08);
+    nodeB.material = material;
+    nodeB.isPickable = true;
+
+    const nodeC = MeshBuilder.CreateSphere(`${name} 终点`, { diameter: 0.22, segments: 16 }, this.scene);
+    nodeC.parent = root;
+    nodeC.position = new Vector3(0.34, POI_STEM_HEIGHT_METERS + 0.12, -0.02);
+    nodeC.material = material;
+    nodeC.isPickable = true;
+  }
+
   /** 创建跟随相机朝向的 POI 标签，显示点位类型。 */
   private createPoiLabel(root: TransformNode, name: string, definition: PoiDefinition): void {
     const texture = new DynamicTexture(
@@ -4204,7 +4360,7 @@ export class BabylonEditorEngine {
     );
     texture.hasAlpha = true;
     texture.drawText(
-      definition.text,
+      definition.title,
       null,
       82,
       "bold 58px Microsoft YaHei, Arial",
@@ -4246,52 +4402,7 @@ export class BabylonEditorEngine {
 
   /** 返回内置 POI 组件定义，所有拖拽 POI 均从这里取模板参数。 */
   private getPoiDefinition(kind: PoiKind): PoiDefinition {
-    const definitions: Record<PoiKind, PoiDefinition> = {
-      marker: {
-        name: "POI 标记点",
-        text: "标记点",
-        colorHex: "#4f9cff",
-        emissiveHex: "#6fb0ff",
-        shape: "pin"
-      },
-      info: {
-        name: "POI 信息点",
-        text: "信息",
-        colorHex: "#4fb477",
-        emissiveHex: "#73d99a",
-        shape: "pin"
-      },
-      warning: {
-        name: "POI 告警点",
-        text: "告警",
-        colorHex: "#d85f4f",
-        emissiveHex: "#ff7b68",
-        shape: "pin"
-      },
-      camera: {
-        name: "POI 摄像头",
-        text: "摄像头",
-        colorHex: "#b58cff",
-        emissiveHex: "#c9a8ff",
-        shape: "camera"
-      },
-      device: {
-        name: "POI 设备点",
-        text: "设备",
-        colorHex: "#d6a247",
-        emissiveHex: "#f0bd62",
-        shape: "device"
-      },
-      label: {
-        name: "POI 文本标签",
-        text: "标签",
-        colorHex: "#65c7c0",
-        emissiveHex: "#86e3dc",
-        shape: "panel"
-      }
-    };
-
-    return definitions[kind];
+    return getPoiCatalogItem(kind);
   }
 
   /** 导入模型或场景文件，并把导入根节点移动到落点。 */
@@ -5052,7 +5163,9 @@ export class BabylonEditorEngine {
       lockedByAncestor,
       meshVertexModify: this.getNodeMeshVertexModify(node, materialColor),
       assetInfo: this.getNodeAssetInfo(node),
-      dynamicParameters: this.getNodeDynamicParameters(node)
+      dynamicParameters: this.getNodeDynamicParameters(node),
+      poi: this.isPoiNode(node) ? this.getNodePoiConfig(node) : undefined,
+      poiRuntime: this.isPoiNode(node) ? this.sceneBusinessRuntime.getPoiRuntimeState(node) : undefined
     };
   }
 
@@ -5156,6 +5269,91 @@ export class BabylonEditorEngine {
   /** 读取节点 metadata.editor，统一兼容旧场景中的空 metadata。 */
   private getNodeEditorMetadata(node: Node): Record<string, unknown> {
     return this.asMetadataObject(this.asMetadataObject(node.metadata).editor);
+  }
+
+  /** 判断节点是否是 POI 根节点，兼容旧顶层 metadata.poi 和新 poiConfig。 */
+  private isPoiNode(node: Node | null | undefined): boolean {
+    if (!(node instanceof TransformNode)) {
+      return false;
+    }
+
+    const metadata = this.asMetadataObject(node.metadata);
+    const editorMetadata = this.getNodeEditorMetadata(node);
+    const poiConfig = this.asMetadataObject(editorMetadata.poiConfig);
+    return typeof metadata.poi === "string" || typeof poiConfig.kind === "string" || typeof editorMetadata.poi === "string";
+  }
+
+  /** 读取并补齐 POI 可持久化配置，旧场景缺字段时自动落到 catalog 默认值。 */
+  private getNodePoiConfig(node: TransformNode): PoiConfigSnapshot {
+    const metadata = this.asMetadataObject(node.metadata);
+    const editorMetadata = this.getNodeEditorMetadata(node);
+    const legacyKind =
+      (typeof metadata.poi === "string" && metadata.poi) ||
+      (typeof editorMetadata.poi === "string" && editorMetadata.poi) ||
+      undefined;
+    return normalizePoiConfig(legacyKind, editorMetadata.poiConfig);
+  }
+
+  /** 合并写回 POI 配置，并保留顶层 metadata.poi 供旧场景和层级树识别。 */
+  private updateNodePoiConfig(node: TransformNode, update: Partial<PoiConfigSnapshot>): void {
+    const current = this.getNodePoiConfig(node);
+    const nextConfig = normalizePoiConfig(current.kind, {
+      ...current,
+      ...update,
+      kind: current.kind,
+      version: 1
+    });
+    const metadata = this.asMetadataObject(node.metadata);
+    node.metadata = {
+      ...metadata,
+      poi: nextConfig.kind
+    };
+    this.mergeNodeEditorMetadata(node, { poiConfig: nextConfig });
+    if (update.title !== undefined) {
+      node.name = update.title.trim() || node.name;
+    }
+    if (update.colorHex !== undefined) {
+      this.applyPoiVisualColor(node, nextConfig.colorHex);
+    }
+    if (this.shouldRestartPoiRuntimeConnections(update)) {
+      this.sceneBusinessRuntime.restart();
+    } else if (this.shouldRefreshPoiRuntimeOverlay(update)) {
+      this.sceneBusinessRuntime.cleanupPoi(node);
+    }
+  }
+
+  /** 判断本次 POI 配置变更是否会影响 WebSocket/MQTT 外发连接。 */
+  private shouldRestartPoiRuntimeConnections(update: Partial<PoiConfigSnapshot>): boolean {
+    return ["enabled", "outputType", "websocketEndpoint", "mqttTopic"].some((key) => Object.prototype.hasOwnProperty.call(update, key));
+  }
+
+  /** 判断本次 POI 配置变更是否需要重建当前 POI 的运行态可视覆盖层。 */
+  private shouldRefreshPoiRuntimeOverlay(update: Partial<PoiConfigSnapshot>): boolean {
+    return ["enabled", "colorHex", "pathPoints"].some((key) => Object.prototype.hasOwnProperty.call(update, key));
+  }
+
+  /** 将 POI 配置颜色同步到当前可视网格材质。 */
+  private applyPoiVisualColor(node: TransformNode, colorHex: string): void {
+    const color = Color3.FromHexString(colorHex);
+    node.getChildMeshes().forEach((mesh) => {
+      const material = mesh.material;
+      if (material instanceof StandardMaterial) {
+        material.diffuseColor = color;
+        material.emissiveColor = color.scale(0.28);
+      }
+    });
+  }
+
+  /** 加载旧场景时补齐 POI 根标识和默认配置，不触碰其它 editor metadata。 */
+  private ensureNodePoiMetadata(node: TransformNode): void {
+    const config = this.getNodePoiConfig(node);
+    const metadata = this.asMetadataObject(node.metadata);
+    node.metadata = {
+      ...metadata,
+      [ROOT_FLAG]: true,
+      poi: config.kind
+    };
+    this.mergeNodeEditorMetadata(node, { poiConfig: config });
   }
 
   /** 判断节点是否是编辑器逻辑分组，分组只承载树结构和批量操作。 */
@@ -5839,6 +6037,10 @@ export class BabylonEditorEngine {
 
   /** 判断节点是否应该作为左侧树节点展示，避免展开导入模型内部 TransformNode。 */
   private isSceneGraphDisplayNode(node: Node): boolean {
+    if (node.metadata?.isPoiRuntimeGenerated) {
+      return false;
+    }
+
     return this.isEditorGroup(node) || node.metadata?.[ROOT_FLAG] === true || node.parent === null;
   }
 
@@ -5882,7 +6084,7 @@ export class BabylonEditorEngine {
       return "Light";
     }
 
-    if (typeof node.metadata?.poi === "string") {
+    if (this.isPoiNode(node)) {
       return "POI";
     }
 

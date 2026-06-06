@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { AssetBrowser } from "./components/AssetBrowser";
 import { HierarchyPanel } from "./components/HierarchyPanel";
@@ -46,6 +46,12 @@ const initialStats: EditorStats = {
   drawCalls: 0
 };
 
+const ASSET_BROWSER_HEIGHT_STORAGE_KEY = "babylon-editor.assetBrowserHeight";
+const DEFAULT_ASSET_BROWSER_HEIGHT = 190;
+const MIN_ASSET_BROWSER_HEIGHT = 132;
+const MAX_ASSET_BROWSER_HEIGHT = 420;
+const MAX_ASSET_BROWSER_HEIGHT_RATIO = 0.45;
+
 /** 统一提取异常消息，兼容 Babylon 以字符串抛错的情况。 */
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim()) {
@@ -57,6 +63,41 @@ function getErrorMessage(error: unknown, fallback: string): string {
   }
 
   return fallback;
+}
+
+/** 计算资源库当前允许的最大高度，避免底部面板压没主视口。 */
+function getAssetBrowserMaxHeight(): number {
+  if (typeof window === "undefined") {
+    return MAX_ASSET_BROWSER_HEIGHT;
+  }
+
+  return Math.max(
+    MIN_ASSET_BROWSER_HEIGHT,
+    Math.min(MAX_ASSET_BROWSER_HEIGHT, Math.floor(window.innerHeight * MAX_ASSET_BROWSER_HEIGHT_RATIO))
+  );
+}
+
+/** 把资源库高度限制在当前视口允许范围内。 */
+function clampAssetBrowserHeight(height: number): number {
+  if (!Number.isFinite(height)) {
+    return DEFAULT_ASSET_BROWSER_HEIGHT;
+  }
+
+  return Math.round(Math.min(getAssetBrowserMaxHeight(), Math.max(MIN_ASSET_BROWSER_HEIGHT, height)));
+}
+
+/** 读取用户上次拖拽后的资源库高度，读取失败时回到默认值。 */
+function readStoredAssetBrowserHeight(): number {
+  if (typeof window === "undefined") {
+    return DEFAULT_ASSET_BROWSER_HEIGHT;
+  }
+
+  try {
+    const stored = window.localStorage.getItem(ASSET_BROWSER_HEIGHT_STORAGE_KEY);
+    return stored ? clampAssetBrowserHeight(Number(stored)) : clampAssetBrowserHeight(DEFAULT_ASSET_BROWSER_HEIGHT);
+  } catch {
+    return clampAssetBrowserHeight(DEFAULT_ASSET_BROWSER_HEIGHT);
+  }
 }
 
 /** 根据文件名推断基础 MIME，供从项目资产恢复 File 对象时使用。 */
@@ -407,6 +448,8 @@ export function App() {
   const [sceneName, setSceneName] = useState("New Scene");
   const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
   const [sceneDataDriven, setSceneDataDriven] = useState<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
+  const [assetBrowserHeight, setAssetBrowserHeight] = useState(readStoredAssetBrowserHeight);
+  const [assetBrowserMaxHeight, setAssetBrowserMaxHeight] = useState(getAssetBrowserMaxHeight);
 
   const activeScene = activeProject?.scenes.find((scene) => scene.id === activeSceneId) ?? activeProject?.scenes[0] ?? null;
   const activeSceneRef = useRef<{ projectPath: string | null; sceneId: string | null }>({ projectPath: null, sceneId: null });
@@ -417,6 +460,42 @@ export function App() {
   const cadRestoreActiveRef = useRef(false);
   const cadRestoreWarningRef = useRef<string | null>(null);
   const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
+  const workspaceStyle = useMemo(
+    () =>
+      ({
+        "--asset-browser-height": `${assetBrowserHeight}px`
+      }) as CSSProperties,
+    [assetBrowserHeight]
+  );
+
+  /** 调整资源库高度并持久化到本机，刷新后继续使用。 */
+  const handleAssetBrowserHeightChange = useCallback((height: number) => {
+    setAssetBrowserHeight(clampAssetBrowserHeight(height));
+  }, []);
+
+  useEffect(() => {
+    const persistAssetBrowserHeight = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(ASSET_BROWSER_HEIGHT_STORAGE_KEY, String(assetBrowserHeight));
+      } catch {
+        // 本地存储不可用时只影响记忆高度，不阻断编辑器使用。
+      }
+    }, 120);
+
+    return () => window.clearTimeout(persistAssetBrowserHeight);
+  }, [assetBrowserHeight]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const nextMaxHeight = getAssetBrowserMaxHeight();
+      setAssetBrowserMaxHeight(nextMaxHeight);
+      setAssetBrowserHeight((current) => Math.round(Math.min(nextMaxHeight, Math.max(MIN_ASSET_BROWSER_HEIGHT, current))));
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   const panelInspectorTarget = useMemo<InspectorTarget | null>(() => {
     if (!inspectorTarget) {
       return null;
@@ -1571,7 +1650,7 @@ export function App() {
         </button>
       </div>
 
-      <div className="workspace">
+      <div className="workspace" style={workspaceStyle}>
         <HierarchyPanel
           title={activeProject.name}
           nodes={nodes}
@@ -1604,7 +1683,15 @@ export function App() {
           cadImportDisabled={cadImportActive}
           cadImportDisabledReason="CAD 图纸正在导入，请等待完成"
         />
-        <AssetBrowser assets={assets} onImportFiles={handleImportFiles} onImportModelPackage={handleImportModelPackage} />
+        <AssetBrowser
+          assets={assets}
+          height={assetBrowserHeight}
+          minHeight={MIN_ASSET_BROWSER_HEIGHT}
+          maxHeight={assetBrowserMaxHeight}
+          onHeightChange={handleAssetBrowserHeightChange}
+          onImportFiles={handleImportFiles}
+          onImportModelPackage={handleImportModelPackage}
+        />
       </div>
 
       {sceneDialogOpen && (

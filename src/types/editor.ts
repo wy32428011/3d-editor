@@ -6,8 +6,89 @@ export type EditorTool = "select" | "move" | "rotate" | "scale";
 /** 可通过工具栏或资产面板创建的基础对象类型。 */
 export type PrimitiveKind = "cube" | "sphere" | "cylinder" | "ground" | "light";
 
-/** POI 库提供的基础点位组件类型。 */
-export type PoiKind = "marker" | "info" | "warning" | "camera" | "device" | "label";
+/** POI 库提供的业务组件类型，旧版类型保留用于恢复历史场景。 */
+export type PoiKind =
+  | "eventTrigger"
+  | "sender"
+  | "receiver"
+  | "chartMarker"
+  | "chartPanel"
+  | "manualRoam"
+  | "alarmManager"
+  | "modelSpawner"
+  | "groupEventBinding"
+  | "autoInspection"
+  | "path"
+  | "marker"
+  | "info"
+  | "warning"
+  | "camera"
+  | "device"
+  | "label";
+
+/** POI 事件触发方式，运行态按该字段决定点击、数据或定时触发。 */
+export type PoiTriggerMode = "click" | "dataCondition" | "timer";
+
+/** POI 数据条件比较方式，字符串值会在运行态按需转成数字比较。 */
+export type PoiConditionOperator = "exists" | "equals" | "notEquals" | "greaterThan" | "lessThan";
+
+/** 发送器输出目标，默认只在编辑器内部事件总线转发。 */
+export type PoiSenderOutputType = "internal" | "websocket" | "mqtt";
+
+/** POI 运行状态只供编辑态显示，不参与场景保存。 */
+export type PoiRuntimeStatus = "idle" | "active" | "alarm" | "running" | "paused";
+
+/** POI 可持久化配置，保存到 metadata.editor.poiConfig。 */
+export interface PoiConfigSnapshot {
+  version: 1;
+  kind: PoiKind;
+  title: string;
+  description: string;
+  enabled: boolean;
+  colorHex: string;
+  eventName: string;
+  triggerMode: PoiTriggerMode;
+  triggerIntervalMs: number;
+  dataField: string;
+  conditionOperator: PoiConditionOperator;
+  conditionValue: string;
+  outputType: PoiSenderOutputType;
+  outputEventName: string;
+  websocketEndpoint: string;
+  mqttTopic: string;
+  bindingField: string;
+  displayField: string;
+  statusField: string;
+  alarmField: string;
+  alarmLevel: string;
+  alarmMessage: string;
+  assetId: string;
+  reuseKey: string;
+  maxInstances: number;
+  targetSelector: string;
+  speedMetersPerSecond: number;
+  progress: number;
+  loop: boolean;
+  dwellMs: number;
+  pathPoints: Vector3Snapshot[];
+}
+
+/** POI 属性面板向引擎提交的配置增量。 */
+export type PoiConfigUpdate = Partial<Omit<PoiConfigSnapshot, "version" | "kind">>;
+
+/** POI 运行态快照，运行中间态默认不写入场景文件。 */
+export interface PoiRuntimeState {
+  status: PoiRuntimeStatus;
+  active: boolean;
+  alarmActive: boolean;
+  lastEventName: string;
+  latestValue: string;
+  generatedCount: number;
+  running: boolean;
+  paused: boolean;
+  updatedAt: number;
+  trend: number[];
+}
 
 /** 场景层级树中的节点类别。 */
 export type SceneNodeKind = "Mesh" | "Transform" | "Light" | "Camera" | "POI" | "CAD" | "Helper" | "Group";
@@ -187,6 +268,10 @@ export interface TransformSnapshot {
   cadOpacity?: number;
   /** 文件夹模型包提供的动态参数面板数据；没有模型包时为空。 */
   dynamicParameters?: DynamicParameterSnapshot;
+  /** POI 专属业务配置；非 POI 节点为空。 */
+  poi?: PoiConfigSnapshot;
+  /** POI 运行态快照，只用于属性面板展示，不参与保存。 */
+  poiRuntime?: PoiRuntimeState;
 }
 
 /** 属性面板向 Babylon 场景提交的部分更新。 */
@@ -203,6 +288,8 @@ export interface TransformUpdate {
   cadOpacity?: number;
   /** 更新文件夹模型包实例的单个动态参数，并实时触发本地运行脚本应用到模型。 */
   dynamicParameter?: DynamicParameterUpdate;
+  /** 更新 POI 业务组件配置，写入 metadata.editor.poiConfig。 */
+  poi?: PoiConfigUpdate;
 }
 
 /** 场景相机属性快照，当前只暴露编辑视口可视距离。 */

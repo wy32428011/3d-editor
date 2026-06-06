@@ -1,25 +1,37 @@
 import {
+  ArchiveRestore,
+  BarChart3,
   Box,
-  Camera,
   Circle,
-  Cpu,
   Cylinder,
   FileArchive,
+  GitBranch,
   Grid3X3,
   Image,
-  Info,
   Lightbulb,
-  MapPin,
+  LineChart,
+  Navigation,
   Package,
-  Tag,
+  PackagePlus,
+  Route,
+  Search,
+  Send,
   TriangleAlert,
-  Upload
+  Upload,
+  Waypoints,
+  Zap,
+  type LucideIcon
 } from "lucide-react";
-import { useRef, useState } from "react";
-import type { AssetRecord, PoiKind, PrimitiveKind } from "../types/editor";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { POI_CATALOG_ITEMS } from "../editor/poiCatalog";
+import type { AssetRecord, PrimitiveKind } from "../types/editor";
 
 interface AssetBrowserProps {
   assets: AssetRecord[];
+  height: number;
+  minHeight: number;
+  maxHeight: number;
+  onHeightChange: (height: number) => void;
   onImportFiles: (files: FileList) => void | Promise<void>;
   onImportModelPackage: () => void | Promise<void>;
 }
@@ -32,20 +44,49 @@ const primitives: Array<{ kind: PrimitiveKind; label: string; icon: typeof Box }
   { kind: "light", label: "Light", icon: Lightbulb }
 ];
 
-const poiComponents: Array<{ kind: PoiKind; label: string; description: string; icon: typeof Box }> = [
-  { kind: "marker", label: "标记点", description: "定位", icon: MapPin },
-  { kind: "info", label: "信息点", description: "说明", icon: Info },
-  { kind: "warning", label: "告警点", description: "告警", icon: TriangleAlert },
-  { kind: "camera", label: "摄像头", description: "监控", icon: Camera },
-  { kind: "device", label: "设备点", description: "设备", icon: Cpu },
-  { kind: "label", label: "文本标签", description: "标签", icon: Tag }
+type AssetLibraryKey = "model" | "poi" | "theme" | "chart" | "group" | "image" | "environment";
+
+const libraryTabs: Array<{ key: AssetLibraryKey; label: string }> = [
+  { key: "model", label: "模型库" },
+  { key: "poi", label: "POI库" },
+  { key: "theme", label: "主题库" },
+  { key: "chart", label: "图表库" },
+  { key: "group", label: "组合库" },
+  { key: "image", label: "图片库" },
+  { key: "environment", label: "环境库" }
 ];
 
-/** 底部资源浏览器展示资产库和 POI 库，所有卡片都通过拖拽进入视口。 */
-export function AssetBrowser({ assets, onImportFiles, onImportModelPackage }: AssetBrowserProps) {
+const poiIconMap: Record<string, LucideIcon> = {
+  zap: Zap,
+  send: Send,
+  "archive-restore": ArchiveRestore,
+  "bar-chart-3": BarChart3,
+  "line-chart": LineChart,
+  navigation: Navigation,
+  "triangle-alert": TriangleAlert,
+  "package-plus": PackagePlus,
+  "git-branch": GitBranch,
+  route: Route,
+  waypoints: Waypoints
+};
+
+/** 底部资源浏览器展示模型库和 POI 库，所有可用卡片都通过拖拽进入视口。 */
+export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightChange, onImportFiles, onImportModelPackage }: AssetBrowserProps) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const [activeLibrary, setActiveLibrary] = useState<"asset" | "poi">("asset");
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+  const [activeLibrary, setActiveLibrary] = useState<AssetLibraryKey>("model");
+  const [poiKeyword, setPoiKeyword] = useState("");
   const importedAssets = assets.filter((asset) => asset.type !== "primitive");
+  const filteredPoiItems = useMemo(() => {
+    const keyword = poiKeyword.trim().toLowerCase();
+    if (!keyword) {
+      return POI_CATALOG_ITEMS;
+    }
+
+    return POI_CATALOG_ITEMS.filter((item) =>
+      [item.title, item.description, item.kind, ...item.keywords].some((value) => value.toLowerCase().includes(keyword))
+    );
+  }, [poiKeyword]);
 
   /** 打开资产面板内的模型选择器，方便从资产区直接导入外部模型。 */
   const openFilePicker = () => {
@@ -60,30 +101,110 @@ export function AssetBrowser({ assets, onImportFiles, onImportModelPackage }: As
     }
   };
 
+  useEffect(() => {
+    return () => resizeCleanupRef.current?.();
+  }, []);
+
+  /** 拖动资源库上边缘，按鼠标纵向位移调整底部区域高度。 */
+  const handleResizeMouseDown = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) {
+        return;
+      }
+
+      event.preventDefault();
+      resizeCleanupRef.current?.();
+      const startY = event.clientY;
+      const startHeight = height;
+      const previousUserSelect = document.body.style.userSelect;
+      const previousCursor = document.body.style.cursor;
+      let resizeActive = true;
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "row-resize";
+
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        onHeightChange(startHeight + startY - moveEvent.clientY);
+      };
+      const handleMouseUp = () => {
+        if (!resizeActive) {
+          return;
+        }
+
+        resizeActive = false;
+        window.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mouseup", handleMouseUp);
+        window.removeEventListener("blur", handleMouseUp);
+        document.body.style.userSelect = previousUserSelect;
+        document.body.style.cursor = previousCursor;
+        resizeCleanupRef.current = null;
+      };
+
+      window.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+      window.addEventListener("blur", handleMouseUp);
+      resizeCleanupRef.current = handleMouseUp;
+    },
+    [height, onHeightChange]
+  );
+
+  /** 支持键盘按 8px 或 32px 步进调整资源库高度，补齐拖拽条的可访问操作。 */
+  const handleResizeKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+      const step = event.shiftKey ? 32 : 8;
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        onHeightChange(height + step);
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        onHeightChange(height - step);
+        return;
+      }
+      if (event.key === "Home") {
+        event.preventDefault();
+        onHeightChange(minHeight);
+        return;
+      }
+      if (event.key === "End") {
+        event.preventDefault();
+        onHeightChange(maxHeight);
+      }
+    },
+    [height, maxHeight, minHeight, onHeightChange]
+  );
+
   return (
     <section className="panel asset-browser">
+      <button
+        aria-label="拖拽调整资源库高度"
+        aria-orientation="horizontal"
+        aria-valuemax={maxHeight}
+        aria-valuemin={minHeight}
+        aria-valuenow={height}
+        className="asset-browser-resize-handle"
+        role="separator"
+        title="拖拽调整资源库高度"
+        type="button"
+        onKeyDown={handleResizeKeyDown}
+        onMouseDown={handleResizeMouseDown}
+      />
       <div className="panel-title asset-panel-title">
         <div className="asset-library-tabs" role="tablist" aria-label="资源库切换">
-          <button
-            className={`asset-library-tab ${activeLibrary === "asset" ? "is-active" : ""}`}
-            type="button"
-            role="tab"
-            aria-selected={activeLibrary === "asset"}
-            onClick={() => setActiveLibrary("asset")}
-          >
-            资产
-          </button>
-          <button
-            className={`asset-library-tab ${activeLibrary === "poi" ? "is-active" : ""}`}
-            type="button"
-            role="tab"
-            aria-selected={activeLibrary === "poi"}
-            onClick={() => setActiveLibrary("poi")}
-          >
-            POI
-          </button>
+          {libraryTabs.map((tab) => (
+            <button
+              className={`asset-library-tab ${activeLibrary === tab.key ? "is-active" : ""}`}
+              key={tab.key}
+              type="button"
+              role="tab"
+              aria-selected={activeLibrary === tab.key}
+              onClick={() => setActiveLibrary(tab.key)}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
-        {activeLibrary === "asset" && (
+        {activeLibrary === "model" && (
           <div className="asset-import-actions">
             <button className="asset-import-button" type="button" title="导入外部模型" onClick={openFilePicker}>
               <Upload size={14} />
@@ -97,8 +218,20 @@ export function AssetBrowser({ assets, onImportFiles, onImportModelPackage }: As
         )}
       </div>
       <div className="asset-content">
-        <div className="asset-shelf">
-          {activeLibrary === "asset" && (
+        {activeLibrary === "poi" && (
+          <div className="poi-library-toolbar">
+            <Search size={14} />
+            <input
+              aria-label="POI名称"
+              className="poi-search-input"
+              placeholder="POI名称"
+              value={poiKeyword}
+              onChange={(event) => setPoiKeyword(event.currentTarget.value)}
+            />
+          </div>
+        )}
+        <div className={`asset-shelf ${activeLibrary === "poi" ? "poi-shelf" : ""}`}>
+          {activeLibrary === "model" && (
             <>
               {primitives.map((item) => {
                 const Icon = item.icon;
@@ -151,25 +284,35 @@ export function AssetBrowser({ assets, onImportFiles, onImportModelPackage }: As
           )}
 
           {activeLibrary === "poi" &&
-            poiComponents.map((item) => {
-              const Icon = item.icon;
+            filteredPoiItems.map((item) => {
+              const Icon = poiIconMap[item.iconKey] ?? Box;
               return (
                 <div
                   key={item.kind}
                   className="asset-tile poi-asset-tile"
                   draggable
-                  title={`${item.label}，拖入视口添加到场景`}
+                  title={`${item.title}，${item.description}`}
                   onDragStart={(event) => {
                     event.dataTransfer.effectAllowed = "copy";
                     event.dataTransfer.setData("application/x-editor-poi", item.kind);
                   }}
                 >
-                  <Icon size={22} />
-                  <span>{item.label}</span>
+                  <div className="poi-tile-preview">
+                    <Icon size={24} />
+                    <span className="poi-tile-node" />
+                  </div>
+                  <span>{item.title}</span>
                   <small>{item.description}</small>
                 </div>
               );
             })}
+          {activeLibrary === "poi" && filteredPoiItems.length === 0 && <div className="empty-state">没有匹配的 POI 组件</div>}
+          {activeLibrary !== "model" && activeLibrary !== "poi" && (
+            <div className="asset-library-empty">
+              <span>{libraryTabs.find((tab) => tab.key === activeLibrary)?.label}</span>
+              <small>该资源库入口已预留，当前版本暂未接入资源内容。</small>
+            </div>
+          )}
         </div>
       </div>
       <input
