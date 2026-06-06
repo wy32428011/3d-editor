@@ -170,8 +170,6 @@ export interface TransformSnapshot {
   scaling: Vector3Snapshot;
   visible: boolean;
   materialColor?: string;
-  /** CAD 图纸整体显示透明度，1 表示保留原始线条不额外变淡。 */
-  cadOpacity?: number;
   /** 当前节点自身是否被锁定，解锁按钮只修改该字段。 */
   selfLocked: boolean;
   /** 当前节点是否因自身或父级锁定而处于只读状态。 */
@@ -194,8 +192,6 @@ export interface TransformUpdate {
   scaling?: Vector3Snapshot;
   visible?: boolean;
   materialColor?: string;
-  /** 更新 CAD 图纸整体显示透明度，仅 CAD 根节点生效。 */
-  cadOpacity?: number;
   meshVertexModify?: Partial<MeshVertexModifySnapshot>;
   assetInfo?: Partial<Pick<AssetInfoSnapshot, "assetCode">>;
   /** 更新 CAD 根节点整体透明度，不改原始线段颜色和坐标。 */

@@ -472,10 +472,10 @@ export class SceneDataDrivenRuntime {
         const base = state.stackerMotionBasePositions.get(node.uniqueId) ?? node.position;
         const position = base.clone();
         const worldDelta = Vector3.Zero();
-        this.addMotionGroupDelta(node, state.stackerMotionGroups.travel, state.stackerMotionValues.travel, worldDelta);
-        this.addMotionGroupDelta(node, state.stackerMotionGroups.lift, state.stackerMotionValues.lift, worldDelta);
-        this.addMotionGroupDelta(node, state.stackerMotionGroups.fork, state.stackerMotionValues.fork, worldDelta);
-        this.addMotionGroupDelta(node, state.stackerMotionGroups.forkSide, state.stackerMotionValues.forkSide, worldDelta);
+        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.travel, state.stackerMotionValues.travel, worldDelta);
+        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.lift, state.stackerMotionValues.lift, worldDelta);
+        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.fork, state.stackerMotionValues.fork, worldDelta);
+        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.forkSide, state.stackerMotionValues.forkSide, worldDelta);
         position.addInPlace(this.worldDeltaToParentLocalDelta(node, worldDelta));
         return [node.uniqueId, position];
       })
@@ -749,8 +749,14 @@ export class SceneDataDrivenRuntime {
     });
   }
 
-  /** 若节点属于某运动组的顶层参与节点，则把该运动值按轴向合成到世界位移。 */
-  private addMotionGroupDelta(node: TransformNode, group: RuntimeMotionGroup, value: number, worldDelta: Vector3): void {
+  /** 若节点属于某运动组的顶层参与节点，则按模型根节点局部轴合成世界位移。 */
+  private addMotionGroupDelta(
+    node: TransformNode,
+    root: TransformNode,
+    group: RuntimeMotionGroup,
+    value: number,
+    worldDelta: Vector3
+  ): void {
     if (group.nodes.length === 0 || !group.nodes.some((item) => item.uniqueId === node.uniqueId)) {
       return;
     }
@@ -759,22 +765,34 @@ export class SceneDataDrivenRuntime {
       return;
     }
 
-    this.addAxisDelta(worldDelta, group.axis, value);
+    this.addModelLocalAxisDelta(worldDelta, root, group.axis, value);
   }
 
-  /** 按模型脚本声明的轴向累加世界位移。 */
-  private addAxisDelta(target: Vector3, axis: ModelDataDrivenAxis, value: number): void {
-    if (axis === "x") {
-      target.x += value;
+  /** 按模型根节点局部轴累加世界位移，忽略根节点缩放以保持 payload 米制距离。 */
+  private addModelLocalAxisDelta(target: Vector3, root: TransformNode, axis: ModelDataDrivenAxis, value: number): void {
+    if (value === 0) {
       return;
     }
 
-    if (axis === "y") {
-      target.y += value;
+    const worldDirection = this.modelLocalAxisToWorldDirection(root, axis);
+    if (worldDirection.lengthSquared() <= 0) {
       return;
     }
 
-    target.z += value;
+    target.addInPlace(worldDirection.scale(value));
+  }
+
+  /** 将模型根节点局部轴转换为世界方向，只保留方向并归一化，不携带根节点缩放。 */
+  private modelLocalAxisToWorldDirection(root: TransformNode, axis: ModelDataDrivenAxis): Vector3 {
+    const localAxis = axis === "x" ? new Vector3(1, 0, 0) : axis === "y" ? new Vector3(0, 1, 0) : new Vector3(0, 0, 1);
+    root.computeWorldMatrix(true);
+    const worldAxis = Vector3.TransformNormal(localAxis, root.getWorldMatrix());
+    const lengthSquared = worldAxis.lengthSquared();
+    if (lengthSquared <= 1e-12) {
+      return Vector3.Zero();
+    }
+
+    return worldAxis.scale(1 / Math.sqrt(lengthSquared));
   }
 
   /** 根据模型脚本或旧 Stacker 兜底规则创建四类运动组。 */

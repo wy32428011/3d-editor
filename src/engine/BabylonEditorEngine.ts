@@ -5435,6 +5435,7 @@ export class BabylonEditorEngine {
   ): string | undefined {
     const editableState = this.captureModelPackageEditableState(root, values);
     try {
+      this.normalizeModelPackageRootForLifecycle(root);
       return action();
     } finally {
       this.restoreModelPackageEditableState(root, editableState);
@@ -5443,6 +5444,15 @@ export class BabylonEditorEngine {
       }
       this.refreshNodeWorldMatrices(root);
     }
+  }
+
+  /** 临时把模型根节点归一到局部基准状态，让参数脚本按模型自身坐标轴计算几何。 */
+  private normalizeModelPackageRootForLifecycle(root: TransformNode): void {
+    root.position.set(0, 0, 0);
+    root.rotationQuaternion = null;
+    root.rotation.set(0, 0, 0);
+    root.scaling.set(1, 1, 1);
+    this.refreshNodeWorldMatrices(root);
   }
 
   /** 捕获模型包根节点用户可编辑状态，供运行脚本生命周期结束后恢复。 */
