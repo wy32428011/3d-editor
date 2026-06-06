@@ -4,11 +4,11 @@ import net from "node:net";
 
 const MQTT_HOST = process.env.STACKER_DEMO_MQTT_HOST ?? "192.168.60.154";
 const MQTT_PORT = Number(process.env.STACKER_DEMO_MQTT_PORT ?? 1883);
-const MQTT_TOPIC = process.env.STACKER_DEMO_TOPIC ?? "digital-twin/stacker/state";
+const MQTT_TOPIC = process.env.STACKER_DEMO_TOPIC ?? "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
 const WS_HOST = process.env.STACKER_DEMO_WS_HOST ?? "127.0.0.1";
 const WS_PORT = Number(process.env.STACKER_DEMO_WS_PORT ?? 18083);
 const WS_PATH = process.env.STACKER_DEMO_WS_PATH ?? "/stacker";
-const DEVICE_ID = process.env.STACKER_DEMO_DEVICE_ID ?? "stacker";
+const DEVICE_ID = process.env.STACKER_DEMO_DEVICE_ID ?? "Stacker01";
 const PUBLISH_INTERVAL_MS = Number(process.env.STACKER_DEMO_INTERVAL_MS ?? 500);
 const MQTT_KEEP_ALIVE_SECONDS = 30;
 const ONCE_MODE = process.argv.includes("--once") || process.env.STACKER_DEMO_ONCE === "1";
@@ -180,16 +180,13 @@ function createStackerFrame() {
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
   const travelPhase = elapsedSeconds * 0.65;
   const liftPhase = elapsedSeconds * 1.1;
-  const travelZ = roundNumber(Math.sin(travelPhase) * 3);
-  return {
-    deviceId: DEVICE_ID,
-    travelZ,
-    z: travelZ,
-    liftY: roundNumber(0.4 + ((Math.sin(liftPhase) + 1) / 2) * 2.2),
-    forkExtend: roundNumber(((Math.sin(liftPhase + Math.PI / 3) + 1) / 2) * 0.8),
-    forkZ: roundNumber(Math.sin(travelPhase * 1.4) * 0.2),
-    status: "running"
-  };
+  const ts = Date.now();
+  return [
+    { e: DEVICE_ID, p: "travel_pos", v: roundNumber(Math.sin(travelPhase) * 3), ts },
+    { e: DEVICE_ID, p: "lift_pos", v: roundNumber(0.4 + ((Math.sin(liftPhase) + 1) / 2) * 2.2), ts },
+    { e: DEVICE_ID, p: "fork_extend", v: roundNumber(((Math.sin(liftPhase + Math.PI / 3) + 1) / 2) * 0.8), ts },
+    { e: DEVICE_ID, p: "fork_side", v: roundNumber(Math.sin(travelPhase * 1.4) * 0.2), ts }
+  ];
 }
 
 /** 四舍五入到 3 位小数，避免日志和消息过长。 */

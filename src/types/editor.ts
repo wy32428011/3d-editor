@@ -50,8 +50,12 @@ export interface DynamicInspectorField {
 /** 模型脚本数据驱动运动组使用的轴向。 */
 export type ModelDataDrivenAxis = "x" | "y" | "z";
 
+/** 模型脚本数据驱动运动组的物理动作类型。 */
+export type ModelDataDrivenMotionKind = "translate" | "rotate";
+
 /** 模型脚本声明的设备匹配默认值，不包含网络连接配置。 */
 export interface ModelDataDrivenDeviceDefinition {
+  devType?: string;
   defaultAssetCode?: string;
   deviceIdField?: string;
   assetCodeField?: string;
@@ -61,6 +65,7 @@ export interface ModelDataDrivenDeviceDefinition {
 /** 模型脚本声明的单个运动组，描述 payload 字段、运动轴向和参与节点。 */
 export interface ModelDataDrivenMotionGroupDefinition {
   fields: string[];
+  kind?: ModelDataDrivenMotionKind;
   axis: ModelDataDrivenAxis;
   nodes: string[];
   fallbackPattern?: string;

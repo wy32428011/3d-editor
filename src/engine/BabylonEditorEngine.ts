@@ -116,9 +116,9 @@ const HELPER_FLAG = "isEditorHelper";
 const ROOT_FLAG = "isEditorRoot";
 const DROP_SURFACE_FLAG = "isEditorDropSurface";
 const GROUP_NODE_TYPE = "group";
-const STACKER_DEMO_DEVICE_ID = "stacker";
+const STACKER_DEMO_DEVICE_ID = "Stacker01";
 const STACKER_DEMO_ENDPOINT = "ws://127.0.0.1:18083/stacker";
-const STACKER_DEMO_TOPIC = "digital-twin/stacker/state";
+const STACKER_DEMO_TOPIC = "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
 export const DEFAULT_SCENE_ENVIRONMENT_COLOR = "#26312d";
 const GRID_RENDER_ELEVATION_METERS = 0.015;
 const EDITOR_LENGTH_UNIT = "meter";
@@ -6431,6 +6431,7 @@ export class BabylonEditorEngine {
     const device = this.asMetadataObject(value);
     return (
       Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      (device.devType === undefined || typeof device.devType === "string") &&
       (device.defaultAssetCode === undefined || typeof device.defaultAssetCode === "string") &&
       (device.deviceIdField === undefined || typeof device.deviceIdField === "string") &&
       (device.assetCodeField === undefined || typeof device.assetCodeField === "string") &&
@@ -6453,6 +6454,7 @@ export class BabylonEditorEngine {
     return (
       Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
       this.isStringArray(group.fields) &&
+      (group.kind === undefined || group.kind === "translate" || group.kind === "rotate") &&
       ["x", "y", "z"].includes(String(group.axis)) &&
       this.isStringArray(group.nodes) &&
       (group.fallbackPattern === undefined || typeof group.fallbackPattern === "string")

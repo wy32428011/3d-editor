@@ -25,7 +25,7 @@
 - 复制粘贴：选中模型后可通过 `Ctrl+C` 复制，再用 `Ctrl+V` 粘贴为带水平偏移的独立副本；属性面板输入框等文本编辑区域仍保留系统复制粘贴行为，预览模式下不会复制或粘贴场景模型
 - 属性编辑：右侧属性面板采用深色折叠分组样式，支持对象名称、显隐、位置、旋转、缩放、主体颜色、旧版 MeshVertexModifyComponent 参数、文件夹模型包解析出的动态参数和业务资产编号编辑；变换与颜色会实时驱动视口模型变化，组件参数、动态参数和资产编号会写入节点 metadata 并随场景保存恢复
 - 资产导入：支持从工具栏和资产面板按钮导入 `.glb`、`.gltf`、`.babylon`、`.obj`、`.stl`、常见图片贴图，以及 `.gltf/.obj` 同批依赖的 `.bin/.mtl/贴图` 文件；桌面模式支持导入包含 `meta.json`/`meta.js`、单个 TypeScript 模型脚本和主 `.glb` 的文件夹模型包，导入后会复制到项目 `assets/source/`，属性栏会优先按 `meta.json` 的 `parameterScripts[].scriptFilename` 选择参数脚本，并静态解析 `visibleAsNumber` / `visibleAsString` / `visibleAsBoolean` / `visibleAsColor3` 装饰器生成动态参数；同一个 `.model.ts` 可以同时声明 `ParametricModelParamsComponent` 和 `ParametricModelRuntimeComponent`，`meta.json` 保留不同 `className` 供兼容运行环境识别；模型包实例化后会在 Electron renderer 中执行项目内已复制的本地运行脚本，属性栏参数会同步到 `metadata.scripts[].values` 并实时触发 `ParametricModelRuntimeComponent` 驱动几何、阵列和显隐变化，脚本执行时会临时把模型根节点归一到局部基准坐标系并在结束后恢复用户设置的位置、旋转和缩放，避免模型旋转后参数化配置失效；脚本异常会降级为属性栏告警且不阻断参数保存；项目模式下导入的源文件会复制到项目 `assets/source/`，模型和场景文件会先进入资产浏览器，不立即写入当前场景，重新打开项目后资产卡片会按需读取项目内源文件和同批依赖继续拖入使用；旧项目没有源文件副本时，会尝试从当前场景内同源模型克隆新实例，模型实例化到场景后，带子节点的模型在层级面板只展示主模型，保持列表简洁
-- 数据驱动：右侧场景属性的 `SceneDataDrivenComponent` 支持配置 WebSocket 或 MQTT over WebSocket 数据源、通道/Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备默认编号、payload 字段、运动轴向、参与节点、固定节点和本地模拟范围，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，脚本中的 `motion.*.axis` 按模型根节点局部轴解释；payload 中的 `travelZ` 或 `z` 会驱动行走机构沿轨道长度方向移动，`liftY` 会驱动载货台和货叉升降，`forkExtend`/`forkX` 会驱动货叉沿伸出方向位移，`forkZ` 会驱动货叉沿局部 Z 方向微调；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
+- 数据驱动：右侧场景属性的 `SceneDataDrivenComponent` 支持配置 WebSocket 或 MQTT over WebSocket 数据源、通道/Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备类型、默认编号、payload 字段、运动轴向、参与节点、固定节点和本地模拟范围，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，整机生成/位姿走 `twinspawn`，内部动作走 `twindatadriven/joint` 的 `{e,p,v}` 点位格式；`travel_pos` 驱动堆垛机行走机构沿轨道方向位移，`lift_pos` 驱动载货台和货叉升降，`fork_extend` 驱动货叉伸出，`fork_side` 驱动货叉侧向微调；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
 - CAD 图纸导入：工具栏提供独立的“导入 CAD 图纸”按钮，当前支持 `.dxf` 文本图纸；导入目标收敛为“所有可解析矢量线”，会把 LINE、LWPOLYLINE、POLYLINE/VERTEX、CIRCLE、ARC、ELLIPSE、SPLINE、SOLID/TRACE/3DFACE 外轮廓、LEADER/MLINE/MLEADER/MULTILEADER、RAY/XLINE 有限参考线、DIMENSION 块或 fallback 线以及 BLOCK/INSERT 嵌套内容解析为贴到 XZ 工作网格的米制线段；非线内容如文字、图片、填充面、遮罩和点不作为本次 CAD 导入目标，避免非线内容污染图纸 bounds 并产生放射状乱线。解析器优先导入模型空间线，模型空间没有可绘制线时才兜底导入布局/图纸空间并提示；若 DXF 的二维内容来自三维/剖面导出并落在 XZ 或 YZ 平面，导入器会读取实体 Z、高程和 OCS 挤出方向后自动选择面积最大的二维平面投影，避免只读 XY 导致所有线段压扁重叠；优先读取 DXF `$INSUNITS` 单位声明并换算到项目米制尺寸，未声明单位且原始尺寸明显过大时会推断为毫米；DXF 文件大小和线段数量不做截断，CAD 解析在 Worker 中输出二进制 typed-array chunk，Babylon 端直接用 `LinesMesh + VertexData` 分块渲染。项目模式会把多个线段 chunk 合并保存为约 16-24MB 的 `*.cadlines.pack.bin` 侧车包，场景 JSON 只保留 CAD 根节点 metadata、bounds、单位和 chunk manifest；旧项目中的单 chunk `*.cadlines.bin` 侧车仍可兼容恢复。图纸按包围盒中心平移到世界原点并在导入后自动取景，导入结果作为可选中、可删除、可随场景保存恢复的 CAD 根节点；选中 CAD 根节点后可在右侧“CAD 显示”中调整整张图纸透明度，不改变原始线色和几何数据。DWG 需先转换为 DXF 后导入。
 - CAD 导入与恢复进度：导入 DXF 时项目条会显示专用进度条，按读取文件、测量图纸、输出线段、创建网格和保存侧车包等阶段更新；能拿到总量的阶段显示百分比，测量等未知总量阶段显示不确定进度。重新打开项目时普通场景会先完成加载并可操作，CAD 侧车线段在后台渐进恢复，顶部显示“CAD 恢复中”的 chunk/mesh 进度；恢复完成前会暂时禁用保存，避免把未恢复完整的 CAD 状态写回场景文件。导入中和恢复中的状态不会再占用错误提示。
 - POI 库：底部资源区支持在“资产”和“POI”之间切换；POI 库内置标记点、信息点、告警点、摄像头、设备点和文本标签，拖入视口后会生成真实 Babylon 可编辑节点，支持选择、Gizmo 变换、属性面板编辑、层级展示和场景保存
@@ -80,27 +80,34 @@ set ELECTRON_DEV_SMOKE_EXIT_MS=3000&& npm run electron:dev
 
 场景属性面板的 `SceneDataDrivenComponent` 只保存非敏感连接配置；选中模型后的对象属性面板也会在“数据驱动”分区复用同一份场景级数据源，并把“绑定设备”写入对象资产编号。MQTT 需要 broker 开启 WebSocket 端口，例如 `ws://127.0.0.1:8083/mqtt` 或 `wss://broker.example.com/mqtt`；普通 WebSocket 会在连接成功后发送 `{"type":"subscribe","channel":"<通道>"}` 作为轻量订阅请求。
 
-模型包脚本可以导出 `dataDriven` 对象，把运动语义放回模型资产自身，例如 Stacker 在 `stacker.model.ts` 中声明 `device.defaultAssetCode = "stacker"`、`motion.travel/lift/fork/forkSide` 的 payload 字段、轴向和节点列表，以及 `fixedNodes` 与 `simulation` 范围。`motion.*.axis` 表示模型根节点的局部轴，不是世界坐标轴；运行时会先把该局部轴转换为世界方向，再写入运动部件的父级局部坐标，所以模型根节点在场景中旋转后，行走、升降和货叉伸缩方向会跟随模型自身朝向。编辑器导入时只静态解析普通对象字面量，不执行脚本来读取配置；旧模型包没有该字段时继续使用内置 Stacker 兜底规则。
+模型包脚本可以导出 `dataDriven` 对象，把运动语义放回模型资产自身，例如 Stacker 在 `stacker.model.ts` 中声明 `device.devType = "stacker"`、`device.defaultAssetCode = "Stacker01"`、`device.deviceIdField = "e"`、`motion.travel/lift/fork/forkSide` 的 MQTT 文档点位字段、轴向和节点列表，以及 `fixedNodes` 与 `simulation` 范围。`motion.*.kind` 可选 `translate` 或 `rotate`，缺省按 `translate` 兼容旧模型；`translate` 的 `v` 表示米制目标位移，`rotate` 的 `v` 表示相对进入预览基线姿态的角度目标值（单位：度）。位移动作的 `motion.*.axis` 表示模型根节点的局部轴，不是世界坐标轴；运行时会先把该局部轴转换为世界方向，再写入运动部件的父级局部坐标，所以模型根节点在场景中旋转后，行走、升降和货叉伸缩方向会跟随模型自身朝向。旋转动作按参与节点自身局部轴旋转，适合辊筒、移载辊等内部机构。编辑器导入时只静态解析普通对象字面量，不执行脚本来读取配置；旧模型包没有该字段时继续使用内置 Stacker 兜底规则。
 
-推荐 Stacker 数据帧：
+Stacker 按 MQTT 文档中的数字孪生主题接入：整机生成/位姿使用 `dt/factory/logistics/stacker/Stacker01/twinspawn`，内部机构动作使用 `dt/factory/logistics/stacker/Stacker01/twindatadriven/joint`。文档坐标中 `x/y/h/r` 分别表示 X 坐标、Y 坐标、Z 高度和旋转角度；运行时会映射到 Babylon 场景的 `x/z/y/rotationY`，也就是文档平面 Y 落到编辑器地面 Z 轴，文档高度 H 落到编辑器垂直 Y 轴。`twindatadriven/joint` 中的 `{e,p,v}` 会在运行时归一为 `{e,[p]:v}` 后再驱动模型内部运动。
+
+推荐 Stacker 整机位姿帧：
 
 ```json
-{
-  "deviceId": "stacker",
-  "travelZ": 2.4,
-  "z": 2.4,
-  "liftY": 1.8,
-  "forkExtend": 0.35,
-  "forkZ": 0,
-  "status": "running"
-}
+{"s":"spawn01","e":"Stacker01","x":12.5,"y":8.3,"h":0,"r":90,"ts":1746991234567}
 ```
 
-`deviceId` 会按场景配置中的“设备字段”读取；模型侧默认先匹配对象属性里的“资产编号”，匹配不到时会继续匹配模型包动态参数 `modelKey`、源文件名和根节点名称。运动字段的数值仍表示相对进入预览基线姿态的米制目标位移距离，不表示世界坐标点，数据服务不需要因为场景里旋转了模型而改变 payload 格式。若数据服务外层包了一层 `data` 或 `payload`，可以把“数据路径”设置为对应点路径；数组 payload 会批量处理但单条消息最多消费 200 帧，避免高频大包造成内存压力。
+推荐 Stacker 内部动作点位帧：
+
+```json
+[
+  {"e":"Stacker01","p":"travel_pos","v":2.4,"ts":1746991234567},
+  {"e":"Stacker01","p":"lift_pos","v":1.2,"ts":1746991234567},
+  {"e":"Stacker01","p":"fork_extend","v":0.6,"ts":1746991234567},
+  {"e":"Stacker01","p":"fork_side","v":0.1,"ts":1746991234567}
+]
+```
+
+`e` 会按模型包默认设备字段读取；模型侧默认先匹配对象属性里的“资产编号”，匹配不到时会继续匹配模型包动态参数 `modelKey`、源文件名和根节点名称。内部动作点位的数值表示相对进入预览基线姿态的目标值，不表示世界坐标点，数据服务不需要因为场景里旋转了模型而改变 payload 格式。若数据服务外层包了一层 `data` 或 `payload`，可以把“数据路径”设置为对应点路径；运行时也会递归归一化包装内的 `{e,p,v}` joint 数组。数组 payload 会按设备合并处理但单条消息最多消费 200 帧，避免高频大包造成内存压力。
+
+除 Stacker 外，`E:\公司文件\数字孪生\模型文件\models` 下已补充以下物理动作语义：多穿小车 `Shuttle01` 使用 `fork_extend/fork_side` 驱动货叉伸缩和侧向微调；RGV `RGV01` 只声明设备匹配，整车运动走 `twinspawn`；辊道机 `RollerConveyor01`、有电机辊道 `MotorConveyor01` 和弯道输送机 `WLTS01` 使用 `roller_angle` 驱动辊筒旋转；链条机 `ChainConveyor01` 使用 `chain_pos` 驱动链条轨道位移；一体式顶升移载 `YZJ01` 使用 `lift_pos` 和 `roller_angle` 驱动顶升与移载辊；换层提升机 `HCTS01` 使用 `lift_pos` 只驱动精确识别的轿厢/平台节点，不配置名称兜底匹配。Shelf 是静态货架，LED 属于状态灯颜色语义，本轮不加入物理动作。
 
 ### Stacker 本地模拟 Demo
 
-拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker` 后，选中模型，在右侧“数据驱动”中点击“启动 Stacker 模拟”。该按钮会把绑定设备写为 `stacker`，填入 Stacker demo 数据源配置，并自动进入预览模式；预览中编辑器会直接生成本地模拟数据，不需要启动 MQTT broker 或桥接脚本。停止预览后，模型会恢复进入预览前的姿态，避免模拟中间帧污染保存文件。
+拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker` 后，选中模型，在右侧“数据驱动”中点击“启动 Stacker 模拟”。该按钮会把绑定设备写为 `Stacker01`，填入 Stacker demo 数据源配置，并自动进入预览模式；预览中编辑器会直接生成本地模拟数据，不需要启动 MQTT broker 或桥接脚本。停止预览后，模型会恢复进入预览前的姿态，避免模拟中间帧污染保存文件。
 
 `填入 Stacker Demo` 只负责填写真实 WebSocket demo 配置，不会自己生成数据，也不会自动进入预览；它用于配合下面的 MQTT 桥接脚本验证真实数据链路。
 
@@ -115,13 +122,13 @@ node scripts/stacker-mqtt-demo-bridge.mjs
 默认配置：
 
 - MQTT broker：`192.168.60.154:1883`
-- MQTT Topic：`digital-twin/stacker/state`
+- MQTT Topic：`dt/factory/logistics/stacker/Stacker01/twindatadriven/joint`
 - 编辑器 WebSocket：`ws://127.0.0.1:18083/stacker`
-- 设备编号：`stacker`
+- 设备编号：`Stacker01`
 
 如需换 broker、Topic 或本地 WebSocket 端口，可通过 `STACKER_DEMO_MQTT_HOST`、`STACKER_DEMO_MQTT_PORT`、`STACKER_DEMO_TOPIC`、`STACKER_DEMO_WS_PORT` 等环境变量覆盖；换机器演示时，Stacker 模型路径也需要替换为本机实际模型包目录。
 
-桥接演示步骤：先启动脚本，再拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker`，选中模型，在右侧“数据驱动”中点击“填入 Stacker Demo”，然后进入预览模式。按钮会把绑定设备写为 `stacker`，并把场景级数据源设置为本地 WebSocket demo；脚本会持续发送 `travelZ/z/liftY/forkExtend/forkZ` 往返变化的数据，便于确认上下轨道固定、行走机构沿轨道移动、载货台升降和货叉伸缩。
+桥接演示步骤：先启动脚本，再拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker`，选中模型，在右侧“数据驱动”中点击“填入 Stacker Demo”，然后进入预览模式。按钮会把绑定设备写为 `Stacker01`，并把场景级数据源设置为本地 WebSocket demo；脚本会持续发送 `travel_pos/lift_pos/fork_extend/fork_side` 往返变化的数据，便于确认上下轨道固定、行走机构沿轨道移动、载货台升降和货叉伸缩。
 
 ## 构建方式
 
@@ -205,12 +212,15 @@ release/Babylon 3D Editor-0.1.0-Setup.exe
 - 2026-06-04：点击视口非模型区域或编辑器 helper 区域时，右侧属性面板会切换为场景属性；场景名、环境色、相机可视距离、编辑器设置和 `SceneDataDrivenComponent` 配置可编辑，其中数据驱动配置保存到 `metadata.editor.sceneDataDriven`，本次不启动真实数据驱动运行时。
 - 2026-06-04：补齐真实数据驱动运行时；`SceneDataDrivenComponent` 可配置 WebSocket 或 MQTT over WebSocket 订阅，预览模式启动后按 `deviceId` 匹配模型并驱动 Stacker 的行走机构、载货台和货叉，停止预览会断开连接并恢复姿态，避免实时数据中间帧污染保存文件。已执行 `node node_modules\typescript\bin\tsc -b`、`node node_modules\vite\bin\vite.js build` 和 `git diff --check` 验证。
 - 2026-06-05：补齐模型属性面板的“数据驱动”入口；选中 Stacker 等模型后可直接绑定设备编号并编辑同一份场景级 MQTT/WebSocket 数据源，Group 和 CAD 节点会提示选择模型实例，避免错误绑定非模型节点。
-- 2026-06-05：新增 Stacker MQTT demo 桥接脚本；本地 `ws://127.0.0.1:18083/stacker` 会向编辑器转发动态 Stacker payload，同时向 `192.168.60.154:1883` 的 `digital-twin/stacker/state` 发布同一份数据，模型面板可一键填入 demo 配置。
-- 2026-06-05：新增 Stacker 内置模拟预览；选中模型后点击“启动 Stacker 模拟”会绑定设备号、填入 demo 配置并进入预览，运行时直接生成 `travelZ/z/liftY/forkExtend/forkZ` 往返数据验证模型运动，不依赖外部 MQTT 或 WebSocket 服务。
-- 2026-06-05：修正 Stacker 数据驱动运动结构；上下轨道固定不动，`travelZ/z` 只驱动堆垛机行走机构沿轨道移动，`liftY` 驱动载货台和货叉升降，`forkExtend/forkZ` 驱动货叉伸缩和微调。
+- 2026-06-05：新增 Stacker MQTT demo 桥接脚本；本地 `ws://127.0.0.1:18083/stacker` 会向编辑器转发动态 Stacker payload，同时向 `192.168.60.154:1883` 的 `dt/factory/logistics/stacker/Stacker01/twindatadriven/joint` 发布同一份数据，模型面板可一键填入 demo 配置。
+- 2026-06-05：新增 Stacker 内置模拟预览；选中模型后点击“启动 Stacker 模拟”会绑定设备号、填入 demo 配置并进入预览，运行时直接生成 `travel_pos/lift_pos/fork_extend/fork_side` 往返数据验证模型运动，不依赖外部 MQTT 或 WebSocket 服务。
+- 2026-06-05：修正 Stacker 数据驱动运动结构；上下轨道固定不动，`travel_pos` 只驱动堆垛机行走机构沿轨道移动，`lift_pos` 驱动载货台和货叉升降，`fork_extend/fork_side` 驱动货叉伸缩和微调。
 - 2026-06-05：修复点击“启动 Stacker 模拟”后看似无反应的问题；数据驱动运行时现在同时识别 GLB 中的 Mesh 和 TransformNode 运动部件，并把 payload 的米制位移换算到模型内部局部坐标，兼容 Stacker 这类按毫米源单位导入并缩放到米制场景的模型。
 - 2026-06-05：模型包 manifest 新增可选 `dataDriven` 运动语义；导入 Stacker 时会从 `stacker.model.ts` 静态解析设备默认绑定、运动组节点、轴向、固定轨道和本地模拟范围，运行时优先使用模型脚本定义，旧场景继续走内置 Stacker 兜底。
 - 2026-06-06：修正 Stacker 根节点旋转后的数据驱动方向；模型脚本 `dataDriven.motion.*.axis` 现在按模型根节点局部轴解释，运行时会忽略根节点缩放只取方向，确保行走机构沿旋转后的轨道方向移动，payload 字段格式保持不变。
+- 2026-06-06：按数字孪生 MQTT 文档重定义 Stacker 数据驱动；设备字段改为 `e`，默认设备号改为 `Stacker01`，整机 `twinspawn` 的文档坐标 `x/y/h` 映射为 Babylon `x/z/y`，内部机构动作使用 `twindatadriven/joint` 的 `{e,p,v,ts}` 数组并映射 `travel_pos/lift_pos/fork_extend/fork_side`。
+- 2026-06-06：扩展模型包 MQTT 物理动作数据驱动；`dataDriven.motion.*.kind` 支持 `translate/rotate`，运行时可驱动任意模型内部运动组，并为多穿小车、RGV、辊道机、链条机、有电机辊道、WLTS、YZJ、HCTS 补充文档标准设备号和物理点位。
+- 2026-06-06：修复 Shelf 模型包“货格宽度”参数调整无效；`shelf.model.ts` 不再通过模型根节点缩放表达货格尺寸，改为基于导入基线缩放模板内容节点并让复制出的层/列货格继承当前模板变换，避免被编辑器根节点变换保护逻辑还原。
 - 2026-06-04：CAD/DXF 导入从单一折线升级为完整二维 primitive 导入，支持原 CAD 颜色、文字、HATCH/SOLID 填充、POINT、LEADER、DIMENSION 块和嵌套 INSERT；移除 180000 线段截断，导入后按 CAD bounds 自动取景，选中 CAD 时不再用高亮层覆盖原图配色。
 - 2026-06-04：修复包含 `IMAGE/IMAGEDEF` 外部栅格参照的 DXF 只显示少量残留线条的问题；CAD 导入现在支持同批选择或拖拽 DXF 与图片文件，Electron 桌面端会尝试从 DXF 同目录读取外部图片，并按 IMAGE 四角贴到 XZ 网格。
 - 2026-06-04：补齐 CAD 保存恢复后的媒体重建；文字会根据 `cadText` metadata 重新绘制 DynamicTexture，Electron 环境会根据保存的原始 DXF 路径从同目录恢复 IMAGE 图片贴图。
@@ -301,7 +311,7 @@ tsconfig.electron.json
 - `ProjectLauncher` 负责桌面项目入口，包括最近项目、新建项目和打开项目。
 - `types/editor.ts` 定义 React 与 Babylon 引擎之间传递的稳定数据结构。
 - `editor/modelPackageDataDriven.ts` 静态解析模型包脚本导出的 `dataDriven` 普通对象字面量，只允许字符串、数字、布尔、数组和对象，避免为读取运动语义执行模型脚本。
-- `editor/sceneDataDrivenRuntime.ts` 负责预览模式下的 WebSocket/MQTT over WebSocket 订阅、payload 解析、设备匹配、模型脚本数据驱动运动映射和退出预览后的姿态恢复；模型包脚本只声明运动语义，不直接持有网络连接。
+- `editor/sceneDataDrivenRuntime.ts` 负责预览模式下的 WebSocket/MQTT over WebSocket 订阅、payload 解析、设备匹配、模型脚本数据驱动运动映射和退出预览后的姿态恢复；模型包脚本只声明运动语义，不直接持有网络连接。内部机构动作支持通用 `translate/rotate` 运动组，旧 Stacker 无脚本场景继续走内置兜底。
 - `editor/cadDxf.ts` 负责 DXF 文本解析和单位归一化，把 CAD 中可解析的线实体、曲线采样线和块展开线按 `$INSUNITS` 或明显毫米级尺寸推断换算成项目米制线段；HATCH 填充/剖面图案属于非线内容，默认跳过以避免派生线污染 bounds；`editor/cadDxf.worker.ts` 在后台把线段输出为 transferable typed-array chunk；Babylon 引擎负责把 chunk 映射到 XZ 网格并按图层/颜色/透明度生成分块 `LinesMesh`。项目模式下新导入会把多个 chunk 合并为 `*.cadlines.pack.bin` 侧车包，重开项目时普通场景先可操作，CAD 再通过批量读取和 mesh 合并后台渐进恢复；旧 `.cadlines.bin` 侧车文件仍兼容。
 - `editor/math.ts` 放置向量、角度和文件体积等通用转换逻辑。
 - `electron/main.ts` 负责桌面窗口、开发/生产入口、外链拦截、单实例应用、项目文件读写和最近项目状态。

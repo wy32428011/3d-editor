@@ -1,10 +1,11 @@
 import type { Scene } from "@babylonjs/core/scene";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
-import { Matrix, Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import type {
   ModelDataDrivenAxis,
   ModelDataDrivenDefinition,
   ModelDataDrivenMotionGroupDefinition,
+  ModelDataDrivenMotionKind,
   ModelDataDrivenSimulationDefinition,
   SceneDataDrivenSnapshot
 } from "../types/editor";
@@ -18,11 +19,11 @@ const MQTT_QOS0 = 0;
 const DEFAULT_RECONNECT_DELAY_MS = 1500;
 const MAX_RECONNECT_DELAY_MS = 8000;
 const STACKER_DEMO_INTERVAL_MS = 250;
-const STACKER_DEMO_DEVICE_ID = "stacker";
-const STACKER_TRAVEL_FIELDS = ["trackZ", "travelZ", "travel", "position.z", "pos.z", "location.z", "z"];
-const STACKER_LIFT_FIELDS = ["liftY", "lift", "platformY", "platform.y", "elevation"];
-const STACKER_FORK_FIELDS = ["forkExtend", "forkX", "fork.x", "fork.extend"];
-const STACKER_FORK_SIDE_FIELDS = ["forkZ", "fork.z"];
+const STACKER_DEMO_DEVICE_ID = "Stacker01";
+const STACKER_TRAVEL_FIELDS = ["travel_pos", "trackZ", "travelZ", "travel", "position.z", "pos.z", "location.z", "z"];
+const STACKER_LIFT_FIELDS = ["lift_pos", "liftY", "lift", "platformY", "platform.y", "elevation"];
+const STACKER_FORK_FIELDS = ["fork_extend", "forkExtend", "forkX", "fork.x", "fork.extend"];
+const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
 const STACKER_TRACK_NODE_NAMES = ["guidaoshang.1", "guidaoxia.2"];
 const STACKER_TRAVEL_NODE_NAMES = [
   "dingbuhuagui2.3",
@@ -48,17 +49,21 @@ type StackerMotionGroupKey = "travel" | "lift" | "fork" | "forkSide";
 
 /** 运行时归一化后的运动组，节点来源可来自模型脚本或 Stacker 兜底配置。 */
 interface RuntimeMotionGroup {
-  key: StackerMotionGroupKey;
+  key: string;
+  kind: ModelDataDrivenMotionKind;
   fields: string[];
   axis: ModelDataDrivenAxis;
   nodes: TransformNode[];
 }
 
-/** Stacker 或模型脚本声明的四类运动组。 */
-type StackerMotionGroups = Record<StackerMotionGroupKey, RuntimeMotionGroup>;
+/** 旧 Stacker 兜底规则生成的四类运动组。 */
+type LegacyStackerMotionGroups = Record<StackerMotionGroupKey, RuntimeMotionGroup>;
 
-/** 当前 Stacker 各运动组最近一次目标值。 */
-type StackerMotionValues = Record<StackerMotionGroupKey, number>;
+/** 子部件旋转快照，保留原始欧拉角或四元数模式。 */
+interface MotionRotationSnapshot {
+  euler: Vector3;
+  quaternion?: Quaternion;
+}
 
 /** 本地模拟预览使用的瞬时数据范围，不写入场景文件。 */
 interface StackerSimulationSettings {
@@ -106,12 +111,16 @@ interface DataDrivenTargetState {
   rootBaseRotationY?: number;
   rootStartRotationY?: number;
   rootTargetRotationY?: number;
-  stackerMotionGroups: StackerMotionGroups;
-  stackerMotionNodes: TransformNode[];
-  stackerMotionBasePositions: Map<number, Vector3>;
-  stackerMotionStartPositions: Map<number, Vector3>;
-  stackerMotionTargetPositions: Map<number, Vector3>;
-  stackerMotionValues: StackerMotionValues;
+  usesDocumentCoordinateMapping: boolean;
+  motionGroups: RuntimeMotionGroup[];
+  motionNodes: TransformNode[];
+  motionBasePositions: Map<number, Vector3>;
+  motionStartPositions: Map<number, Vector3>;
+  motionTargetPositions: Map<number, Vector3>;
+  motionBaseRotations: Map<number, MotionRotationSnapshot>;
+  motionStartRotations: Map<number, MotionRotationSnapshot>;
+  motionTargetRotations: Map<number, MotionRotationSnapshot>;
+  motionValues: Map<string, number>;
   motionStartedAt: number;
   motionDurationMs: number;
 }
@@ -176,7 +185,7 @@ export class SceneDataDrivenRuntime {
       return false;
     }
 
-    return this.getStackerMotionNodes(groups).length > 0;
+    return this.getMotionNodes(Object.values(groups)).length > 0;
   }
 
   /** 读取当前可驱动 Stacker 的模拟参数，优先使用模型脚本 dataDriven.simulation。 */
@@ -323,11 +332,12 @@ export class SceneDataDrivenRuntime {
       return existing;
     }
 
-    const rawMotionGroups = this.createStackerMotionGroups(target);
-    const isStacker = this.isStackerTarget(target, rawMotionGroups);
-    const stackerMotionGroups = isStacker ? rawMotionGroups : this.createEmptyStackerMotionGroups();
-    const stackerMotionNodes = this.getStackerMotionNodes(stackerMotionGroups);
-    const stackerMotionBasePositions = this.captureNodePositions(stackerMotionNodes);
+    const legacyStackerGroups = this.createStackerMotionGroups(target);
+    const isStacker = this.isStackerTarget(target, legacyStackerGroups);
+    const motionGroups = this.createMotionGroups(target, isStacker, legacyStackerGroups);
+    const motionNodes = this.getMotionNodes(motionGroups);
+    const motionBasePositions = this.captureNodePositions(motionNodes);
+    const motionBaseRotations = this.captureNodeRotations(motionNodes);
     const rotationY = target.root.rotationQuaternion ? undefined : target.root.rotation.y;
     const state: DataDrivenTargetState = {
       target,
@@ -338,17 +348,16 @@ export class SceneDataDrivenRuntime {
       rootBaseRotationY: rotationY,
       rootStartRotationY: rotationY,
       rootTargetRotationY: rotationY,
-      stackerMotionGroups,
-      stackerMotionNodes,
-      stackerMotionBasePositions,
-      stackerMotionStartPositions: this.captureNodePositions(stackerMotionNodes),
-      stackerMotionTargetPositions: this.captureNodePositions(stackerMotionNodes),
-      stackerMotionValues: {
-        travel: 0,
-        lift: 0,
-        fork: 0,
-        forkSide: 0
-      },
+      usesDocumentCoordinateMapping: Boolean(target.dataDriven?.device) || isStacker,
+      motionGroups,
+      motionNodes,
+      motionBasePositions,
+      motionStartPositions: this.captureNodePositions(motionNodes),
+      motionTargetPositions: this.captureNodePositions(motionNodes),
+      motionBaseRotations,
+      motionStartRotations: this.captureNodeRotations(motionNodes),
+      motionTargetRotations: this.cloneNodeRotationSnapshots(motionBaseRotations),
+      motionValues: this.createInitialMotionValues(motionGroups),
       motionStartedAt: now,
       motionDurationMs: 0
     };
@@ -361,6 +370,31 @@ export class SceneDataDrivenRuntime {
     return new Map(nodes.map((node) => [node.uniqueId, node.position.clone()]));
   }
 
+  /** 捕获一组节点的当前旋转，四元数节点保持四元数模式。 */
+  private captureNodeRotations(nodes: TransformNode[]): Map<number, MotionRotationSnapshot> {
+    return new Map(nodes.map((node) => [node.uniqueId, this.captureNodeRotation(node)]));
+  }
+
+  /** 捕获单个节点的当前旋转。 */
+  private captureNodeRotation(node: TransformNode): MotionRotationSnapshot {
+    return node.rotationQuaternion
+      ? { euler: node.rotationQuaternion.toEulerAngles(), quaternion: node.rotationQuaternion.clone() }
+      : { euler: node.rotation.clone() };
+  }
+
+  /** 深拷贝旋转快照，避免插值过程中修改基线。 */
+  private cloneNodeRotationSnapshots(snapshots: Map<number, MotionRotationSnapshot>): Map<number, MotionRotationSnapshot> {
+    return new Map([...snapshots.entries()].map(([key, value]) => [key, this.cloneRotationSnapshot(value)]));
+  }
+
+  /** 深拷贝单个旋转快照。 */
+  private cloneRotationSnapshot(snapshot: MotionRotationSnapshot): MotionRotationSnapshot {
+    return {
+      euler: snapshot.euler.clone(),
+      quaternion: snapshot.quaternion?.clone()
+    };
+  }
+
   /** 退出预览时恢复所有已驱动模型的基线姿态。 */
   private restoreTargets(): void {
     const restoredRoots: TransformNode[] = [];
@@ -369,7 +403,8 @@ export class SceneDataDrivenRuntime {
       if (state.rootBaseRotationY !== undefined && !state.target.root.rotationQuaternion) {
         state.target.root.rotation.y = state.rootBaseRotationY;
       }
-      this.restoreNodePositions(state.stackerMotionNodes, state.stackerMotionBasePositions);
+      this.restoreNodePositions(state.motionNodes, state.motionBasePositions);
+      this.restoreNodeRotations(state.motionNodes, state.motionBaseRotations);
       restoredRoots.push(state.target.root);
     });
 
@@ -388,6 +423,29 @@ export class SceneDataDrivenRuntime {
     });
   }
 
+  /** 批量恢复节点旋转，缺失节点会被跳过以兼容运行时模型重建。 */
+  private restoreNodeRotations(nodes: TransformNode[], rotations: Map<number, MotionRotationSnapshot>): void {
+    nodes.forEach((node) => {
+      const rotation = rotations.get(node.uniqueId);
+      if (rotation) {
+        this.applyRotationSnapshot(node, rotation);
+      }
+    });
+  }
+
+  /** 将旋转快照写回节点，保持节点原本的欧拉角或四元数表达方式。 */
+  private applyRotationSnapshot(node: TransformNode, rotation: MotionRotationSnapshot): void {
+    if (rotation.quaternion) {
+      node.rotationQuaternion = rotation.quaternion.clone();
+      return;
+    }
+
+    if (node.rotationQuaternion) {
+      node.rotationQuaternion = null;
+    }
+    node.rotation.copyFrom(rotation.euler);
+  }
+
   /** 把一帧业务数据写入匹配模型的目标姿态。 */
   private applyFrame(frame: DataFrame, config: SceneDataDrivenSnapshot, now: number): void {
     const target = this.findTargetForFrame(frame, config);
@@ -402,13 +460,17 @@ export class SceneDataDrivenRuntime {
     state.motionDurationMs = duration;
     state.rootStartPosition = state.target.root.position.clone();
     state.rootTargetPosition = this.createRootTargetPosition(state, frame);
-    if (!state.isStacker && state.rootBaseRotationY !== undefined && !state.target.root.rotationQuaternion) {
+    if (state.rootBaseRotationY !== undefined && !state.target.root.rotationQuaternion) {
       state.rootStartRotationY = state.target.root.rotation.y;
       state.rootTargetRotationY = this.createRootTargetRotationY(state, frame);
     }
-    if (state.isStacker) {
-      state.stackerMotionStartPositions = this.captureNodePositions(state.stackerMotionNodes);
-      state.stackerMotionTargetPositions = this.createStackerMotionTargetPositions(state, frame);
+    const nextMotionValues = this.readMotionGroupValues(frame, state.motionGroups);
+    if (nextMotionValues.size > 0) {
+      this.updateMotionValues(state.motionValues, nextMotionValues);
+      state.motionStartPositions = this.captureNodePositions(state.motionNodes);
+      state.motionTargetPositions = this.createMotionTargetPositions(state);
+      state.motionStartRotations = this.captureNodeRotations(state.motionNodes);
+      state.motionTargetRotations = this.createMotionTargetRotations(state);
     }
 
     if (duration === 0) {
@@ -416,16 +478,16 @@ export class SceneDataDrivenRuntime {
     }
   }
 
-  /** 根据数据帧创建整机根节点目标位置，Stacker 的轨道固定，不移动模型根节点。 */
+  /** 根据数据帧创建整机根节点目标位置，文档坐标的 X/Y/H 对应 Babylon 的 X/Z/Y。 */
   private createRootTargetPosition(state: DataDrivenTargetState, frame: DataFrame): Vector3 {
-    if (state.isStacker) {
-      return state.target.root.position.clone();
-    }
-
     const position = state.target.root.position.clone();
     const x = this.readNumber(frame, ["x", "position.x", "pos.x", "location.x", "root.x"]);
-    const y = this.readNumber(frame, ["y", "position.y", "pos.y", "location.y", "root.y"]);
-    const z = this.readNumber(frame, ["z", "position.z", "pos.z", "location.z", "root.z"]);
+    const yFields = state.usesDocumentCoordinateMapping
+      ? ["h", "height", "position.z", "pos.z", "location.z", "root.z"]
+      : ["y", "position.y", "pos.y", "location.y", "root.y"];
+    const zFields = state.usesDocumentCoordinateMapping ? ["y"] : ["z", "h", "height", "position.z", "pos.z", "location.z", "root.z"];
+    const y = this.readNumber(frame, yFields);
+    const z = this.readNumber(frame, zFields);
     if (x !== undefined) {
       position.x = x;
     }
@@ -438,9 +500,9 @@ export class SceneDataDrivenRuntime {
     return position;
   }
 
-  /** 根据数据帧创建整机朝向，yaw/rotationY 默认按角度解释。 */
+  /** 根据数据帧创建整机朝向，文档 twinspawn 的 r 和 yaw/rotationY 默认按角度解释。 */
   private createRootTargetRotationY(state: DataDrivenTargetState, frame: DataFrame): number | undefined {
-    const rotationY = this.readNumber(frame, ["yaw", "rotationY", "rotation.y", "heading"]);
+    const rotationY = this.readNumber(frame, ["r", "yaw", "rotationY", "rotation.y", "heading"]);
     if (rotationY === undefined) {
       return state.rootTargetRotationY;
     }
@@ -448,36 +510,34 @@ export class SceneDataDrivenRuntime {
     return (rotationY * Math.PI) / 180;
   }
 
-  /** 根据 Stacker 业务帧合成行走、升降和货叉伸缩后的内部部件目标位置。 */
-  private createStackerMotionTargetPositions(state: DataDrivenTargetState, frame: DataFrame): Map<number, Vector3> {
-    const nextValues: Partial<StackerMotionValues> = {
-      travel: this.readMotionGroupValue(frame, state.stackerMotionGroups.travel),
-      lift: this.readMotionGroupValue(frame, state.stackerMotionGroups.lift),
-      fork: this.readMotionGroupValue(frame, state.stackerMotionGroups.fork),
-      forkSide: this.readMotionGroupValue(frame, state.stackerMotionGroups.forkSide)
-    };
-    if (
-      nextValues.travel === undefined &&
-      nextValues.lift === undefined &&
-      nextValues.fork === undefined &&
-      nextValues.forkSide === undefined
-    ) {
-      return new Map(state.stackerMotionTargetPositions);
-    }
-
-    this.updateStackerMotionValues(state.stackerMotionValues, nextValues);
-
+  /** 根据所有 translate 运动组合成内部部件目标位置。 */
+  private createMotionTargetPositions(state: DataDrivenTargetState): Map<number, Vector3> {
     return new Map(
-      state.stackerMotionNodes.map((node) => {
-        const base = state.stackerMotionBasePositions.get(node.uniqueId) ?? node.position;
+      state.motionNodes.map((node) => {
+        const base = state.motionBasePositions.get(node.uniqueId) ?? node.position;
         const position = base.clone();
         const worldDelta = Vector3.Zero();
-        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.travel, state.stackerMotionValues.travel, worldDelta);
-        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.lift, state.stackerMotionValues.lift, worldDelta);
-        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.fork, state.stackerMotionValues.fork, worldDelta);
-        this.addMotionGroupDelta(node, state.target.root, state.stackerMotionGroups.forkSide, state.stackerMotionValues.forkSide, worldDelta);
+        state.motionGroups
+          .filter((group) => group.kind === "translate")
+          .forEach((group) => this.addMotionGroupDelta(node, state.target.root, group, state.motionValues.get(group.key) ?? 0, worldDelta));
         position.addInPlace(this.worldDeltaToParentLocalDelta(node, worldDelta));
         return [node.uniqueId, position];
+      })
+    );
+  }
+
+  /** 根据所有 rotate 运动组合成内部部件目标旋转。 */
+  private createMotionTargetRotations(state: DataDrivenTargetState): Map<number, MotionRotationSnapshot> {
+    return new Map(
+      state.motionNodes.map((node) => {
+        const base = state.motionBaseRotations.get(node.uniqueId) ?? this.captureNodeRotation(node);
+        let rotation = this.cloneRotationSnapshot(base);
+        state.motionGroups
+          .filter((group) => group.kind === "rotate")
+          .forEach((group) => {
+            rotation = this.addMotionGroupRotation(node, group, state.motionValues.get(group.key) ?? 0, rotation);
+          });
+        return [node.uniqueId, rotation];
       })
     );
   }
@@ -487,11 +547,8 @@ export class SceneDataDrivenRuntime {
     const progress =
       state.motionDurationMs <= 0 ? 1 : Math.min(1, Math.max(0, (now - state.motionStartedAt) / state.motionDurationMs));
     const easedProgress = this.easeOutCubic(progress);
-    let changed = state.isStacker
-      ? false
-      : this.copyInterpolatedVector(state.target.root.position, state.rootStartPosition, state.rootTargetPosition, easedProgress);
+    let changed = this.copyInterpolatedVector(state.target.root.position, state.rootStartPosition, state.rootTargetPosition, easedProgress);
     if (
-      !state.isStacker &&
       state.rootStartRotationY !== undefined &&
       state.rootTargetRotationY !== undefined &&
       !state.target.root.rotationQuaternion
@@ -503,7 +560,10 @@ export class SceneDataDrivenRuntime {
       }
     }
     changed =
-      this.applyInterpolatedNodePositions(state.stackerMotionNodes, state.stackerMotionStartPositions, state.stackerMotionTargetPositions, easedProgress) ||
+      this.applyInterpolatedNodePositions(state.motionNodes, state.motionStartPositions, state.motionTargetPositions, easedProgress) ||
+      changed;
+    changed =
+      this.applyInterpolatedNodeRotations(state.motionNodes, state.motionStartRotations, state.motionTargetRotations, easedProgress) ||
       changed;
     return changed;
   }
@@ -526,6 +586,24 @@ export class SceneDataDrivenRuntime {
     return changed;
   }
 
+  /** 批量按插值进度更新子部件旋转。 */
+  private applyInterpolatedNodeRotations(
+    nodes: TransformNode[],
+    starts: Map<number, MotionRotationSnapshot>,
+    targets: Map<number, MotionRotationSnapshot>,
+    progress: number
+  ): boolean {
+    let changed = false;
+    nodes.forEach((node) => {
+      const start = starts.get(node.uniqueId);
+      const target = targets.get(node.uniqueId);
+      if (start && target) {
+        changed = this.copyInterpolatedRotation(node, start, target, progress) || changed;
+      }
+    });
+    return changed;
+  }
+
   /** 把 from 到 to 的插值结果写入 target，数值未变化时返回 false。 */
   private copyInterpolatedVector(target: Vector3, from: Vector3, to: Vector3, progress: number): boolean {
     const nextX = this.lerp(from.x, to.x, progress);
@@ -537,6 +615,40 @@ export class SceneDataDrivenRuntime {
 
     target.set(nextX, nextY, nextZ);
     return true;
+  }
+
+  /** 把 from 到 to 的旋转插值结果写入节点，数值未变化时返回 false。 */
+  private copyInterpolatedRotation(
+    node: TransformNode,
+    from: MotionRotationSnapshot,
+    to: MotionRotationSnapshot,
+    progress: number
+  ): boolean {
+    if (from.quaternion && to.quaternion) {
+      const next = Quaternion.Slerp(from.quaternion, to.quaternion, progress);
+      const current = node.rotationQuaternion ?? Quaternion.Identity();
+      if (this.areQuaternionsClose(current, next)) {
+        return false;
+      }
+
+      node.rotationQuaternion = next;
+      return true;
+    }
+
+    if (node.rotationQuaternion) {
+      node.rotationQuaternion = null;
+    }
+    return this.copyInterpolatedVector(node.rotation, from.euler, to.euler, progress);
+  }
+
+  /** 判断两个四元数是否足够接近，避免每帧无意义地触发刷新。 */
+  private areQuaternionsClose(left: Quaternion, right: Quaternion): boolean {
+    return (
+      Math.abs(left.x - right.x) < 0.000001 &&
+      Math.abs(left.y - right.y) < 0.000001 &&
+      Math.abs(left.z - right.z) < 0.000001 &&
+      Math.abs(left.w - right.w) < 0.000001
+    );
   }
 
   /** 查找一帧数据对应的场景模型；没有设备号且只有一个目标时默认驱动该目标。 */
@@ -572,14 +684,103 @@ export class SceneDataDrivenRuntime {
   /** 从原始 payload 中提取业务数据帧，支持数组、data/payload 包装和用户配置路径。 */
   private extractPayloadFrames(payload: unknown, config: SceneDataDrivenSnapshot): DataFrame[] {
     const scopedPayload = config.payloadPath.trim() ? this.readPath(payload, config.payloadPath.trim()) : payload;
+    const normalizedPayload = this.normalizeDocumentJointPayload(scopedPayload);
     const frames: DataFrame[] = [];
-    this.collectFrames(scopedPayload, frames, this.getCommonFrameFieldNames(config));
+    this.collectFrames(normalizedPayload, frames, this.getCommonFrameFieldNames(config));
     return frames;
+  }
+
+  /** 将 MQTT 文档的 {e,p,v} 关节点位格式归一化为运行时可直接读取的 {e,[p]:v} 帧。 */
+  private normalizeDocumentJointPayload(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      const jointRecords = value.filter((item) => this.isDocumentJointRecord(item));
+      if (jointRecords.length === 0 || jointRecords.length !== value.length) {
+        return value;
+      }
+
+      const groupedFrames = new Map<string, Record<string, unknown>>();
+      jointRecords.forEach((record) => {
+        const pointName = this.readJointPointName(record);
+        if (!pointName) {
+          return;
+        }
+
+        const deviceId = this.readJointDeviceId(record);
+        const frameKey = deviceId ?? `__anonymous_${groupedFrames.size}`;
+        const frame = groupedFrames.get(frameKey) ?? {};
+        if (deviceId) {
+          frame.e = deviceId;
+        }
+        if (record.ts !== undefined) {
+          frame.ts = record.ts;
+        }
+        frame[pointName] = record.v;
+        groupedFrames.set(frameKey, frame);
+      });
+      return [...groupedFrames.values()];
+    }
+
+    if (!this.isDocumentJointRecord(value)) {
+      return value;
+    }
+
+    const pointName = this.readJointPointName(value);
+    if (!pointName) {
+      return value;
+    }
+
+    const frame: Record<string, unknown> = { [pointName]: value.v };
+    const deviceId = this.readJointDeviceId(value);
+    if (deviceId) {
+      frame.e = deviceId;
+    }
+    if (value.ts !== undefined) {
+      frame.ts = value.ts;
+    }
+    return frame;
+  }
+
+  /** 判断对象是否符合文档 twindatadriven/joint 的单点位格式。 */
+  private isDocumentJointRecord(value: unknown): value is Record<string, unknown> & { v: unknown } {
+    if (!this.isRecord(value)) {
+      return false;
+    }
+    return Boolean(this.readJointPointName(value) && value.v !== undefined);
+  }
+
+  /** 读取文档 joint 消息中的设备编号，支持字符串和数字编号。 */
+  private readJointDeviceId(record: Record<string, unknown>): string | undefined {
+    const value = record.e;
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+    return undefined;
+  }
+
+  /** 读取文档 joint 消息中的点位名称，空名称不参与运动映射。 */
+  private readJointPointName(record: Record<string, unknown>): string | undefined {
+    const value = record.p;
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+    return undefined;
   }
 
   /** 递归收集 payload 中可能的业务帧，达到上限后立即停止展开。 */
   private collectFrames(value: unknown, output: DataFrame[], commonFieldNames: string[]): void {
     if (output.length >= MAX_FRAMES_PER_MESSAGE) {
+      return;
+    }
+
+    const normalizedValue = this.normalizeDocumentJointPayload(value);
+    if (normalizedValue !== value) {
+      this.collectFrames(normalizedValue, output, commonFieldNames);
       return;
     }
 
@@ -624,18 +825,24 @@ export class SceneDataDrivenRuntime {
       "x",
       "y",
       "z",
+      "h",
       "position",
       "pos",
       "location",
+      "travel_pos",
       "trackZ",
       "travelZ",
       "travel",
+      "lift_pos",
       "liftY",
       "lift",
       "platformY",
+      "fork_extend",
       "forkExtend",
       "forkX",
+      "fork_side",
       "forkZ",
+      "r",
       "yaw",
       "rotationY"
     ].some((key) => value[key] !== undefined);
@@ -657,6 +864,8 @@ export class SceneDataDrivenRuntime {
     return this.dedupeStrings([
       config.deviceIdField,
       ...this.options.getTargets().map((target) => target.dataDriven?.device?.deviceIdField),
+      "e",
+      "devId",
       "deviceId",
       "deviceID",
       "id",
@@ -711,6 +920,8 @@ export class SceneDataDrivenRuntime {
     return this.dedupeStrings([
       target.dataDriven?.device?.deviceIdField,
       config.deviceIdField,
+      "e",
+      "devId",
       "deviceId",
       "deviceID",
       "id",
@@ -739,14 +950,26 @@ export class SceneDataDrivenRuntime {
     return group.fields.length > 0 ? this.readNumber(frame, group.fields) : undefined;
   }
 
-  /** 更新 Stacker 运动组最近一次目标值，缺失字段沿用上一帧。 */
-  private updateStackerMotionValues(current: StackerMotionValues, next: Partial<StackerMotionValues>): void {
-    (["travel", "lift", "fork", "forkSide"] as const).forEach((key) => {
-      const value = next[key];
+  /** 读取本帧命中的所有运动组数值。 */
+  private readMotionGroupValues(frame: DataFrame, groups: RuntimeMotionGroup[]): Map<string, number> {
+    const values = new Map<string, number>();
+    groups.forEach((group) => {
+      const value = this.readMotionGroupValue(frame, group);
       if (value !== undefined) {
-        current[key] = value;
+        values.set(group.key, value);
       }
     });
+    return values;
+  }
+
+  /** 创建运动组目标值缓存，未上报字段按 0 解释为基线姿态。 */
+  private createInitialMotionValues(groups: RuntimeMotionGroup[]): Map<string, number> {
+    return new Map(groups.map((group) => [group.key, 0]));
+  }
+
+  /** 更新运动组最近一次目标值，缺失字段沿用上一帧。 */
+  private updateMotionValues(current: Map<string, number>, next: Map<string, number>): void {
+    next.forEach((value, key) => current.set(key, value));
   }
 
   /** 若节点属于某运动组的顶层参与节点，则按模型根节点局部轴合成世界位移。 */
@@ -768,6 +991,45 @@ export class SceneDataDrivenRuntime {
     this.addModelLocalAxisDelta(worldDelta, root, group.axis, value);
   }
 
+  /** 若节点属于某旋转组的顶层参与节点，则按节点自身局部轴合成目标旋转。 */
+  private addMotionGroupRotation(
+    node: TransformNode,
+    group: RuntimeMotionGroup,
+    value: number,
+    current: MotionRotationSnapshot
+  ): MotionRotationSnapshot {
+    if (value === 0 || group.nodes.length === 0 || !group.nodes.some((item) => item.uniqueId === node.uniqueId)) {
+      return current;
+    }
+
+    if (this.hasAncestorInSet(node, group.nodes)) {
+      return current;
+    }
+
+    const radians = (value * Math.PI) / 180;
+    if (current.quaternion) {
+      return {
+        euler: current.euler.clone(),
+        quaternion: current.quaternion.multiply(Quaternion.RotationAxis(this.getLocalAxisVector(group.axis), radians))
+      };
+    }
+
+    const euler = current.euler.clone();
+    if (group.axis === "x") {
+      euler.x += radians;
+    } else if (group.axis === "y") {
+      euler.y += radians;
+    } else {
+      euler.z += radians;
+    }
+    return { euler };
+  }
+
+  /** 读取局部坐标轴单位向量。 */
+  private getLocalAxisVector(axis: ModelDataDrivenAxis): Vector3 {
+    return axis === "x" ? new Vector3(1, 0, 0) : axis === "y" ? new Vector3(0, 1, 0) : new Vector3(0, 0, 1);
+  }
+
   /** 按模型根节点局部轴累加世界位移，忽略根节点缩放以保持 payload 米制距离。 */
   private addModelLocalAxisDelta(target: Vector3, root: TransformNode, axis: ModelDataDrivenAxis, value: number): void {
     if (value === 0) {
@@ -784,7 +1046,7 @@ export class SceneDataDrivenRuntime {
 
   /** 将模型根节点局部轴转换为世界方向，只保留方向并归一化，不携带根节点缩放。 */
   private modelLocalAxisToWorldDirection(root: TransformNode, axis: ModelDataDrivenAxis): Vector3 {
-    const localAxis = axis === "x" ? new Vector3(1, 0, 0) : axis === "y" ? new Vector3(0, 1, 0) : new Vector3(0, 0, 1);
+    const localAxis = this.getLocalAxisVector(axis);
     root.computeWorldMatrix(true);
     const worldAxis = Vector3.TransformNormal(localAxis, root.getWorldMatrix());
     const lengthSquared = worldAxis.lengthSquared();
@@ -795,8 +1057,25 @@ export class SceneDataDrivenRuntime {
     return worldAxis.scale(1 / Math.sqrt(lengthSquared));
   }
 
-  /** 根据模型脚本或旧 Stacker 兜底规则创建四类运动组。 */
-  private createStackerMotionGroups(target: SceneDataDrivenTarget): StackerMotionGroups {
+  /** 根据模型脚本或旧 Stacker 兜底规则创建最终生效的运动组。 */
+  private createMotionGroups(
+    target: SceneDataDrivenTarget,
+    isStacker: boolean,
+    legacyStackerGroups: LegacyStackerMotionGroups
+  ): RuntimeMotionGroup[] {
+    const motion = target.dataDriven?.motion;
+    if (motion) {
+      const fixedNodeNames = target.dataDriven?.fixedNodes?.length ? target.dataDriven.fixedNodes : [];
+      return Object.entries(motion)
+        .map(([key, group]) => this.createRuntimeMotionGroup(key, target.root, group, [], group.axis, [], /$a/, fixedNodeNames, false))
+        .filter((group) => group.fields.length > 0 && group.nodes.length > 0);
+    }
+
+    return isStacker ? Object.values(legacyStackerGroups).filter((group) => group.fields.length > 0 && group.nodes.length > 0) : [];
+  }
+
+  /** 根据模型脚本或旧 Stacker 兜底规则创建四类 Stacker 运动组。 */
+  private createStackerMotionGroups(target: SceneDataDrivenTarget): LegacyStackerMotionGroups {
     const motion = target.dataDriven?.motion;
     const useLegacyFallback = !motion;
     const fixedNodeNames = target.dataDriven?.fixedNodes?.length ? target.dataDriven.fixedNodes : useLegacyFallback ? STACKER_TRACK_NODE_NAMES : [];
@@ -850,7 +1129,7 @@ export class SceneDataDrivenRuntime {
 
   /** 创建一个运行时运动组；模型脚本存在时不再自动套用旧 Stacker 兜底节点。 */
   private createRuntimeMotionGroup(
-    key: StackerMotionGroupKey,
+    key: string,
     root: TransformNode,
     group: ModelDataDrivenMotionGroupDefinition | undefined,
     fallbackFields: string[],
@@ -862,6 +1141,7 @@ export class SceneDataDrivenRuntime {
   ): RuntimeMotionGroup {
     return {
       key,
+      kind: group?.kind ?? "translate",
       fields: group?.fields?.length ? group.fields : useLegacyFallback ? fallbackFields : [],
       axis: group?.axis ?? fallbackAxis,
       nodes: this.findMotionGroupNodes(root, group, fallbackNodeNames, fallbackPattern, fixedNodeNames, useLegacyFallback)
@@ -909,24 +1189,17 @@ export class SceneDataDrivenRuntime {
       .some((token) => normalizedName.includes(token));
   }
 
-  /** 创建空运动组，用于非 Stacker 目标保持根节点位移逻辑。 */
-  private createEmptyStackerMotionGroups(): StackerMotionGroups {
-    return {
-      travel: { key: "travel", fields: [], axis: "z", nodes: [] },
-      lift: { key: "lift", fields: [], axis: "y", nodes: [] },
-      fork: { key: "fork", fields: [], axis: "x", nodes: [] },
-      forkSide: { key: "forkSide", fields: [], axis: "z", nodes: [] }
-    };
-  }
-
   /** 汇总所有参与内部运动的节点并去重。 */
-  private getStackerMotionNodes(groups: StackerMotionGroups): TransformNode[] {
-    return this.dedupeTransformNodes([...groups.travel.nodes, ...groups.lift.nodes, ...groups.fork.nodes, ...groups.forkSide.nodes]);
+  private getMotionNodes(groups: RuntimeMotionGroup[]): TransformNode[] {
+    return this.dedupeTransformNodes(groups.flatMap((group) => group.nodes));
   }
 
   /** 判断目标是否按模型内部部件驱动，避免普通模型包含 fork/platform 名称时误套 Stacker 逻辑。 */
-  private isStackerTarget(target: SceneDataDrivenTarget, groups: StackerMotionGroups): boolean {
-    if (target.dataDriven?.motion && this.getStackerMotionNodes(groups).length > 0) {
+  private isStackerTarget(target: SceneDataDrivenTarget, groups: LegacyStackerMotionGroups): boolean {
+    if (
+      target.dataDriven?.device?.devType === "stacker" ||
+      target.dataDriven?.device?.defaultAssetCode === STACKER_DEMO_DEVICE_ID
+    ) {
       return true;
     }
 
@@ -1041,16 +1314,26 @@ class StackerDemoSimulationConnection implements DataConnection {
     const travelPhase = elapsedSeconds * 0.55;
     const liftPhase = elapsedSeconds * 1.05;
     const deviceIdField = this.config.deviceIdField.trim() || "deviceId";
+    const ts = Date.now();
     this.onMessage(
-      JSON.stringify({
-        [deviceIdField]: settings.deviceId,
-        travelZ: this.round(Math.sin(travelPhase) * settings.travelRange),
-        z: this.round(Math.sin(travelPhase) * settings.travelRange),
-        liftY: this.round(settings.liftBase + ((Math.sin(liftPhase) + 1) / 2) * settings.liftRange),
-        forkExtend: this.round(((Math.sin(liftPhase + Math.PI / 3) + 1) / 2) * settings.forkRange),
-        forkZ: this.round(Math.sin(travelPhase * 1.35) * settings.forkSideRange),
-        status: "simulated"
-      })
+      JSON.stringify([
+        { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "travel_pos", v: this.round(Math.sin(travelPhase) * settings.travelRange), ts },
+        {
+          e: settings.deviceId,
+          [deviceIdField]: settings.deviceId,
+          p: "lift_pos",
+          v: this.round(settings.liftBase + ((Math.sin(liftPhase) + 1) / 2) * settings.liftRange),
+          ts
+        },
+        {
+          e: settings.deviceId,
+          [deviceIdField]: settings.deviceId,
+          p: "fork_extend",
+          v: this.round(((Math.sin(liftPhase + Math.PI / 3) + 1) / 2) * settings.forkRange),
+          ts
+        },
+        { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "fork_side", v: this.round(Math.sin(travelPhase * 1.35) * settings.forkSideRange), ts }
+      ])
     );
   }
 

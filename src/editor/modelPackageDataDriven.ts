@@ -4,6 +4,7 @@ import type {
   ModelDataDrivenDefinition,
   ModelDataDrivenDeviceDefinition,
   ModelDataDrivenMotionGroupDefinition,
+  ModelDataDrivenMotionKind,
   ModelDataDrivenSimulationDefinition
 } from "../types/editor";
 
@@ -196,10 +197,14 @@ function normalizeDeviceDefinition(record: Record<string, LiteralValue> | undefi
   }
 
   const device: ModelDataDrivenDeviceDefinition = {};
+  const devType = readString(record.devType);
   const defaultAssetCode = readString(record.defaultAssetCode);
   const deviceIdField = readString(record.deviceIdField);
   const assetCodeField = readString(record.assetCodeField);
   const interpolationMs = readNonNegativeNumber(record.interpolationMs);
+  if (devType) {
+    device.devType = devType;
+  }
   if (defaultAssetCode) {
     device.defaultAssetCode = defaultAssetCode;
   }
@@ -242,6 +247,10 @@ function normalizeMotionDefinitions(
     }
 
     const group: ModelDataDrivenMotionGroupDefinition = { fields, axis, nodes };
+    const kind = readMotionKind(groupRecord.kind);
+    if (kind) {
+      group.kind = kind;
+    }
     const fallbackPattern = readString(groupRecord.fallbackPattern);
     if (fallbackPattern) {
       group.fallbackPattern = fallbackPattern;
@@ -299,6 +308,12 @@ function readStringArray(value: LiteralValue | undefined): string[] {
 function readAxis(value: LiteralValue | undefined): ModelDataDrivenAxis | undefined {
   const axis = readString(value);
   return axis === "x" || axis === "y" || axis === "z" ? axis : undefined;
+}
+
+/** 读取运动类型，未声明时由运行时按 translate 兼容处理。 */
+function readMotionKind(value: LiteralValue | undefined): ModelDataDrivenMotionKind | undefined {
+  const kind = readString(value);
+  return kind === "translate" || kind === "rotate" ? kind : undefined;
 }
 
 /** 读取非空字符串。 */

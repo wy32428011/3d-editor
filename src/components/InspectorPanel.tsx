@@ -55,9 +55,9 @@ const dataSourceTypeLabels: Record<SceneDataSourceType, string> = {
   websocket: "WebSocket",
   mqtt: "MQTT"
 };
-const stackerDemoDeviceId = "stacker";
+const stackerDemoDeviceId = "Stacker01";
 const stackerDemoEndpoint = "ws://127.0.0.1:18083/stacker";
-const stackerDemoTopic = "digital-twin/stacker/state";
+const stackerDemoTopic = "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
 
 /** 右侧属性面板负责按当前目标编辑对象属性或场景级属性。 */
 export function InspectorPanel({
@@ -557,7 +557,7 @@ function NodeDataDrivenEditor({
       dataSourceType: "websocket",
       dataEndpoint: stackerDemoEndpoint,
       dataChannel: stackerDemoTopic,
-      deviceIdField: "deviceId",
+      deviceIdField: "e",
       assetCodeField: "assetCode",
       payloadPath: "",
       interpolationMs: 200,
@@ -602,7 +602,7 @@ function NodeDataDrivenEditor({
         <input
           className="inspector-input"
           disabled={nodeLocked}
-          placeholder="stacker"
+          placeholder="Stacker01"
           title="写入对象资产编号，用于匹配数据包中的设备号"
           value={selection.assetInfo.assetCode}
           onInput={(event) => onNodeChange({ assetInfo: { assetCode: event.currentTarget.value } })}
