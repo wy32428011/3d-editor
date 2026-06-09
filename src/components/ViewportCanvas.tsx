@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import type { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { BabylonEditorEngine } from "../engine/BabylonEditorEngine";
 import { isPoiKind } from "../editor/poiCatalog";
-import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind } from "../types/editor";
+import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind, TransformSnapshot } from "../types/editor";
 
 interface ViewportCanvasProps {
   callbacks: EditorEngineCallbacks;
@@ -12,7 +12,17 @@ interface ViewportCanvasProps {
   onEngineReady: (engine: BabylonEditorEngine | null) => void;
   onDropAsset: (assetId: string, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
   onDropFiles: (files: FileList, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
+  onModelContextMenu: (target: TransformSnapshot | null, point: { x: number; y: number }) => void;
 }
+
+interface RightPointerState {
+  x: number;
+  y: number;
+  dragged: boolean;
+}
+
+const RIGHT_BUTTON = 2;
+const CONTEXT_MENU_DRAG_THRESHOLD = 6;
 
 /** 中央视口承载 Babylon canvas，并处理文件拖拽和内置资产拖拽。 */
 export function ViewportCanvas({
@@ -22,11 +32,13 @@ export function ViewportCanvas({
   previewMode,
   onEngineReady,
   onDropAsset,
-  onDropFiles
+  onDropFiles,
+  onModelContextMenu
 }: ViewportCanvasProps) {
   const shellRef = useRef<HTMLElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<BabylonEditorEngine | null>(null);
+  const rightPointerRef = useRef<RightPointerState | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) {
@@ -106,8 +118,59 @@ export function ViewportCanvas({
     }
   };
 
+  /** 记录右键按下位置，用于区分菜单点击和右键拖动画面。 */
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== RIGHT_BUTTON) {
+      return;
+    }
+
+    rightPointerRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      dragged: false
+    };
+  };
+
+  /** 超过阈值的右键移动视为相机平移，不再弹出模型菜单。 */
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const pointer = rightPointerRef.current;
+    if (!pointer) {
+      return;
+    }
+
+    const distance = Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y);
+    if (distance > CONTEXT_MENU_DRAG_THRESHOLD) {
+      pointer.dragged = true;
+    }
+  };
+
+  /** 右键菜单只在未拖拽且命中可编辑场景对象时打开。 */
+  const handleContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const pointer = rightPointerRef.current;
+    const dragged =
+      pointer?.dragged ||
+      (pointer ? Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) > CONTEXT_MENU_DRAG_THRESHOLD : false);
+    rightPointerRef.current = null;
+    if (dragged) {
+      onModelContextMenu(null, { x: event.clientX, y: event.clientY });
+      return;
+    }
+
+    const target = engineRef.current?.pickContextMenuTargetFromClient(event.clientX, event.clientY) ?? null;
+    onModelContextMenu(target, { x: event.clientX, y: event.clientY });
+  };
+
   return (
-    <main ref={shellRef} className="viewport-shell" onDragOver={handleDragOver} onDrop={handleDrop}>
+    <main
+      ref={shellRef}
+      className="viewport-shell"
+      onContextMenu={handleContextMenu}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+    >
       <canvas ref={canvasRef} className="viewport-canvas" />
     </main>
   );

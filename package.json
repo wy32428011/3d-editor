@@ -34,7 +34,7 @@
   },
   "build": {
     "appId": "com.local.babylon3deditor",
-    "productName": "Babylon 3D Editor",
+    "productName": "zdzn 3D Editor",
     "asar": false,
     "directories": {
       "output": "release",
@@ -67,9 +67,6 @@
     }
   },
   "description": "基于 Babylon.js 技术栈实现的桌面 3D 场景编辑器原型，目标是提供接近 Unity Scene View 的基础编辑体验：层级树、中央 3D 视口、属性面板、资产浏览器、拖拽创建、拖拽导入、Gizmo 变换和场景保存。当前工程已接入 Electron，可生成 Windows 安装程序。",
-  "directories": {
-    "doc": "docs"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wy32428011/3d-editor.git"

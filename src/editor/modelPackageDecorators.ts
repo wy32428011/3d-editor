@@ -6,9 +6,11 @@ interface ParsedDecoratorResult {
 }
 
 const NUMBER_DECORATOR_PATTERN = /@visibleAsNumber\(\s*["']([^"']+)["']\s*(?:,\s*\{([^}]*)\})?\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*number\s*=\s*(-?\d+(?:\.\d+)?)/g;
-const COLOR3_DECORATOR_PATTERN = /@visibleAsColor3\(\s*["']([^"']+)["']\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*Color3\s*=\s*new\s+Color3\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g;
-const STRING_DECORATOR_PATTERN = /@visibleAsString\(\s*["']([^"']+)["']\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*string\s*=\s*(["'])(.*?)\3/g;
-const BOOLEAN_DECORATOR_PATTERN = /@visibleAsBoolean\(\s*["']([^"']+)["']\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*boolean\s*=\s*(true|false)/g;
+const COLOR3_DECORATOR_PATTERN = /@visibleAsColor3\(\s*["']([^"']+)["']\s*(?:,\s*\{([^}]*)\})?\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*Color3\s*=\s*new\s+Color3\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g;
+const STRING_DECORATOR_PATTERN = /@visibleAsString\(\s*["']([^"']+)["']\s*(?:,\s*\{([^}]*)\})?\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*string\s*=\s*(["'])(.*?)\4/g;
+const BOOLEAN_DECORATOR_PATTERN = /@visibleAsBoolean\(\s*["']([^"']+)["']\s*(?:,\s*\{([^}]*)\})?\s*\)\s*(?:private\s+|public\s+|protected\s+)?([A-Za-z_$][\w$]*)\s*:\s*boolean\s*=\s*(true|false)/g;
+const VISIBLE_DECORATOR_PATTERN = /@visibleAs(?:Number|String|Boolean|Color3)\s*\(/;
+const DEFAULT_EXPORT_CLASS_PATTERN = /export\s+default\s+class\s+([A-Za-z_$][\w$]*)/;
 
 /**
  * 静态解析模型包脚本中的属性面板装饰器，不执行脚本代码。
@@ -39,7 +41,7 @@ export function parseModelPackageDecorators(scriptText: string, sourceFile: stri
   }
 
   for (const match of scriptText.matchAll(COLOR3_DECORATOR_PATTERN)) {
-    const [, label, key, rText, gText, bText] = match;
+    const [, label, , key, rText, gText, bText] = match;
     const defaultValue: Color3Snapshot = {
       r: Number(rText),
       g: Number(gText),
@@ -60,7 +62,7 @@ export function parseModelPackageDecorators(scriptText: string, sourceFile: stri
   }
 
   for (const match of scriptText.matchAll(STRING_DECORATOR_PATTERN)) {
-    const [, label, key, , defaultValue] = match;
+    const [, label, , key, , defaultValue] = match;
     matches.push({
       index: match.index ?? 0,
       field: {
@@ -76,7 +78,7 @@ export function parseModelPackageDecorators(scriptText: string, sourceFile: stri
   }
 
   for (const match of scriptText.matchAll(BOOLEAN_DECORATOR_PATTERN)) {
-    const [, label, key, defaultText] = match;
+    const [, label, , key, defaultText] = match;
     matches.push({
       index: match.index ?? 0,
       field: {
@@ -100,6 +102,17 @@ export function parseModelPackageDecorators(scriptText: string, sourceFile: stri
   }
 
   return { fields, warnings };
+}
+
+/** 判断脚本是否声明了可见参数装饰器，供模型包导入时在多个 TS 中选择真正的参数脚本。 */
+export function hasModelPackageVisibleDecorators(scriptText: string): boolean {
+  return VISIBLE_DECORATOR_PATTERN.test(scriptText);
+}
+
+/** 静态读取默认导出的类名，兼容旧模型脚本的 XxxComponent 运行类。 */
+export function parseModelPackageDefaultExportClassName(scriptText: string): string | undefined {
+  const match = scriptText.match(DEFAULT_EXPORT_CLASS_PATTERN);
+  return match?.[1];
 }
 
 /** 解析 visibleAsNumber 的 min/max/step 简单对象参数。 */

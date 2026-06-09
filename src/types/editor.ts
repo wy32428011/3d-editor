@@ -4,7 +4,7 @@ import type { ModelSourceUnit, UnitInferenceConfidence, UnitInferenceMethod } fr
 export type EditorTool = "select" | "move" | "rotate" | "scale";
 
 /** 可通过工具栏或资产面板创建的基础对象类型。 */
-export type PrimitiveKind = "cube" | "sphere" | "cylinder" | "ground" | "light";
+export type PrimitiveKind = "cube" | "sphere" | "cylinder" | "ground" | "light" | "locatorWireCube";
 
 /** POI 库提供的业务组件类型，旧版类型保留用于恢复历史场景。 */
 export type PoiKind =
@@ -91,7 +91,7 @@ export interface PoiRuntimeState {
 }
 
 /** 场景层级树中的节点类别。 */
-export type SceneNodeKind = "Mesh" | "Transform" | "Light" | "Camera" | "POI" | "CAD" | "Helper" | "Group";
+export type SceneNodeKind = "Mesh" | "Transform" | "Light" | "Camera" | "POI" | "CAD" | "Locator" | "Helper" | "Group";
 
 /** 三维向量快照，用于 React 面板和 Babylon 对象之间传值。 */
 export interface Vector3Snapshot {
@@ -113,6 +113,12 @@ export type DynamicParameterValue = number | string | boolean | Color3Snapshot;
 /** 当前支持从 TypeScript 装饰器静态解析出的参数控件类型。 */
 export type DynamicInspectorFieldKind = "number" | "color3" | "string" | "boolean";
 
+/** 模型包动态参数在属性面板和运行脚本之间传递的单位。 */
+export type DynamicInspectorFieldUnit = "m" | "count" | "degree" | "ratio";
+
+/** 模型包动态参数的物理语义，用于区分长度、数量和角度等数值。 */
+export type DynamicInspectorFieldPhysicalKind = "length" | "distance" | "count" | "angle" | "ratio";
+
 /** 模型包脚本中暴露给属性面板的动态字段定义。 */
 export interface DynamicInspectorField {
   id: string;
@@ -120,6 +126,8 @@ export interface DynamicInspectorField {
   label: string;
   kind: DynamicInspectorFieldKind;
   defaultValue: DynamicParameterValue;
+  unit?: DynamicInspectorFieldUnit;
+  physicalKind?: DynamicInspectorFieldPhysicalKind;
   min?: number;
   max?: number;
   step?: number;
@@ -201,6 +209,8 @@ export interface ModelPackageManifest {
   meta?: unknown;
   files: ModelPackageProjectFile[];
   dynamicFields: DynamicInspectorField[];
+  /** meta.json 中模型给出的实例初始参数值，首次导入和资产拖入时会覆盖脚本字段默认值。 */
+  initialValues?: Record<string, DynamicParameterValue>;
   warnings: string[];
   importedAt: number;
 }
@@ -244,6 +254,48 @@ export interface AssetInfoSnapshot {
   sourceFile?: string;
 }
 
+/** 定位线框立方体的数据驱动接收端配置，保存到 metadata.editor.locatorAnimationConnection。 */
+export interface LocatorAnimationConnectionSnapshot {
+  version: 1;
+  enabled: boolean;
+  assetCode: string;
+  deviceIdField: string;
+  assetCodeField: string;
+  positionXField: string;
+  positionYField: string;
+  positionZField: string;
+  rotationYField: string;
+  interpolationMs: number;
+}
+
+/** 定位线框立方体动画连接配置的面板增量。 */
+export type LocatorAnimationConnectionUpdate = Partial<Omit<LocatorAnimationConnectionSnapshot, "version">>;
+
+/** 模型阵列支持的地面轴向，Z 对应 Babylon 地面深度方向，负号表示世界坐标负向。 */
+export type ModelArrayAxis = "x" | "-x" | "z" | "-z";
+
+/** 从场景节点反向定位到底部资源库的目标。 */
+export type AssetLibraryFocusTarget =
+  | { type: "asset"; assetId: string }
+  | { type: "primitive"; primitiveKind: PrimitiveKind }
+  | { type: "poi"; poiKind: PoiKind };
+
+/** 创建模型阵列时由 UI 传入的参数，数量表示新增副本数。 */
+export interface ModelArrayOptions {
+  targetId: number;
+  axis: ModelArrayAxis;
+  count: number;
+  spacing: number;
+}
+
+/** 模型阵列命令结果，失败时 message 直接用于界面提示。 */
+export interface ModelArrayResult {
+  success: boolean;
+  createdCount: number;
+  message?: string;
+  selectedNode?: TransformSnapshot;
+}
+
 /** 当前选中对象的可编辑属性快照。 */
 export interface TransformSnapshot {
   id: number;
@@ -262,6 +314,10 @@ export interface TransformSnapshot {
   locked: boolean;
   /** 当前节点是否继承了父级 group 的锁定。 */
   lockedByAncestor: boolean;
+  /** 当前节点在模型树中是否存在可展示子级，用于视口右键菜单判断子级命令。 */
+  hasChildren: boolean;
+  /** 当前节点在模型树中的父级 ID，根级节点为空。 */
+  parentId?: number;
   meshVertexModify: MeshVertexModifySnapshot;
   assetInfo: AssetInfoSnapshot;
   /** CAD 根节点的整体显示透明度，按 0-1 保存并作用到所有 CAD 线块。 */
@@ -272,6 +328,8 @@ export interface TransformSnapshot {
   poi?: PoiConfigSnapshot;
   /** POI 运行态快照，只用于属性面板展示，不参与保存。 */
   poiRuntime?: PoiRuntimeState;
+  /** 定位线框立方体专属动画连接配置；非定位框为空。 */
+  locatorAnimationConnection?: LocatorAnimationConnectionSnapshot;
 }
 
 /** 属性面板向 Babylon 场景提交的部分更新。 */
@@ -290,6 +348,8 @@ export interface TransformUpdate {
   dynamicParameter?: DynamicParameterUpdate;
   /** 更新 POI 业务组件配置，写入 metadata.editor.poiConfig。 */
   poi?: PoiConfigUpdate;
+  /** 更新定位线框立方体的数据驱动接收端配置。 */
+  locatorAnimationConnection?: LocatorAnimationConnectionUpdate;
 }
 
 /** 场景相机属性快照，当前只暴露编辑视口可视距离。 */
@@ -382,6 +442,20 @@ export const DEFAULT_SCENE_DATA_DRIVEN: SceneDataDrivenSnapshot = {
   credentialProfileId: ""
 };
 
+/** 定位线框立方体动画连接默认值，默认关闭，避免新建定位框被数据帧误命中。 */
+export const DEFAULT_LOCATOR_ANIMATION_CONNECTION: LocatorAnimationConnectionSnapshot = {
+  version: 1,
+  enabled: false,
+  assetCode: "",
+  deviceIdField: "e",
+  assetCodeField: "assetCode",
+  positionXField: "x",
+  positionYField: "h",
+  positionZField: "y",
+  rotationYField: "r",
+  interpolationMs: 200
+};
+
 /** 场景编辑器设置默认值，沿用截图中三项灵敏度的初始数值。 */
 export const DEFAULT_SCENE_EDITOR_SETTINGS: SceneEditorSettingsSnapshot = {
   zoomSensitivity: 10,
@@ -446,6 +520,12 @@ export interface EditorStats {
   activeMeshes: number;
   vertices: number;
   drawCalls: number;
+  hardwareScalingLevel: number;
+  renderWidth: number;
+  renderHeight: number;
+  gpuVendor: string;
+  gpuRenderer: string;
+  contextLost: boolean;
 }
 
 /** Babylon 引擎向 React 外层同步状态的回调集合。 */

@@ -16,7 +16,7 @@ import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { Light } from "@babylonjs/core/Lights/light";
 import { PointLight } from "@babylonjs/core/Lights/pointLight";
-import { HighlightLayer } from "@babylonjs/core/Layers/highlightLayer";
+import { SelectionOutlineLayer } from "@babylonjs/core/Layers/selectionOutlineLayer";
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
@@ -40,6 +40,7 @@ import { Scene } from "@babylonjs/core/scene";
 import type { Animatable } from "@babylonjs/core/Animations/animatable";
 import type { Animation } from "@babylonjs/core/Animations/animation";
 import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
+import { SceneInstrumentation } from "@babylonjs/core/Instrumentation/sceneInstrumentation";
 import earcut from "earcut";
 import { applySnapshotVector, formatBytes, snapshotVector } from "../editor/math";
 import {
@@ -54,8 +55,8 @@ import {
   DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS,
   invokeModelPackageRuntimeLifecycle,
   type ModelPackageRuntimeInstance
-} from "../editor/modelPackageRuntime";
-import { SceneDataDrivenRuntime, type SceneDataDrivenTarget } from "../editor/sceneDataDrivenRuntime";
+} from "../editor/modelPackageRuntimeCompiler";
+import { SceneDataDrivenRuntime, type SceneDataDrivenRootMotionFields, type SceneDataDrivenTarget } from "../editor/sceneDataDrivenRuntime";
 import { SceneBusinessRuntime } from "../editor/sceneBusinessRuntime";
 import {
   parseCadDxfLineStream,
@@ -92,9 +93,10 @@ import {
   EDITOR_GRID_SIZE_METERS,
   SCENE_UNIT_IN_METERS
 } from "../editor/units";
-import { DEFAULT_SCENE_DATA_DRIVEN, DEFAULT_SCENE_EDITOR_SETTINGS } from "../types/editor";
+import { DEFAULT_LOCATOR_ANIMATION_CONNECTION, DEFAULT_SCENE_DATA_DRIVEN, DEFAULT_SCENE_EDITOR_SETTINGS } from "../types/editor";
 import type {
   AssetInfoSnapshot,
+  AssetLibraryFocusTarget,
   AssetRecord,
   DynamicInspectorField,
   DynamicParameterSnapshot,
@@ -104,6 +106,10 @@ import type {
   EditorStats,
   EditorTool,
   MeshVertexModifySnapshot,
+  LocatorAnimationConnectionSnapshot,
+  LocatorAnimationConnectionUpdate,
+  ModelArrayOptions,
+  ModelArrayResult,
   ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
@@ -132,6 +138,13 @@ export const DEFAULT_SCENE_ENVIRONMENT_COLOR = "#26312d";
 const GRID_RENDER_ELEVATION_METERS = 0.015;
 const EDITOR_LENGTH_UNIT = "meter";
 const IMPORTED_MODEL_UNIT_POLICY = "imported-model-coordinates-are-meters";
+const TARGET_HIGH_QUALITY_RENDER_PIXELS = 3840 * 2160;
+const MAX_HIGH_QUALITY_RENDER_SCALE = 4;
+const PERFORMANCE_PREVIEW_MIN_HARDWARE_SCALING_LEVEL = 1.25;
+const HARDWARE_SCALING_LEVEL_EPSILON = 0.01;
+const SELECTION_OUTLINE_COLOR = "#63d7ff";
+const SELECTION_OUTLINE_THICKNESS = 1.8;
+const SELECTION_OUTLINE_TEXTURE_RATIO = 0.5;
 const CAD_LINE_CHUNK_PERSIST_CONCURRENCY = 2;
 const IMPORTED_MODEL_NORMALIZED_UNIT_POLICY = "imported-model-source-units-normalized-to-meters";
 const GRID_MAJOR_LINE_EVERY_CELLS = 5;
@@ -146,6 +159,7 @@ const GRID_FLASH_MAX_VISIBILITY = 1;
 const GRID_FLASH_PULSE_ELEVATION_OFFSET_METERS = 0.026;
 const GRID_FLASH_SWEEP_ELEVATION_OFFSET_METERS = 0.018;
 const MAX_MODEL_PACKAGE_RUNTIME_GENERATED_NODES = 5000;
+const MAX_MODEL_ARRAY_CLONE_COUNT = 50;
 const CAD_LINE_ELEVATION_METERS = GRID_RENDER_ELEVATION_METERS + 0.045;
 const CAD_LINE_CHUNK_SEGMENTS = 32000;
 const CAD_LINE_PACK_MAX_BYTES = 20 * 1024 * 1024;
@@ -439,7 +453,7 @@ export class BabylonEditorEngine {
   private readonly scene: Scene;
   private readonly editorCamera: ArcRotateCamera;
   private readonly gizmoManager: GizmoManager;
-  private readonly highlightLayer: HighlightLayer;
+  private readonly selectionOutlineLayer: SelectionOutlineLayer;
   private readonly assets: AssetRecord[] = [];
   private readonly assetFiles = new Map<string, File>();
   private readonly assetDependencyFiles = new Map<string, File[]>();
@@ -447,11 +461,14 @@ export class BabylonEditorEngine {
   private readonly modelPackageRuntimeHandles = new Map<number, ModelPackageRuntimeHandle>();
   private readonly sceneDataDrivenRuntime: SceneDataDrivenRuntime;
   private readonly sceneBusinessRuntime: SceneBusinessRuntime;
+  private readonly sceneInstrumentation: SceneInstrumentation;
   private readonly localImportFileKeys = new Set<string>();
-  private readonly highlightedMeshes = new Set<Mesh>();
   private selectedNode: TransformNode | null = null;
   private currentTool: EditorTool = "move";
   private performanceMode = false;
+  private webglContextLost = false;
+  private gpuVendor = "未知 GPU";
+  private gpuRenderer = "未知渲染器";
   private previewMode = false;
   private pendingStackerDemoSimulation = false;
   private stackerDemoSimulationActive = false;
@@ -476,6 +493,17 @@ export class BabylonEditorEngine {
   private readonly gridFlashSweepMeshes: AbstractMesh[] = [];
   private readonly observedTransformGizmos = new WeakSet<object>();
   private readonly handleResize = () => this.resize();
+  private readonly handleWebglContextLost = (event: Event) => {
+    event.preventDefault();
+    this.webglContextLost = true;
+    this.callbacks.onStatsChange(this.collectStats());
+  };
+  private readonly handleWebglContextRestored = () => {
+    this.webglContextLost = false;
+    this.captureGpuRendererInfo();
+    this.resize();
+    this.callbacks.onStatsChange(this.collectStats());
+  };
   private cadRestoreGeneration = 0;
 
   /** 初始化渲染引擎、默认场景和所有编辑器输入绑定。 */
@@ -484,15 +512,26 @@ export class BabylonEditorEngine {
     this.callbacks = callbacks;
     this.engine = new Engine(canvas, true, {
       adaptToDeviceRatio: true,
-      preserveDrawingBuffer: true,
-      stencil: true
+      powerPreference: "high-performance",
+      preserveDrawingBuffer: false,
+      stencil: false
     });
     this.scene = new Scene(this.engine);
+    this.sceneInstrumentation = new SceneInstrumentation(this.scene);
+    this.captureGpuRendererInfo();
+    this.bindWebglContextLifecycle();
+    this.applyRenderQuality();
 
     this.editorCamera = this.createEditorCamera();
     this.applySceneEnvironmentColor(DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
     this.gizmoManager = new GizmoManager(this.scene);
-    this.highlightLayer = new HighlightLayer("EditorSelectionHighlight", this.scene);
+    this.selectionOutlineLayer = new SelectionOutlineLayer("EditorSelectionOutline", this.scene, {
+      mainTextureRatio: SELECTION_OUTLINE_TEXTURE_RATIO,
+      mainTextureSamples: 1,
+      useDepthOcclusion: false
+    });
+    this.selectionOutlineLayer.outlineColor = Color3.FromHexString(SELECTION_OUTLINE_COLOR);
+    this.selectionOutlineLayer.outlineThickness = SELECTION_OUTLINE_THICKNESS;
 
     this.configureGizmos();
     this.sceneDataDrivenRuntime = new SceneDataDrivenRuntime({
@@ -537,12 +576,16 @@ export class BabylonEditorEngine {
       this.transformSyncFrame = 0;
     }
     window.removeEventListener("resize", this.handleResize);
+    this.canvas.removeEventListener("webglcontextlost", this.handleWebglContextLost);
+    this.canvas.removeEventListener("webglcontextrestored", this.handleWebglContextRestored);
     this.sceneBusinessRuntime.dispose();
     this.sceneDataDrivenRuntime.stop(false);
     this.stopAllModelPackageRuntimes(false);
     this.disposeClipboardTemplate();
     this.clearRegisteredLocalImportFiles();
-    this.highlightLayer.dispose();
+    this.selectionOutlineLayer.clearSelection();
+    this.sceneInstrumentation.dispose();
+    this.selectionOutlineLayer.dispose();
     this.gizmoManager.dispose();
     this.scene.dispose();
     this.engine.dispose();
@@ -555,6 +598,7 @@ export class BabylonEditorEngine {
 
   /** 同步画布 CSS 尺寸和 WebGL 后备缓冲，避免布局变化后视口变黑或取景错位。 */
   public resize(): void {
+    this.applyRenderQuality();
     this.engine.resize();
     this.updateDynamicGridForCamera();
     this.scene.render();
@@ -569,8 +613,40 @@ export class BabylonEditorEngine {
   /** 开关性能预览模式，在流畅度和编辑精度之间切换。 */
   public setPerformanceMode(enabled: boolean): void {
     this.performanceMode = enabled;
-    this.engine.setHardwareScalingLevel(enabled ? Math.max(1.25, window.devicePixelRatio || 1.25) : 1);
+    this.applyRenderQuality();
     this.scene.skipPointerMovePicking = enabled;
+    this.callbacks.onStatsChange(this.collectStats());
+  }
+
+  /** 按当前模式应用 WebGL 后备缓冲缩放；默认走接近 4K 的高清策略。 */
+  private applyRenderQuality(): void {
+    if (this.webglContextLost) {
+      return;
+    }
+
+    const nextLevel = this.performanceMode
+      ? this.calculatePerformancePreviewHardwareScalingLevel()
+      : this.calculateHighQualityHardwareScalingLevel();
+    const currentLevel = this.engine.getHardwareScalingLevel();
+    if (!Number.isFinite(currentLevel) || Math.abs(currentLevel - nextLevel) > HARDWARE_SCALING_LEVEL_EPSILON) {
+      this.engine.setHardwareScalingLevel(nextLevel);
+    }
+  }
+
+  /** 计算高清模式的硬件缩放值：低于 4K 的视口自动超采样，避免默认画面发糊。 */
+  private calculateHighQualityHardwareScalingLevel(): number {
+    const cssWidth = Math.max(1, this.canvas.clientWidth || this.canvas.width || this.engine.getRenderWidth(true) || 1);
+    const cssHeight = Math.max(1, this.canvas.clientHeight || this.canvas.height || this.engine.getRenderHeight(true) || 1);
+    const cssPixels = cssWidth * cssHeight;
+    const targetRenderScale = Math.sqrt(TARGET_HIGH_QUALITY_RENDER_PIXELS / cssPixels);
+    const renderScale = Math.min(MAX_HIGH_QUALITY_RENDER_SCALE, Math.max(1, targetRenderScale));
+    return 1 / renderScale;
+  }
+
+  /** 计算性能预览的硬件缩放值，保留用户主动降画质换流畅度的能力。 */
+  private calculatePerformancePreviewHardwareScalingLevel(): number {
+    const devicePixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    return Math.max(PERFORMANCE_PREVIEW_MIN_HARDWARE_SCALING_LEVEL, devicePixelRatio);
   }
 
   /** 读取当前场景环境背景色，供 React 项目条色块和项目加载后同步显示。 */
@@ -819,14 +895,32 @@ export class BabylonEditorEngine {
 
   /** 收集当前场景中可由外部数据匹配的模型根节点。 */
   private createSceneDataDrivenTargets(): SceneDataDrivenTarget[] {
-    const roots = new Map<number, TransformNode>();
+    const targets = new Map<number, SceneDataDrivenTarget>();
     const visit = (node: Node): void => {
       if (node.metadata?.[HELPER_FLAG]) {
         return;
       }
 
-      if (node instanceof TransformNode && !this.isEditorGroup(node) && !this.isPoiNode(node) && this.isSceneGraphDisplayNode(node)) {
-        roots.set(node.uniqueId, node);
+      if (node instanceof TransformNode && this.isLocatorWireCubeNode(node) && this.isSceneGraphDisplayNode(node)) {
+        const locatorTarget = this.createLocatorSceneDataDrivenTarget(node);
+        if (locatorTarget) {
+          targets.set(node.uniqueId, locatorTarget);
+        }
+        return;
+      }
+
+      if (
+        node instanceof TransformNode &&
+        !this.isEditorGroup(node) &&
+        !this.isPoiNode(node) &&
+        !this.isLocatorWireCubeNode(node) &&
+        this.isSceneGraphDisplayNode(node)
+      ) {
+        targets.set(node.uniqueId, {
+          root: node,
+          matchFields: this.createSceneDataDrivenMatchFields(node),
+          dataDriven: this.getModelDataDrivenDefinition(node)
+        });
         return;
       }
 
@@ -834,11 +928,56 @@ export class BabylonEditorEngine {
     };
 
     this.scene.rootNodes.forEach(visit);
-    return [...roots.values()].map((root) => ({
+    return [...targets.values()];
+  }
+
+  /** 定位框只有显式启用并配置设备号时才作为数据驱动接收端，避免视觉参考框被误驱动。 */
+  private createLocatorSceneDataDrivenTarget(root: TransformNode): SceneDataDrivenTarget | null {
+    const connection = this.getLocatorAnimationConnection(root);
+    const assetCode = connection.assetCode.trim();
+    if (!connection.enabled || !assetCode) {
+      return null;
+    }
+
+    const assetCodeField = connection.assetCodeField.trim() || DEFAULT_LOCATOR_ANIMATION_CONNECTION.assetCodeField;
+    const deviceIdField = connection.deviceIdField.trim() || DEFAULT_LOCATOR_ANIMATION_CONNECTION.deviceIdField;
+    const matchFields = {
+      [assetCodeField]: assetCode,
+      assetCode,
+      locatorAssetCode: assetCode
+    };
+
+    return {
       root,
-      matchFields: this.createSceneDataDrivenMatchFields(root),
-      dataDriven: this.getModelDataDrivenDefinition(root)
-    }));
+      matchFields,
+      requiresDeviceMatch: true,
+      dataDriven: {
+        device: {
+          defaultAssetCode: assetCode,
+          deviceIdField,
+          assetCodeField,
+          interpolationMs: connection.interpolationMs
+        }
+      },
+      rootMotionFields: this.createLocatorRootMotionFields(connection)
+    };
+  }
+
+  /** 将定位框配置转换为运行态根节点位姿字段，空字段表示该轴不接收数据。 */
+  private createLocatorRootMotionFields(connection: LocatorAnimationConnectionSnapshot): SceneDataDrivenRootMotionFields {
+    return {
+      positionX: this.createLocatorMotionFieldCandidates(connection.positionXField),
+      positionY: this.createLocatorMotionFieldCandidates(connection.positionYField),
+      positionZ: this.createLocatorMotionFieldCandidates(connection.positionZField),
+      rotationY: this.createLocatorMotionFieldCandidates(connection.rotationYField),
+      interpolationMs: connection.interpolationMs
+    };
+  }
+
+  /** 规范化定位框单个运动字段，避免空字符串在运行态误匹配。 */
+  private createLocatorMotionFieldCandidates(field: string): string[] {
+    const normalized = field.trim();
+    return normalized ? [normalized] : [];
   }
 
   /** 收集当前场景中的 POI 根节点，运行态只消费这些轻量业务组件。 */
@@ -861,6 +1000,7 @@ export class BabylonEditorEngine {
         !node.metadata?.[HELPER_FLAG] &&
         !node.metadata?.isPoiRuntimeGenerated &&
         !this.isPoiNode(node) &&
+        !this.isLocatorWireCubeNode(node) &&
         this.isSceneGraphDisplayNode(node)
       ) {
         nodes.set(node.uniqueId, node);
@@ -917,9 +1057,14 @@ export class BabylonEditorEngine {
     return undefined;
   }
 
+  /** 取路径叶子文件名，供资源库反向定位和设备匹配字段复用。 */
+  private getFileName(fileName: string): string {
+    return fileName.split(/[\\/]/).pop() ?? fileName;
+  }
+
   /** 从源文件名中提取无扩展名标识，便于 payload 用 Stacker 这类名称匹配。 */
   private getFileStem(fileName: string): string {
-    const leafName = fileName.split(/[\\/]/).pop() ?? fileName;
+    const leafName = this.getFileName(fileName);
     const dotIndex = leafName.lastIndexOf(".");
     return dotIndex > 0 ? leafName.slice(0, dotIndex) : leafName;
   }
@@ -1095,6 +1240,22 @@ export class BabylonEditorEngine {
     }
   }
 
+  /** 选中指定节点的第一个可展示子级，供“选择子级”右键命令使用。 */
+  public selectFirstChildById(id: number): boolean {
+    const node = this.findTransformNodeByUniqueId(id);
+    if (!node || node.metadata?.[HELPER_FLAG]) {
+      return false;
+    }
+
+    const child = this.getVisibleChildren(node).find((item) => item instanceof TransformNode && this.isSceneGraphDisplayNode(item));
+    if (!(child instanceof TransformNode) || this.isNodeLocked(child)) {
+      return false;
+    }
+
+    this.selectNode(child);
+    return true;
+  }
+
   /** 根据层级面板传入的 uniqueId 快速定位到场景节点。 */
   public focusById(id: number): void {
     const node = this.findTransformNodeByUniqueId(id);
@@ -1127,6 +1288,58 @@ export class BabylonEditorEngine {
     this.scene.render();
   }
 
+  /** 选中对象时切换自身显隐状态，右键和快捷键共用同一入口。 */
+  public toggleSelectedVisibility(): boolean {
+    const node = this.selectedNode;
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+      return false;
+    }
+
+    this.setNodeVisibilityById(node.uniqueId, !this.getNodeVisibility(node));
+    return true;
+  }
+
+  /** 选中对象时切换自身锁定状态，父级锁定对象不允许在子级上反向解锁。 */
+  public toggleSelectedLock(): boolean {
+    const node = this.selectedNode;
+    if (!node || node.metadata?.[HELPER_FLAG] || (this.isNodeLockedByAncestor(node) && !this.isNodeSelfLocked(node))) {
+      return false;
+    }
+
+    this.setNodeLockedById(node.uniqueId, !this.isNodeSelfLocked(node));
+    return true;
+  }
+
+  /** 按当前选中节点反向定位底部资源库卡片，文件夹和 CAD 这类场景对象没有资源库目标。 */
+  public getAssetLibraryFocusTargetById(id: number): AssetLibraryFocusTarget | null {
+    const node = this.findTransformNodeByUniqueId(id);
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isEditorGroup(node) || this.isCadDrawingNode(node)) {
+      return null;
+    }
+
+    if (this.isPoiNode(node)) {
+      return { type: "poi", poiKind: this.getNodePoiConfig(node).kind };
+    }
+
+    const packageRoot = this.findModelPackageRoot(node);
+    if (packageRoot) {
+      const instance = this.asMetadataObject(this.getNodeEditorMetadata(packageRoot).modelPackageInstance);
+      const assetId = typeof instance.assetId === "string" ? instance.assetId : "";
+      if (assetId) {
+        return { type: "asset", assetId };
+      }
+    }
+
+    const sourceFile = this.getNodeSourceFileName(node);
+    const sourceAsset = sourceFile ? this.findAssetBySourceFile(sourceFile) : undefined;
+    if (sourceAsset) {
+      return { type: "asset", assetId: sourceAsset.id };
+    }
+
+    const primitiveKind = this.getPrimitiveKindForAssetFocus(node);
+    return primitiveKind ? { type: "primitive", primitiveKind } : null;
+  }
+
   /** 删除当前选中的可编辑节点，并同步层级树、属性面板和性能统计。 */
   public deleteSelected(): void {
     const node = this.selectedNode;
@@ -1139,6 +1352,76 @@ export class BabylonEditorEngine {
     this.disposeEditableNode(node);
     this.refreshSceneGraph();
     this.callbacks.onStatsChange(this.collectStats());
+  }
+
+  /** 把当前选中节点放入新建逻辑分组，单选结构下用于快捷群组当前对象。 */
+  public groupSelected(): boolean {
+    const node = this.selectedNode;
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+      return false;
+    }
+
+    const previousParent = node.parent instanceof TransformNode ? node.parent : null;
+    const group = new TransformNode(this.createUniqueGroupName(), this.scene);
+    group.position.copyFrom(node.getAbsolutePosition());
+    group.metadata = {
+      [ROOT_FLAG]: true,
+      editor: {
+        nodeType: GROUP_NODE_TYPE
+      }
+    };
+    group.setParent(previousParent);
+    node.setParent(group);
+    this.refreshNodeWorldMatrices(node);
+    this.selectNode(group);
+    this.scene.render();
+    return true;
+  }
+
+  /** 解组当前选中对象：选中 group 时释放其子级，选中子级时移回场景根级。 */
+  public ungroupSelected(): boolean {
+    const node = this.selectedNode;
+    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+      return false;
+    }
+
+    if (this.isEditorGroup(node)) {
+      const targetParent = node.parent instanceof TransformNode ? node.parent : null;
+      const children = this.getVisibleChildren(node).filter((child): child is TransformNode => child instanceof TransformNode);
+      children.forEach((child) => {
+        child.setParent(targetParent);
+        child.metadata = {
+          ...this.asMetadataObject(child.metadata),
+          [ROOT_FLAG]: true
+        };
+        this.refreshNodeWorldMatrices(child);
+      });
+      this.selectNode(children[0] ?? null);
+      this.disposeEditableNode(node);
+      this.refreshSceneGraph();
+      this.scene.render();
+      return true;
+    }
+
+    if (node.parent instanceof TransformNode && this.isEditorGroup(node.parent)) {
+      this.moveNodeToGroup(node.uniqueId, null);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** 单选编辑器中的反选：选择当前节点之后的下一个可编辑树节点。 */
+  public invertSelection(): boolean {
+    const candidates = this.getSelectableSceneGraphNodes();
+    if (candidates.length === 0) {
+      return false;
+    }
+
+    const currentIndex = this.selectedNode ? candidates.findIndex((node) => node.uniqueId === this.selectedNode?.uniqueId) : -1;
+    const nextNode = candidates[(currentIndex + 1 + candidates.length) % candidates.length];
+    this.selectNode(nextNode);
+    return true;
   }
 
   /** 复制当前选中的可编辑节点到引擎内部剪贴板，供后续 Ctrl+V 复用。 */
@@ -1203,6 +1486,132 @@ export class BabylonEditorEngine {
     this.callbacks.onStatsChange(this.collectStats());
     this.scene.render();
     return true;
+  }
+
+  /** 根据视口右键位置拾取可展示上下文菜单的场景对象，阵列等具体命令再单独校验。 */
+  public pickContextMenuTargetFromClient(clientX: number, clientY: number): TransformSnapshot | null {
+    if (this.previewMode) {
+      return null;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const pick = this.scene.pick(
+      clientX - rect.left,
+      clientY - rect.top,
+      (mesh) => mesh.isPickable !== false && !mesh.metadata?.[HELPER_FLAG] && !mesh.metadata?.[DROP_SURFACE_FLAG]
+    );
+    const pickedMesh = pick?.pickedMesh;
+    if (!pickedMesh) {
+      return null;
+    }
+
+    const targetRoot = this.findSelectableRoot(pickedMesh);
+    if (!targetRoot || targetRoot.metadata?.[HELPER_FLAG]) {
+      return null;
+    }
+
+    this.selectNode(targetRoot);
+    return this.createTransformSnapshot(targetRoot);
+  }
+
+  /** 沿地面 X/Z 轴批量克隆指定模型，生成的副本是普通可编辑场景节点。 */
+  public createModelArray(options: ModelArrayOptions): ModelArrayResult {
+    if (this.previewMode) {
+      return this.createModelArrayFailure("预览模式正在播放场景，请先停止预览再创建模型阵列。");
+    }
+
+    const cloneCount = options.count;
+    if (
+      !Number.isFinite(cloneCount) ||
+      !Number.isInteger(cloneCount) ||
+      cloneCount < 1 ||
+      cloneCount > MAX_MODEL_ARRAY_CLONE_COUNT
+    ) {
+      return this.createModelArrayFailure(`克隆数量必须是 1-${MAX_MODEL_ARRAY_CLONE_COUNT} 之间的整数。`);
+    }
+
+    if (!Number.isFinite(options.spacing) || options.spacing <= 0) {
+      return this.createModelArrayFailure("阵列间距必须是大于 0 的米制数值。");
+    }
+
+    const sourceRoot = this.getModelArrayTargetRoot(this.findTransformNodeByUniqueId(options.targetId));
+    if (!sourceRoot) {
+      return this.createModelArrayFailure("当前选择不可创建模型阵列，请选择未锁定的普通模型。");
+    }
+
+    const directionByAxis: Partial<Record<string, Vector3>> = {
+      x: new Vector3(1, 0, 0),
+      "-x": new Vector3(-1, 0, 0),
+      z: new Vector3(0, 0, 1),
+      "-z": new Vector3(0, 0, -1)
+    };
+    const direction = directionByAxis[options.axis];
+    if (!direction) {
+      return this.createModelArrayFailure("阵列轴向必须是 X、-X、Z 或 -Z。");
+    }
+    const sourceParent = sourceRoot.parent instanceof TransformNode ? sourceRoot.parent : null;
+    const sourceModelPackage = this.getModelPackageAssetForRoot(sourceRoot)?.modelPackage;
+    const usedAssetCodes = this.collectSceneAssetCodes();
+    const sourceAssetCode = this.getNodeAssetInfo(sourceRoot).assetCode.trim();
+    const clones: TransformNode[] = [];
+    let sourceRuntimeStopped = false;
+
+    try {
+      this.cleanupPoiRuntimeInHierarchy(sourceRoot);
+      if (sourceModelPackage) {
+        this.stopModelPackageRuntime(sourceRoot, true);
+        sourceRuntimeStopped = true;
+      }
+
+      for (let index = 1; index <= cloneCount; index += 1) {
+        const cloneName = this.createUniqueArrayCopyName(sourceRoot.name, index);
+        const clone = this.cloneEditableNode(sourceRoot, cloneName, sourceParent);
+        if (!clone) {
+          throw new Error("克隆模型节点失败。");
+        }
+
+        this.prepareClonedHierarchy(clone, sourceRoot, false);
+        clone.name = cloneName;
+        clone.setEnabled(true);
+        const worldOffset = direction.scale(options.spacing * index);
+        clone.position.addInPlace(this.worldDeltaToParentLocalDelta(clone, worldOffset));
+        if (sourceAssetCode) {
+          this.updateNodeAssetInfo(clone, {
+            assetCode: this.createUniqueArrayAssetCode(sourceAssetCode, usedAssetCodes)
+          });
+        }
+
+        clones.push(clone);
+        const cloneModelPackage = this.getModelPackageAssetForRoot(clone)?.modelPackage;
+        if (cloneModelPackage) {
+          this.applyModelPackageRuntime(clone, cloneModelPackage, "clone");
+        }
+        this.refreshNodeWorldMatrices(clone);
+        this.ensureNodeGridCoverage(clone);
+      }
+    } catch (error) {
+      clones.forEach((clone) => this.disposeClonedNodeHierarchy(clone));
+      if (sourceRuntimeStopped && sourceModelPackage) {
+        this.applyModelPackageRuntime(sourceRoot, sourceModelPackage, "clone");
+      }
+      this.refreshSceneGraph();
+      this.scene.render();
+      return this.createModelArrayFailure(getEngineErrorMessage(error, "创建模型阵列失败。"));
+    }
+
+    if (sourceRuntimeStopped && sourceModelPackage) {
+      this.applyModelPackageRuntime(sourceRoot, sourceModelPackage, "clone");
+    }
+
+    const selectedClone = clones[clones.length - 1];
+    this.selectNode(selectedClone);
+    this.callbacks.onStatsChange(this.collectStats());
+    this.scene.render();
+    return {
+      success: true,
+      createdCount: clones.length,
+      selectedNode: this.createTransformSnapshot(selectedClone)
+    };
   }
 
   /** 创建基础几何体或灯光，并放置到指定位置。 */
@@ -1371,10 +1780,15 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    const clonedNode = this.instantiateAssetFromSceneTemplate(asset, position);
+    if (clonedNode) {
+      this.callbacks.onStatsChange(this.collectStats());
+      return true;
+    }
+
     const file = this.assetFiles.get(assetId);
     if (!file) {
-      const clonedNode = this.instantiateAssetFromSceneTemplate(asset, position);
-      return Boolean(clonedNode);
+      return false;
     }
 
     const extension = this.getFileExtension(file.name);
@@ -2725,6 +3139,10 @@ export class BabylonEditorEngine {
       this.updateNodePoiConfig(node, update.poi);
     }
 
+    if (transformEditable && update.locatorAnimationConnection && this.isLocatorWireCubeNode(node)) {
+      this.updateLocatorAnimationConnection(node, update.locatorAnimationConnection);
+    }
+
     return graphDirty;
   }
 
@@ -3710,9 +4128,100 @@ export class BabylonEditorEngine {
   }
 
   /** 克隆可编辑节点层级，失败时返回 null 以便快捷键不拦截默认行为。 */
-  private cloneEditableNode(sourceNode: TransformNode, name: string): TransformNode | null {
-    const clone = sourceNode.clone(name, null, false);
+  private cloneEditableNode(sourceNode: TransformNode, name: string, parent: TransformNode | null = null): TransformNode | null {
+    const clone = sourceNode.clone(name, parent, false);
     return clone instanceof TransformNode ? clone : null;
+  }
+
+  /** 生成模型阵列失败结果，保证 App 层不需要重复拼装错误结构。 */
+  private createModelArrayFailure(message: string): ModelArrayResult {
+    return {
+      success: false,
+      createdCount: 0,
+      message
+    };
+  }
+
+  /** 收敛模型阵列目标，只允许普通 Mesh/Transform 模型进入批量克隆流程。 */
+  private getModelArrayTargetRoot(node: TransformNode | null | undefined): TransformNode | null {
+    const root = node ? this.findModelPackageRoot(node) ?? node : null;
+    if (
+      !root ||
+      root.metadata?.[HELPER_FLAG] ||
+      this.isNodeLocked(root) ||
+      this.isEditorGroup(root) ||
+      this.isCadDrawingNode(root) ||
+      this.isPoiNode(root) ||
+      this.isLocatorWireCubeNode(root)
+    ) {
+      return null;
+    }
+
+    const kind = this.getNodeKind(root);
+    return kind === "Mesh" || kind === "Transform" ? root : null;
+  }
+
+  /** 按节点源文件在资产记录里查找可聚焦卡片，兼容保存恢复后的项目相对路径。 */
+  private findAssetBySourceFile(sourceFile: string): AssetRecord | undefined {
+    const sourceLeaf = this.getFileName(sourceFile);
+    return this.assets.find((asset) => {
+      if (asset.name === sourceLeaf || asset.name === sourceFile) {
+        return true;
+      }
+
+      const projectFiles = [asset.projectFile, ...(asset.projectFiles ?? [])].filter((file): file is string => Boolean(file));
+      return projectFiles.some((projectFile) => this.getFileName(projectFile) === sourceLeaf || projectFile === sourceFile);
+    });
+  }
+
+  /** 从基础对象 metadata 读取资源库卡片类型，非法旧值不会进入 UI 命令。 */
+  private getPrimitiveKindForAssetFocus(node: TransformNode): PrimitiveKind | null {
+    const primitive = this.asMetadataObject(node.metadata).primitive;
+    return primitive === "cube" ||
+      primitive === "sphere" ||
+      primitive === "cylinder" ||
+      primitive === "ground" ||
+      primitive === "light" ||
+      primitive === "locatorWireCube"
+      ? primitive
+      : null;
+  }
+
+  /** 按层级树顺序收集可被单选命令访问的节点，供 Ctrl+I 在单选结构下循环切换。 */
+  private getSelectableSceneGraphNodes(): TransformNode[] {
+    const output: TransformNode[] = [];
+    const visit = (node: Node): void => {
+      if (node.metadata?.[HELPER_FLAG]) {
+        return;
+      }
+
+      if (node instanceof TransformNode && this.isSceneGraphDisplayNode(node) && !this.isNodeLocked(node)) {
+        output.push(node);
+        if (!this.isEditorGroup(node)) {
+          return;
+        }
+      }
+
+      this.getVisibleChildren(node).forEach(visit);
+    };
+
+    this.scene.rootNodes.forEach(visit);
+    return output;
+  }
+
+  /** 将世界方向位移换算成节点父级局部坐标，保证 group 内阵列仍沿场景 X/Z 展开。 */
+  private worldDeltaToParentLocalDelta(node: TransformNode, worldDelta: Vector3): Vector3 {
+    if (worldDelta.lengthSquared() <= 0) {
+      return Vector3.Zero();
+    }
+
+    const parent = node.parent;
+    if (!(parent instanceof TransformNode)) {
+      return worldDelta.clone();
+    }
+
+    parent.computeWorldMatrix(true);
+    return Vector3.TransformNormal(worldDelta, Matrix.Invert(parent.getWorldMatrix()));
   }
 
   /** 准备复制出的节点层级，确保 metadata、拾取状态和材质都独立且符合编辑器约定。 */
@@ -3818,6 +4327,46 @@ export class BabylonEditorEngine {
       candidate = `${copyBaseName} ${index}`;
       index += 1;
     }
+    return candidate;
+  }
+
+  /** 生成模型阵列副本名称，按创建顺序保持层级树可读且避免重名。 */
+  private createUniqueArrayCopyName(baseName: string, arrayIndex: number): string {
+    const arrayBaseName = `${baseName || "模型"} 阵列 ${arrayIndex}`;
+    let candidate = arrayBaseName;
+    let index = 2;
+    while (this.scene.getNodeByName(candidate)) {
+      candidate = `${arrayBaseName} 副本 ${index}`;
+      index += 1;
+    }
+    return candidate;
+  }
+
+  /** 收集场景中已有业务资产编号，供阵列副本生成不冲突的新编号。 */
+  private collectSceneAssetCodes(): Set<string> {
+    const assetCodes = new Set<string>();
+    [...this.scene.transformNodes, ...this.scene.meshes].forEach((node) => {
+      if (!(node instanceof TransformNode) || node.metadata?.[HELPER_FLAG]) {
+        return;
+      }
+
+      const assetCode = this.getNodeAssetInfo(node).assetCode.trim();
+      if (assetCode) {
+        assetCodes.add(assetCode);
+      }
+    });
+    return assetCodes;
+  }
+
+  /** 根据源资产编号生成递增编号，源 ABC 会生成 ABC-1、ABC-2 并自动跳过冲突。 */
+  private createUniqueArrayAssetCode(sourceAssetCode: string, usedAssetCodes: Set<string>): string {
+    let index = 1;
+    let candidate = `${sourceAssetCode}-${index}`;
+    while (usedAssetCodes.has(candidate)) {
+      index += 1;
+      candidate = `${sourceAssetCode}-${index}`;
+    }
+    usedAssetCodes.add(candidate);
     return candidate;
   }
 
@@ -4093,6 +4642,29 @@ export class BabylonEditorEngine {
     window.addEventListener("resize", this.handleResize);
   }
 
+  /** 绑定 WebGL 上下文丢失事件，黑屏时能在状态栏明确暴露原因。 */
+  private bindWebglContextLifecycle(): void {
+    this.canvas.addEventListener("webglcontextlost", this.handleWebglContextLost);
+    this.canvas.addEventListener("webglcontextrestored", this.handleWebglContextRestored);
+  }
+
+  /** 读取当前 WebGL 渲染器信息，用于判断是否真正跑在硬件 GPU 上。 */
+  private captureGpuRendererInfo(): void {
+    try {
+      const glInfo = this.engine.getGlInfo();
+      this.gpuVendor = this.normalizeGpuInfo(glInfo.vendor, "未知 GPU");
+      this.gpuRenderer = this.normalizeGpuInfo(glInfo.renderer, "未知渲染器");
+    } catch {
+      this.gpuVendor = "未知 GPU";
+      this.gpuRenderer = "未知渲染器";
+    }
+  }
+
+  /** 清洗 GPU 字符串，避免空值撑爆状态栏或误导诊断。 */
+  private normalizeGpuInfo(value: unknown, fallback: string): string {
+    return typeof value === "string" && value.trim() ? value.trim() : fallback;
+  }
+
   /** 创建一个符合当前编辑规范的基础对象。 */
   private createPrimitive(kind: PrimitiveKind, position: Vector3): TransformNode {
     const name = `${this.getPrimitiveName(kind)} ${this.primitiveSeed++}`;
@@ -4114,7 +4686,13 @@ export class BabylonEditorEngine {
     mesh.metadata = { [ROOT_FLAG]: true, primitive: kind };
     mesh.isPickable = true;
 
-    if (kind !== "ground") {
+    if (kind === "locatorWireCube") {
+      this.mergeNodeEditorMetadata(mesh, {
+        locatorAnimationConnection: DEFAULT_LOCATOR_ANIMATION_CONNECTION
+      });
+    }
+
+    if (kind !== "ground" && kind !== "locatorWireCube") {
       mesh.material = this.createDefaultMaterial(name);
     }
 
@@ -4135,6 +4713,10 @@ export class BabylonEditorEngine {
       );
     }
 
+    if (kind === "locatorWireCube") {
+      return this.createLocatorWireCubeMesh(name);
+    }
+
     if (kind === "ground") {
       const ground = MeshBuilder.CreateGround(
         name,
@@ -4149,6 +4731,39 @@ export class BabylonEditorEngine {
     }
 
     return MeshBuilder.CreateBox(name, { size: DEFAULT_BOX_SIZE_METERS }, this.scene);
+  }
+
+  /** 创建只包含 12 条边的定位线框，底面以局部原点贴地，便于把货物手动摆入框内。 */
+  private createLocatorWireCubeMesh(name: string): LinesMesh {
+    const size = DEFAULT_BOX_SIZE_METERS;
+    const halfSize = size / 2;
+    const bottomCorners = [
+      new Vector3(-halfSize, 0, -halfSize),
+      new Vector3(halfSize, 0, -halfSize),
+      new Vector3(halfSize, 0, halfSize),
+      new Vector3(-halfSize, 0, halfSize)
+    ];
+    const topCorners = bottomCorners.map((corner) => corner.add(new Vector3(0, size, 0)));
+    const lines = [
+      [bottomCorners[0], bottomCorners[1]],
+      [bottomCorners[1], bottomCorners[2]],
+      [bottomCorners[2], bottomCorners[3]],
+      [bottomCorners[3], bottomCorners[0]],
+      [topCorners[0], topCorners[1]],
+      [topCorners[1], topCorners[2]],
+      [topCorners[2], topCorners[3]],
+      [topCorners[3], topCorners[0]],
+      [bottomCorners[0], topCorners[0]],
+      [bottomCorners[1], topCorners[1]],
+      [bottomCorners[2], topCorners[2]],
+      [bottomCorners[3], topCorners[3]]
+    ];
+    const lineSystem = MeshBuilder.CreateLineSystem(name, { lines }, this.scene);
+    lineSystem.color = Color3.FromHexString("#72d6ff");
+    lineSystem.alpha = 0.95;
+    lineSystem.intersectionThreshold = 0.08;
+    lineSystem.alwaysSelectAsActiveMesh = true;
+    return lineSystem;
   }
 
   /** 创建默认材质，让新增物体在深色视口里有清晰轮廓。 */
@@ -4169,6 +4784,7 @@ export class BabylonEditorEngine {
   private getPrimitiveName(kind: PrimitiveKind): string {
     const names: Record<PrimitiveKind, string> = {
       cube: "立方体",
+      locatorWireCube: "定位线框立方体",
       sphere: "球体",
       cylinder: "圆柱体",
       ground: "地面",
@@ -5031,7 +5647,10 @@ export class BabylonEditorEngine {
     this.gizmoManager.rotationGizmoEnabled = this.currentTool === "rotate";
     this.gizmoManager.scaleGizmoEnabled = this.currentTool === "scale";
     this.gizmoManager.boundingBoxGizmoEnabled =
-      this.currentTool === "select" && Boolean(this.selectedNode) && !this.isCadDrawingNode(this.selectedNode);
+      this.currentTool === "select" &&
+      Boolean(this.selectedNode) &&
+      !this.isCadDrawingNode(this.selectedNode) &&
+      !this.isLocatorWireCubeNode(this.selectedNode);
     this.bindGizmoRealtimeSync();
     this.gizmoManager.attachToNode(this.selectedNode);
   }
@@ -5113,21 +5732,21 @@ export class BabylonEditorEngine {
     this.getEditableMeshes(node).forEach((mesh) => mesh.computeWorldMatrix(true));
   }
 
-  /** 刷新选中高亮层，TransformNode 会高亮其所有子网格。 */
+  /** 刷新选中轮廓，把同一模型的子网格作为一个整体描边，避免内部零件边界被染亮。 */
   private applyHighlight(node: TransformNode | null): void {
-    this.highlightedMeshes.forEach((mesh) => this.highlightLayer.removeMesh(mesh));
-    this.highlightedMeshes.clear();
+    this.selectionOutlineLayer.clearSelection();
 
     if (!node || this.isCadDrawingNode(node)) {
       return;
     }
 
-    this.getEditableMeshes(node)
+    const meshes = this.getEditableMeshes(node)
       .filter((mesh): mesh is Mesh => mesh instanceof Mesh && !mesh.metadata?.[HELPER_FLAG] && !this.isCadDrawingNode(mesh))
-      .forEach((mesh) => {
-        this.highlightLayer.addMesh(mesh, Color3.FromHexString("#f4c542"));
-        this.highlightedMeshes.add(mesh);
-      });
+      .filter((mesh) => mesh.isEnabled() && mesh.isVisible && mesh.getTotalVertices() > 0);
+
+    if (meshes.length > 0) {
+      this.selectionOutlineLayer.addSelection(meshes);
+    }
   }
 
   /** 向 React 发出当前选中对象的属性快照。 */
@@ -5147,6 +5766,7 @@ export class BabylonEditorEngine {
     const materialColor = this.getNodeMaterialColor(node);
     const selfLocked = this.isNodeSelfLocked(node);
     const lockedByAncestor = this.isNodeLockedByAncestor(node);
+    const displayableChildren = this.getVisibleChildren(node).filter((child) => this.isSceneGraphDisplayNode(child));
     return {
       id: node.uniqueId,
       name: node.name,
@@ -5161,11 +5781,14 @@ export class BabylonEditorEngine {
       selfLocked,
       locked: selfLocked || lockedByAncestor,
       lockedByAncestor,
+      hasChildren: displayableChildren.length > 0,
+      parentId: node.parent instanceof TransformNode ? node.parent.uniqueId : undefined,
       meshVertexModify: this.getNodeMeshVertexModify(node, materialColor),
       assetInfo: this.getNodeAssetInfo(node),
       dynamicParameters: this.getNodeDynamicParameters(node),
       poi: this.isPoiNode(node) ? this.getNodePoiConfig(node) : undefined,
-      poiRuntime: this.isPoiNode(node) ? this.sceneBusinessRuntime.getPoiRuntimeState(node) : undefined
+      poiRuntime: this.isPoiNode(node) ? this.sceneBusinessRuntime.getPoiRuntimeState(node) : undefined,
+      locatorAnimationConnection: this.isLocatorWireCubeNode(node) ? this.getLocatorAnimationConnection(node) : undefined
     };
   }
 
@@ -5198,6 +5821,31 @@ export class BabylonEditorEngine {
     };
   }
 
+  /** 读取定位框动画连接配置，旧场景缺失字段时回退到安全默认值。 */
+  private getLocatorAnimationConnection(node: TransformNode): LocatorAnimationConnectionSnapshot {
+    const editorMetadata = this.getNodeEditorMetadata(node);
+    return this.normalizeLocatorAnimationConnection(this.asMetadataObject(editorMetadata.locatorAnimationConnection));
+  }
+
+  /** 将定位框动画连接配置收敛为稳定快照，非法字段不进入运行态。 */
+  private normalizeLocatorAnimationConnection(value: Record<string, unknown>): LocatorAnimationConnectionSnapshot {
+    return {
+      version: 1,
+      enabled: this.getBooleanMetadata(value.enabled, DEFAULT_LOCATOR_ANIMATION_CONNECTION.enabled),
+      assetCode: this.getStringMetadata(value.assetCode, DEFAULT_LOCATOR_ANIMATION_CONNECTION.assetCode),
+      deviceIdField: this.getStringMetadata(value.deviceIdField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.deviceIdField),
+      assetCodeField: this.getStringMetadata(value.assetCodeField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.assetCodeField),
+      positionXField: this.getStringMetadata(value.positionXField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.positionXField),
+      positionYField: this.getStringMetadata(value.positionYField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.positionYField),
+      positionZField: this.getStringMetadata(value.positionZField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.positionZField),
+      rotationYField: this.getStringMetadata(value.rotationYField, DEFAULT_LOCATOR_ANIMATION_CONNECTION.rotationYField),
+      interpolationMs: Math.max(
+        0,
+        this.getNumberMetadata(value.interpolationMs, DEFAULT_LOCATOR_ANIMATION_CONNECTION.interpolationMs)
+      )
+    };
+  }
+
   /** 读取选中节点所属模型包实例的动态参数快照。 */
   private getNodeDynamicParameters(node: TransformNode): DynamicParameterSnapshot | undefined {
     const packageRoot = this.findModelPackageRoot(node);
@@ -5215,7 +5863,7 @@ export class BabylonEditorEngine {
     }
 
     const values = {
-      ...this.createDefaultDynamicParameterValues(asset.modelPackage.dynamicFields),
+      ...this.createInitialDynamicParameterValues(asset.modelPackage),
       ...this.asMetadataObject(instance.values)
     } as Record<string, DynamicParameterValue>;
 
@@ -5237,9 +5885,25 @@ export class BabylonEditorEngine {
     }, {});
   }
 
+  /** 根据模型包 manifest 生成实例初始参数，优先采用 meta.json 中模型给出的参数值。 */
+  private createInitialDynamicParameterValues(manifest: ModelPackageManifest): Record<string, DynamicParameterValue> {
+    const values = this.createDefaultDynamicParameterValues(manifest.dynamicFields);
+    const fieldsByKey = new Map(manifest.dynamicFields.map((field) => [field.key, field]));
+    Object.entries(this.asMetadataObject(manifest.initialValues)).forEach(([key, value]) => {
+      const field = fieldsByKey.get(key);
+      const parameterValue = value as DynamicParameterValue;
+      if (!field || !this.isDynamicParameterValueCompatible(field, parameterValue)) {
+        return;
+      }
+
+      values[key] = this.cloneDynamicParameterValue(parameterValue);
+    });
+    return values;
+  }
+
   /** 将模型包实例信息写入导入根节点 metadata，参数值随场景序列化保存。 */
   private attachModelPackageMetadata(root: TransformNode, assetId: string, manifest: ModelPackageManifest): void {
-    const values = this.createDefaultDynamicParameterValues(manifest.dynamicFields);
+    const values = this.createInitialDynamicParameterValues(manifest);
     this.mergeNodeEditorMetadata(root, {
       modelPackageInstance: {
         packageId: manifest.packageId,
@@ -5437,6 +6101,17 @@ export class BabylonEditorEngine {
         ...stored,
         assetCode: update.assetCode ?? current.assetCode
       }
+    });
+  }
+
+  /** 合并写回定位框动画连接配置，只保留 Inspector 暴露的白名单字段。 */
+  private updateLocatorAnimationConnection(node: TransformNode, update: LocatorAnimationConnectionUpdate): void {
+    const current = this.getLocatorAnimationConnection(node);
+    this.mergeNodeEditorMetadata(node, {
+      locatorAnimationConnection: this.normalizeLocatorAnimationConnection({
+        ...current,
+        ...update
+      })
     });
   }
 
@@ -5715,8 +6390,12 @@ export class BabylonEditorEngine {
           label: field.label,
           type: field.kind,
           defaultValue: field.defaultValue,
+          unit: field.unit,
+          physicalKind: field.physicalKind,
           configuration: {
             type: field.kind,
+            unit: field.unit,
+            physicalKind: field.physicalKind,
             min: field.min,
             max: field.max,
             step: field.step
@@ -5745,7 +6424,7 @@ export class BabylonEditorEngine {
     const editorMetadata = this.getNodeEditorMetadata(root);
     const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
     return {
-      ...this.createDefaultDynamicParameterValues(manifest.dynamicFields),
+      ...this.createInitialDynamicParameterValues(manifest),
       ...this.asMetadataObject(instance.values)
     } as Record<string, DynamicParameterValue>;
   }
@@ -6070,6 +6749,18 @@ export class BabylonEditorEngine {
     return false;
   }
 
+  /** 判断节点是否是定位线框立方体，避免把视觉定位框当作业务模型处理。 */
+  private isLocatorWireCubeNode(node: Node | null | undefined): boolean {
+    let current: Node | null | undefined = node;
+    while (current) {
+      if (current.metadata?.primitive === "locatorWireCube") {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
   /** 判断节点类别，供层级树和属性面板显示。 */
   private getNodeKind(node: Node): SceneNodeKind {
     if (node.metadata?.[HELPER_FLAG]) {
@@ -6082,6 +6773,10 @@ export class BabylonEditorEngine {
 
     if (node.metadata?.primitive === "light") {
       return "Light";
+    }
+
+    if (this.isLocatorWireCubeNode(node)) {
+      return "Locator";
     }
 
     if (this.isPoiNode(node)) {
@@ -6110,12 +6805,19 @@ export class BabylonEditorEngine {
   /** 汇总当前场景性能指标，便于用户判断编辑器压力。 */
   private collectStats(): EditorStats {
     const meshes = this.scene.meshes.filter((mesh) => !mesh.metadata?.[HELPER_FLAG]);
+    const drawCalls = this.sceneInstrumentation.drawCallsCounter.current;
     return {
       fps: Math.round(this.engine.getFps()),
       meshes: meshes.length,
       activeMeshes: Number((this.scene.getActiveMeshes() as unknown as { length: number }).length ?? 0),
       vertices: meshes.reduce((total, mesh) => total + mesh.getTotalVertices(), 0),
-      drawCalls: 0
+      drawCalls: Number.isFinite(drawCalls) ? Math.round(drawCalls) : 0,
+      hardwareScalingLevel: Number(this.engine.getHardwareScalingLevel().toFixed(2)),
+      renderWidth: this.engine.getRenderWidth(true),
+      renderHeight: this.engine.getRenderHeight(true),
+      gpuVendor: this.gpuVendor,
+      gpuRenderer: this.gpuRenderer,
+      contextLost: this.webglContextLost
     };
   }
 
@@ -6461,7 +7163,8 @@ export class BabylonEditorEngine {
     if (asset.modelPackage) {
       this.stopModelPackageRuntime(sourceNode, true);
     }
-    const clone = sourceNode.clone(`${sourceNode.name} 副本`, null, false);
+    const cloneName = this.createUniqueCopyName(sourceNode.name || asset.name);
+    const clone = sourceNode.clone(cloneName, null, false);
     if (asset.modelPackage) {
       this.applyModelPackageRuntime(sourceNode, asset.modelPackage, "clone");
     }
@@ -6469,16 +7172,10 @@ export class BabylonEditorEngine {
       return null;
     }
 
-    clone.metadata = {
-      ...this.asMetadataObject(sourceNode.metadata),
-      [ROOT_FLAG]: true
-    };
-    if (clone instanceof AbstractMesh) {
-      clone.isPickable = true;
-    }
-    clone.getChildMeshes().forEach((mesh) => {
-      mesh.isPickable = true;
-    });
+    this.prepareClonedHierarchy(clone, sourceNode, false);
+    clone.name = cloneName;
+    clone.setEnabled(true);
+    this.updateNodeVisibility(clone, true);
 
     this.alignNodeBaseToPosition(clone, position);
     if (asset.modelPackage) {
@@ -6610,6 +7307,7 @@ export class BabylonEditorEngine {
       manifest.files.every((file) => this.isModelPackageProjectFile(file)) &&
       Array.isArray(manifest.dynamicFields) &&
       manifest.dynamicFields.every((field) => this.isDynamicInspectorField(field)) &&
+      (manifest.initialValues === undefined || this.isDynamicParameterValueMap(manifest.initialValues)) &&
       Array.isArray(manifest.warnings) &&
       manifest.warnings.every((warning) => typeof warning === "string") &&
       typeof manifest.importedAt === "number"
@@ -6704,6 +7402,8 @@ export class BabylonEditorEngine {
       ["visibleAsNumber", "visibleAsColor3", "visibleAsString", "visibleAsBoolean"].includes(String(field.sourceDecorator)) &&
       typeof field.order === "number" &&
       Number.isFinite(field.order) &&
+      (field.unit === undefined || ["m", "count", "degree", "ratio"].includes(String(field.unit))) &&
+      (field.physicalKind === undefined || ["length", "distance", "count", "angle", "ratio"].includes(String(field.physicalKind))) &&
       (field.min === undefined || (typeof field.min === "number" && Number.isFinite(field.min))) &&
       (field.max === undefined || (typeof field.max === "number" && Number.isFinite(field.max))) &&
       (field.step === undefined || (typeof field.step === "number" && Number.isFinite(field.step)));
@@ -6729,6 +7429,20 @@ export class BabylonEditorEngine {
     }
 
     return false;
+  }
+
+  /** 校验模型包 manifest 中的初始参数字典，避免坏项目把不可序列化对象带入运行时。 */
+  private isDynamicParameterValueMap(value: unknown): boolean {
+    const values = this.asMetadataObject(value);
+    return Boolean(value && typeof value === "object" && !Array.isArray(value)) && Object.values(values).every((item) => {
+      if (typeof item === "number") {
+        return Number.isFinite(item);
+      }
+      if (typeof item === "string" || typeof item === "boolean") {
+        return true;
+      }
+      return this.isColor3ParameterValue(item as DynamicParameterValue);
+    });
   }
 
   /** 规范化序列化资产中的单位字段；无效单位字段只会被丢弃，不影响资产本身恢复。 */

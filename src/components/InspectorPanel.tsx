@@ -8,6 +8,8 @@ import type {
   DynamicParameterUpdate,
   DynamicParameterValue,
   InspectorTarget,
+  LocatorAnimationConnectionSnapshot,
+  LocatorAnimationConnectionUpdate,
   MeshVertexModifySnapshot,
   PoiConditionOperator,
   PoiConfigSnapshot,
@@ -168,6 +170,8 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
   const isGroup = selection.kind === "Group";
   const isCad = selection.kind === "CAD";
   const isPoi = selection.kind === "POI" && Boolean(selection.poi);
+  const isLocator = selection.kind === "Locator";
+  const isModelNode = !isGroup && !isCad && !isPoi && !isLocator;
   const isTransformReadOnly = isLocked || isGroup;
 
   return (
@@ -221,6 +225,19 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
         </InspectorSection>
       </fieldset>
 
+      {isLocator && selection.locatorAnimationConnection && (
+        <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
+          <InspectorSection title="动画连接" defaultOpen>
+            <LocatorAnimationConnectionEditor
+              value={selection.locatorAnimationConnection}
+              sceneDataDriven={sceneDataDriven}
+              onChange={(locatorAnimationConnection) => onChange({ locatorAnimationConnection })}
+              onSceneDataDrivenChange={onSceneDataDrivenChange}
+            />
+          </InspectorSection>
+        </fieldset>
+      )}
+
       {isGroup && (
         <InspectorSection title="分组" defaultOpen>
           <div className="inspector-empty-section">当前节点是逻辑分组，可在左侧模型树拖入模型并批量高亮。</div>
@@ -245,7 +262,7 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
         </fieldset>
       )}
 
-      {!isGroup && !isCad && !isPoi && (
+      {isModelNode && (
         <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
           {selection.dynamicParameters && (
             <InspectorSection title={`${selection.dynamicParameters.displayName} 参数`} defaultOpen>
@@ -272,24 +289,28 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
         </fieldset>
       )}
 
-      <InspectorSection title="关节参数">
-        <div className="inspector-empty-section">暂无关节参数</div>
-      </InspectorSection>
+      {!isLocator && (
+        <>
+          <InspectorSection title="关节参数">
+            <div className="inspector-empty-section">暂无关节参数</div>
+          </InspectorSection>
 
-      <InspectorSection title="数据驱动" defaultOpen={!isGroup && !isCad && !isPoi}>
-        {!isGroup && !isCad && !isPoi ? (
-          <NodeDataDrivenEditor
-            nodeLocked={isLocked}
-            selection={selection}
-            sceneDataDriven={sceneDataDriven}
-            onNodeChange={onChange}
-            onSceneDataDrivenChange={onSceneDataDrivenChange}
-            onStartStackerDemoPreview={onStartStackerDemoPreview}
-          />
-        ) : (
-          <div className="inspector-empty-section">数据驱动仅支持模型节点，请选择拖入场景的模型实例。</div>
-        )}
-      </InspectorSection>
+          <InspectorSection title="数据驱动" defaultOpen={isModelNode}>
+            {isModelNode ? (
+              <NodeDataDrivenEditor
+                nodeLocked={isLocked}
+                selection={selection}
+                sceneDataDriven={sceneDataDriven}
+                onNodeChange={onChange}
+                onSceneDataDrivenChange={onSceneDataDrivenChange}
+                onStartStackerDemoPreview={onStartStackerDemoPreview}
+              />
+            ) : (
+              <div className="inspector-empty-section">数据驱动仅支持模型节点，请选择拖入场景的模型实例。</div>
+            )}
+          </InspectorSection>
+        </>
+      )}
     </aside>
   );
 }
@@ -808,6 +829,38 @@ function NodeDataDrivenEditor({
   );
 }
 
+interface LocatorAnimationConnectionEditorProps {
+  value: LocatorAnimationConnectionSnapshot;
+  sceneDataDriven: SceneDataDrivenSnapshot;
+  onChange: (update: LocatorAnimationConnectionUpdate) => void;
+  onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
+}
+
+/** 定位线框立方体专属数据驱动接收端配置，不复用普通模型资产编号面板。 */
+function LocatorAnimationConnectionEditor({
+  value,
+  sceneDataDriven,
+  onChange,
+  onSceneDataDrivenChange
+}: LocatorAnimationConnectionEditorProps) {
+  return (
+    <>
+      <InspectorCheckboxRow label="启用定位框" checked={value.enabled} onChange={(enabled) => onChange({ enabled })} />
+      <InspectorTextRow label="绑定设备" value={value.assetCode} onChange={(assetCode) => onChange({ assetCode })} />
+      <InspectorTextRow label="设备字段" value={value.deviceIdField} onChange={(deviceIdField) => onChange({ deviceIdField })} />
+      <InspectorTextRow label="匹配字段" value={value.assetCodeField} onChange={(assetCodeField) => onChange({ assetCodeField })} />
+      <InspectorTextRow label="X字段" value={value.positionXField} onChange={(positionXField) => onChange({ positionXField })} />
+      <InspectorTextRow label="Y字段" value={value.positionYField} onChange={(positionYField) => onChange({ positionYField })} />
+      <InspectorTextRow label="Z字段" value={value.positionZField} onChange={(positionZField) => onChange({ positionZField })} />
+      <InspectorTextRow label="朝向字段" value={value.rotationYField} onChange={(rotationYField) => onChange({ rotationYField })} />
+      <InspectorNumberRow label="插值(ms)" step="50" value={value.interpolationMs} onChange={(interpolationMs) => onChange({ interpolationMs })} />
+      <div className="inspector-data-source-editor">
+        <DataSourceConnectionEditor value={sceneDataDriven} onChange={onSceneDataDrivenChange} />
+      </div>
+    </>
+  );
+}
+
 interface InspectorSelectRowProps {
   label: string;
   options: string[];
@@ -954,14 +1007,20 @@ interface DynamicParameterFieldProps {
 /** 渲染单个模型包动态字段。 */
 function DynamicParameterField({ field, value, onChange }: DynamicParameterFieldProps) {
   if (field.kind === "number") {
+    const unitLabel = getDynamicParameterUnitLabel(field);
+    const numberValue = typeof value === "number" ? value : Number(field.defaultValue);
     return (
       <label className="inspector-row">
         <span className="inspector-row-label">{field.label}</span>
-        <InspectorNumberInput
-          step={String(field.step ?? 0.1)}
-          value={typeof value === "number" ? value : Number(field.defaultValue)}
-          onChange={(nextValue) => onChange(clampNumberValue(nextValue, field.min, field.max))}
-        />
+        <span className={unitLabel ? "inspector-unit-control" : undefined}>
+          <InspectorNumberInput
+            title={unitLabel ? `${field.label}: ${numberValue} ${unitLabel}` : field.label}
+            step={String(field.step ?? 0.1)}
+            value={numberValue}
+            onChange={(nextValue) => onChange(clampNumberValue(nextValue, field.min, field.max))}
+          />
+          {unitLabel && <span className="inspector-unit-suffix">{unitLabel}</span>}
+        </span>
       </label>
     );
   }
@@ -1005,6 +1064,20 @@ function DynamicParameterField({ field, value, onChange }: DynamicParameterField
   }
 
   return <div className="inspector-empty-section">不支持的参数类型：{field.kind}</div>;
+}
+
+/** 动态参数的单位显示沿用编辑器全局米制、角度和倍率符号。 */
+function getDynamicParameterUnitLabel(field: DynamicInspectorField): string {
+  if (field.unit === "m") {
+    return LENGTH_UNIT_SYMBOL;
+  }
+  if (field.unit === "degree") {
+    return ROTATION_UNIT_SYMBOL;
+  }
+  if (field.unit === "ratio") {
+    return SCALE_UNIT_SYMBOL;
+  }
+  return "";
 }
 
 /** 限制数字参数在装饰器声明的范围内。 */

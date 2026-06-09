@@ -2,6 +2,7 @@ import {
   Box,
   Bug,
   Circle,
+  Cuboid,
   Cylinder,
   FileAxis3d,
   Gauge,
@@ -15,7 +16,8 @@ import {
   Save,
   Scaling,
   Square,
-  Upload
+  Upload,
+  type LucideIcon
 } from "lucide-react";
 import { useRef } from "react";
 import type { EditorStats, EditorTool, PrimitiveKind } from "../types/editor";
@@ -47,13 +49,43 @@ const toolButtons: Array<{ tool: EditorTool; label: string; icon: typeof MousePo
   { tool: "scale", label: "缩放", icon: Scaling }
 ];
 
-const primitiveButtons: Array<{ kind: PrimitiveKind; label: string; icon: typeof Box }> = [
+const primitiveButtons: Array<{ kind: PrimitiveKind; label: string; icon: LucideIcon }> = [
   { kind: "cube", label: "立方体", icon: Box },
+  { kind: "locatorWireCube", label: "定位线框立方体", icon: Cuboid },
   { kind: "sphere", label: "球体", icon: Circle },
   { kind: "cylinder", label: "圆柱体", icon: Cylinder },
   { kind: "ground", label: "地面", icon: Grid3X3 },
   { kind: "light", label: "点光源", icon: Lightbulb }
 ];
+
+/** 压缩 GPU 名称，避免长 renderer 字符串撑开工具栏。 */
+function formatGpuRendererLabel(stats: EditorStats): string {
+  if (stats.contextLost) {
+    return "WebGL 丢失";
+  }
+
+  const renderer = stats.gpuRenderer
+    .replace(/^ANGLE\s*\(/i, "")
+    .replace(/\s+Direct3D.*$/i, "")
+    .replace(/\s+D3D.*$/i, "")
+    .trim();
+  if (!renderer || renderer === "未知渲染器") {
+    return stats.gpuVendor;
+  }
+  return renderer.length > 24 ? `${renderer.slice(0, 24)}...` : renderer;
+}
+
+/** 拼装 GPU 诊断提示，便于确认是否跑在硬件 GPU、高清模式和当前渲染分辨率。 */
+function formatGpuRendererTitle(stats: EditorStats, performanceMode: boolean): string {
+  return [
+    `GPU Vendor: ${stats.gpuVendor}`,
+    `GPU Renderer: ${stats.gpuRenderer}`,
+    `Quality: ${performanceMode ? "performance preview" : "4K high quality"}`,
+    `Render Size: ${stats.renderWidth}x${stats.renderHeight}`,
+    `Hardware Scaling: ${stats.hardwareScalingLevel}`,
+    `Context: ${stats.contextLost ? "lost" : "ok"}`
+  ].join("\n");
+}
 
 /** 顶部工具栏负责工具切换、基础对象创建、导入、保存和调试入口。 */
 export function Toolbar({
@@ -181,7 +213,7 @@ export function Toolbar({
         </button>
         <button
           className={`icon-button ${performanceMode ? "is-active" : ""}`}
-          title="性能预览"
+          title={performanceMode ? "退出性能预览，恢复高清 4K" : "性能预览（降低清晰度）"}
           type="button"
           onClick={onTogglePerformance}
         >
@@ -192,7 +224,10 @@ export function Toolbar({
       <div className="stats-strip" aria-label="状态">
         <span>{stats.fps} FPS</span>
         <span>{stats.meshes} Mesh</span>
+        <span>{stats.drawCalls} Draw</span>
         <span>{stats.vertices.toLocaleString()} Vtx</span>
+        <span title={formatGpuRendererTitle(stats, performanceMode)}>{formatGpuRendererLabel(stats)}</span>
+        <span title={`渲染分辨率 ${stats.renderWidth}x${stats.renderHeight}`}>{performanceMode ? "Perf" : "4K"} {stats.hardwareScalingLevel}x</span>
       </div>
 
       <input

@@ -1,30 +1,47 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { AssetBrowser } from "./components/AssetBrowser";
-import { HierarchyPanel } from "./components/HierarchyPanel";
+import { HierarchyPanel, type HierarchyExpansionCommand } from "./components/HierarchyPanel";
 import { InspectorPanel } from "./components/InspectorPanel";
 import { ProjectLauncher } from "./components/ProjectLauncher";
 import { Toolbar } from "./components/Toolbar";
 import { ViewportCanvas } from "./components/ViewportCanvas";
 import type { CadDxfLineProgress } from "./editor/cadDxf";
+import {
+  inferDynamicParameterUnit,
+  normalizeDynamicParameterUnit,
+  withInferredDynamicParameterUnit
+} from "./editor/dynamicParameterUnits";
 import { parseModelPackageDataDriven } from "./editor/modelPackageDataDriven";
-import { parseModelPackageDecorators } from "./editor/modelPackageDecorators";
-import { DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS } from "./editor/modelPackageRuntime";
+import {
+  hasModelPackageVisibleDecorators,
+  parseModelPackageDecorators,
+  parseModelPackageDefaultExportClassName
+} from "./editor/modelPackageDecorators";
+import { DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS } from "./editor/modelPackageRuntimeCompiler";
 import { DEFAULT_SCENE_ENVIRONMENT_COLOR, type BabylonEditorEngine } from "./engine/BabylonEditorEngine";
 import { DEFAULT_SCENE_DATA_DRIVEN } from "./types/editor";
 import type {
   AssetRecord,
+  AssetLibraryFocusTarget,
+  Color3Snapshot,
+  DynamicInspectorField,
+  DynamicInspectorFieldKind,
+  DynamicParameterValue,
   EditorEngineCallbacks,
   EditorStats,
   EditorTool,
   InspectorTarget,
+  ModelArrayAxis,
   ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
   PrimitiveKind,
   SceneDataDrivenSnapshot,
   SceneInspectorUpdate,
+  SceneNodeKind,
   SceneNodeSummary,
+  TransformSnapshot,
   TransformUpdate
 } from "./types/editor";
 
@@ -38,12 +55,48 @@ interface ModelPackageRuntimeScriptSelection {
   className: string;
 }
 
+interface ModelArrayContextTarget {
+  id: number;
+  name: string;
+  kind: SceneNodeKind;
+  locked: boolean;
+}
+
+interface SceneContextMenuTarget extends ModelArrayContextTarget {
+  visible: boolean;
+  selfLocked: boolean;
+  lockedByAncestor: boolean;
+  hasChildren: boolean;
+  parentId?: number;
+}
+
+interface SceneContextMenuState {
+  target: SceneContextMenuTarget | null;
+  x: number;
+  y: number;
+}
+
+type AssetLibraryFocusCommand = AssetLibraryFocusTarget & { token: number };
+
+interface ModelArrayDialogState {
+  target: ModelArrayContextTarget;
+  axis: ModelArrayAxis;
+  count: string;
+  spacing: string;
+}
+
 const initialStats: EditorStats = {
   fps: 0,
   meshes: 0,
   activeMeshes: 0,
   vertices: 0,
-  drawCalls: 0
+  drawCalls: 0,
+  hardwareScalingLevel: 1,
+  renderWidth: 0,
+  renderHeight: 0,
+  gpuVendor: "未知 GPU",
+  gpuRenderer: "未知渲染器",
+  contextLost: false
 };
 
 const ASSET_BROWSER_HEIGHT_STORAGE_KEY = "babylon-editor.assetBrowserHeight";
@@ -51,6 +104,11 @@ const DEFAULT_ASSET_BROWSER_HEIGHT = 190;
 const MIN_ASSET_BROWSER_HEIGHT = 132;
 const MAX_ASSET_BROWSER_HEIGHT = 420;
 const MAX_ASSET_BROWSER_HEIGHT_RATIO = 0.45;
+const MODEL_ARRAY_DEFAULT_AXIS: ModelArrayAxis = "x";
+const MODEL_ARRAY_DEFAULT_COUNT = "3";
+const MODEL_ARRAY_DEFAULT_SPACING = "1";
+const SCENE_CONTEXT_MENU_WIDTH = 220;
+const SCENE_CONTEXT_MENU_HEIGHT = 420;
 
 /** 统一提取异常消息，兼容 Babylon 以字符串抛错的情况。 */
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -98,6 +156,58 @@ function readStoredAssetBrowserHeight(): number {
   } catch {
     return clampAssetBrowserHeight(DEFAULT_ASSET_BROWSER_HEIGHT);
   }
+}
+
+/** 判断 UI 侧是否展示模型阵列入口，最终权限仍由 Babylon 引擎兜底校验。 */
+function canOpenModelArrayMenu(target: ModelArrayContextTarget): boolean {
+  return !target.locked && (target.kind === "Mesh" || target.kind === "Transform");
+}
+
+/** 把右键菜单限制在视口内，避免靠近窗口边缘时菜单不可点。 */
+function clampSceneContextMenuPosition(point: { x: number; y: number }): { x: number; y: number } {
+  if (typeof window === "undefined") {
+    return point;
+  }
+
+  return {
+    x: Math.max(8, Math.min(point.x, window.innerWidth - SCENE_CONTEXT_MENU_WIDTH - 8)),
+    y: Math.max(8, Math.min(point.y, window.innerHeight - SCENE_CONTEXT_MENU_HEIGHT - 8))
+  };
+}
+
+/** 从层级树节点生成右键菜单目标，避免 App 直接依赖完整树节点结构。 */
+function createSceneContextTargetFromSceneNode(node: SceneNodeSummary): SceneContextMenuTarget {
+  return {
+    id: node.id,
+    name: node.name,
+    kind: node.kind,
+    locked: node.locked,
+    visible: node.visible,
+    selfLocked: node.selfLocked,
+    lockedByAncestor: node.lockedByAncestor,
+    hasChildren: node.hasChildren,
+    parentId: node.parentId
+  };
+}
+
+/** 从引擎选中快照生成右键菜单目标，视口右键和层级树右键共用同一弹窗。 */
+function createSceneContextTargetFromTransformSnapshot(snapshot: TransformSnapshot): SceneContextMenuTarget {
+  return {
+    id: snapshot.id,
+    name: snapshot.name,
+    kind: snapshot.kind,
+    locked: snapshot.locked,
+    visible: snapshot.visible,
+    selfLocked: snapshot.selfLocked,
+    lockedByAncestor: snapshot.lockedByAncestor,
+    hasChildren: snapshot.hasChildren,
+    parentId: snapshot.parentId
+  };
+}
+
+/** 收敛阵列轴向下拉值，避免 DOM 字符串越过类型约束。 */
+function readModelArrayAxis(value: string): ModelArrayAxis {
+  return value === "-x" || value === "z" || value === "-z" ? value : "x";
 }
 
 /** 根据文件名推断基础 MIME，供从项目资产恢复 File 对象时使用。 */
@@ -266,26 +376,26 @@ function getMetaParameterScriptFile(meta: unknown, textFiles: Record<string, str
 /** 从 meta.json 中读取运行脚本文件名和类名，默认兼容 ParametricModelRuntimeComponent。 */
 function getMetaRuntimeScript(
   meta: unknown,
-  availableFiles: string[],
+  textFiles: Record<string, string>,
   fallbackScriptFile: string | undefined,
   warnings: string[]
 ): ModelPackageRuntimeScriptSelection {
   const animationScripts = asRecord(meta).animationScripts;
-  const fileMap = createModelPackageRelativePathMap(availableFiles);
+  const fileMap = createModelPackageRelativePathMap(Object.keys(textFiles));
   if (Array.isArray(animationScripts)) {
     for (const script of animationScripts) {
       const scriptRecord = asRecord(script);
       const scriptFile = scriptRecord.scriptFilename;
-      const className =
-        typeof scriptRecord.className === "string" && scriptRecord.className.trim().length > 0
-          ? scriptRecord.className.trim()
-          : DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS;
       if (typeof scriptFile !== "string" || scriptFile.trim().length === 0) {
         continue;
       }
 
       const matchedFile = fileMap.get(normalizeModelPackageRelativePath(scriptFile));
       if (matchedFile) {
+        const className =
+          typeof scriptRecord.className === "string" && scriptRecord.className.trim().length > 0
+            ? scriptRecord.className.trim()
+            : getModelPackageRuntimeClassName(textFiles[matchedFile]);
         return { scriptFile: matchedFile, className };
       }
 
@@ -295,8 +405,13 @@ function getMetaRuntimeScript(
 
   return {
     scriptFile: fallbackScriptFile,
-    className: DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS
+    className: fallbackScriptFile ? getModelPackageRuntimeClassName(textFiles[fallbackScriptFile]) : DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS
   };
+}
+
+/** 从脚本文本推断运行类名，兼容旧模型包默认导出的 XxxComponent。 */
+function getModelPackageRuntimeClassName(scriptText: string | undefined): string {
+  return scriptText ? parseModelPackageDefaultExportClassName(scriptText) ?? DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS : DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS;
 }
 
 /** 规范化模型包内部相对路径，兼容 meta 中的 ./ 前缀和 Windows 反斜杠。 */
@@ -327,6 +442,11 @@ function chooseModelPackageParameterScriptFile(
     return paramsFiles[0];
   }
 
+  const decoratedScriptFile = chooseDecoratedModelPackageScriptFile(tsFiles, textFiles, fallbackScriptFile);
+  if (decoratedScriptFile) {
+    return decoratedScriptFile;
+  }
+
   if (fallbackScriptFile && textFiles[fallbackScriptFile] !== undefined) {
     return fallbackScriptFile;
   }
@@ -337,6 +457,343 @@ function chooseModelPackageParameterScriptFile(
 
   warnings.push("模型包包含多个 .ts 脚本，但未找到 meta.json 声明的有效参数脚本或 .params.ts 文件，已跳过动态参数解析。");
   return undefined;
+}
+
+/** 没有 meta 参数声明时，在旧模型包中选择真正带 Inspector 装饰器的脚本。 */
+function chooseDecoratedModelPackageScriptFile(
+  tsFiles: string[],
+  textFiles: Record<string, string>,
+  fallbackScriptFile: string | undefined
+): string | undefined {
+  const decoratedFiles = tsFiles.filter((file) => hasModelPackageVisibleDecorators(textFiles[file] ?? ""));
+  if (decoratedFiles.length === 0) {
+    return undefined;
+  }
+
+  return decoratedFiles.sort((left, right) => {
+    const depthDiff = getModelPackageRelativeDepth(left) - getModelPackageRelativeDepth(right);
+    if (depthDiff !== 0) {
+      return depthDiff;
+    }
+
+    if (fallbackScriptFile) {
+      if (left === fallbackScriptFile) {
+        return -1;
+      }
+      if (right === fallbackScriptFile) {
+        return 1;
+      }
+    }
+
+    return left.localeCompare(right);
+  })[0];
+}
+
+/** 计算模型包相对路径层级，优先选根目录脚本，避免误选 labels 等辅助脚本。 */
+function getModelPackageRelativeDepth(filePath: string): number {
+  return normalizeModelPackageRelativePath(filePath).split("/").length;
+}
+
+/** 从 meta.json 中选出与当前参数脚本对应的 parameterScripts 记录。 */
+function getMetaParameterScriptRecord(meta: unknown, scriptFile: string | undefined): Record<string, unknown> | undefined {
+  const parameterScripts = asRecord(meta).parameterScripts;
+  if (!Array.isArray(parameterScripts)) {
+    return undefined;
+  }
+
+  const normalizedScriptFile = scriptFile ? normalizeModelPackageRelativePath(scriptFile) : "";
+  const records = parameterScripts.map((script) => asRecord(script));
+  if (!normalizedScriptFile) {
+    return records[0];
+  }
+
+  return (
+    records.find((record) => {
+      const declaredScriptFile = record.scriptFilename;
+      return (
+        typeof declaredScriptFile === "string" &&
+        normalizeModelPackageRelativePath(declaredScriptFile) === normalizedScriptFile
+      );
+    }) ?? records[0]
+  );
+}
+
+/** 解析 meta.json 中声明的字段和值，让模型包自身参数优先进入右侧属性面板。 */
+function parseMetaParameterDefinition(
+  meta: unknown,
+  scriptFile: string | undefined,
+  fallbackSourceFile: string,
+  warnings: string[]
+): { fields: DynamicInspectorField[]; initialValues: Record<string, DynamicParameterValue> } {
+  const parameterScript = getMetaParameterScriptRecord(meta, scriptFile);
+  if (!parameterScript) {
+    return { fields: [], initialValues: {} };
+  }
+
+  const sourceFile = getMetaParameterSourceFile(parameterScript, scriptFile, fallbackSourceFile);
+  const fields = parseMetaDynamicFields(parameterScript, sourceFile, warnings);
+  return {
+    fields,
+    initialValues: parseMetaInitialValues(parameterScript, fields, warnings)
+  };
+}
+
+/** 获取 meta 参数脚本来源文件名，优先使用 manifest 中声明的脚本路径。 */
+function getMetaParameterSourceFile(
+  parameterScript: Record<string, unknown>,
+  scriptFile: string | undefined,
+  fallbackSourceFile: string
+): string {
+  const declaredScriptFile = parameterScript.scriptFilename;
+  return typeof declaredScriptFile === "string" && declaredScriptFile.trim()
+    ? declaredScriptFile.trim()
+    : scriptFile ?? fallbackSourceFile;
+}
+
+/** 解析 meta.json parameterScripts[].fields，补齐脚本装饰器无法覆盖的字段契约。 */
+function parseMetaDynamicFields(
+  parameterScript: Record<string, unknown>,
+  sourceFile: string,
+  warnings: string[]
+): DynamicInspectorField[] {
+  const rawFields = parameterScript.fields;
+  if (!Array.isArray(rawFields)) {
+    return [];
+  }
+
+  const output: DynamicInspectorField[] = [];
+  rawFields.forEach((rawField, index) => {
+    const field = asRecord(rawField);
+    const key = getMetaFieldKey(field);
+    if (!key) {
+      warnings.push(`${sourceFile} 的第 ${index + 1} 个 meta 参数缺少 key，已跳过。`);
+      return;
+    }
+
+    const kind = getMetaFieldKind(field);
+    if (!kind) {
+      warnings.push(`${sourceFile} 的 meta 参数 ${key} 类型不受支持，已跳过。`);
+      return;
+    }
+
+    const defaultValue = normalizeMetaParameterValue(field.defaultValue, kind) ?? getFallbackDynamicParameterValue(kind);
+    const configuration = asRecord(field.configuration);
+    const label = getMetaFieldLabel(field, key);
+    const explicitUnit = normalizeDynamicParameterUnit(configuration.unit ?? field.unit ?? configuration.unitSymbol ?? field.unitSymbol);
+    const unitInference = inferDynamicParameterUnit(key, label, kind, explicitUnit);
+    output.push({
+      id: `${sourceFile}:meta:${key}`,
+      key,
+      label,
+      kind,
+      defaultValue,
+      unit: unitInference.unit,
+      physicalKind: unitInference.physicalKind,
+      min: readFiniteNumber(configuration.min ?? field.min),
+      max: readFiniteNumber(configuration.max ?? field.max),
+      step: readFiniteNumber(configuration.step ?? field.step),
+      sourceFile,
+      sourceDecorator: getSourceDecoratorForKind(kind),
+      order: output.length
+    });
+  });
+
+  return output;
+}
+
+/** 从 meta 字段中读取参数 key，兼容 Babylon Editor 的 propertyKey 命名。 */
+function getMetaFieldKey(field: Record<string, unknown>): string {
+  const key = typeof field.key === "string" ? field.key : field.propertyKey;
+  return typeof key === "string" ? key.trim() : "";
+}
+
+/** 从 meta 字段中读取展示名称，缺失时退回 key。 */
+function getMetaFieldLabel(field: Record<string, unknown>, key: string): string {
+  const label = field.label;
+  return typeof label === "string" && label.trim() ? label.trim() : key;
+}
+
+/** 从 meta 字段声明中收敛当前编辑器支持的参数类型。 */
+function getMetaFieldKind(field: Record<string, unknown>): DynamicInspectorFieldKind | undefined {
+  const configuration = asRecord(field.configuration);
+  const declaredType = configuration.type ?? field.type;
+  if (typeof declaredType === "string") {
+    const normalizedType = declaredType.trim().toLowerCase();
+    if (["number", "float", "double", "integer", "int"].includes(normalizedType)) {
+      return "number";
+    }
+    if (["color3", "color"].includes(normalizedType)) {
+      return "color3";
+    }
+    if (["string", "text"].includes(normalizedType)) {
+      return "string";
+    }
+    if (["boolean", "bool"].includes(normalizedType)) {
+      return "boolean";
+    }
+  }
+
+  return inferDynamicFieldKind(field.defaultValue);
+}
+
+/** 按默认值类型推断字段类型，用于兼容缺少 configuration.type 的旧 meta。 */
+function inferDynamicFieldKind(value: unknown): DynamicInspectorFieldKind | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return "number";
+  }
+  if (typeof value === "string") {
+    return "string";
+  }
+  if (typeof value === "boolean") {
+    return "boolean";
+  }
+  if (isColor3SnapshotValue(value)) {
+    return "color3";
+  }
+  return undefined;
+}
+
+/** 将字段类型映射为现有动态字段来源枚举，保持旧 Inspector 校验逻辑可复用。 */
+function getSourceDecoratorForKind(kind: DynamicInspectorFieldKind): DynamicInspectorField["sourceDecorator"] {
+  if (kind === "number") {
+    return "visibleAsNumber";
+  }
+  if (kind === "color3") {
+    return "visibleAsColor3";
+  }
+  if (kind === "boolean") {
+    return "visibleAsBoolean";
+  }
+  return "visibleAsString";
+}
+
+/** 读取 meta.json parameterScripts[].values，作为模型实例首次进入场景的权威初始值。 */
+function parseMetaInitialValues(
+  parameterScript: Record<string, unknown>,
+  fields: DynamicInspectorField[],
+  warnings: string[]
+): Record<string, DynamicParameterValue> {
+  const rawValues = asRecord(parameterScript.values);
+  if (Object.keys(rawValues).length === 0) {
+    return {};
+  }
+
+  return fields.reduce<Record<string, DynamicParameterValue>>((values, field) => {
+    if (!Object.prototype.hasOwnProperty.call(rawValues, field.key)) {
+      return values;
+    }
+
+    const value = normalizeMetaParameterValue(rawValues[field.key], field.kind);
+    if (value === undefined) {
+      warnings.push(`meta.json 参数 ${field.key} 的值类型与 ${field.kind} 不匹配，已使用字段默认值。`);
+      return values;
+    }
+
+    values[field.key] = value;
+    return values;
+  }, {});
+}
+
+/** 合并脚本装饰器字段和 meta 字段，meta 字段用于覆盖模型给出的 label、默认值和约束。 */
+function mergeDynamicFields(scriptFields: DynamicInspectorField[], metaFields: DynamicInspectorField[]): DynamicInspectorField[] {
+  const fields = scriptFields.map((field) => ({ ...field }));
+  metaFields.forEach((metaField) => {
+    const existingIndex = fields.findIndex((field) => field.key === metaField.key);
+    if (existingIndex >= 0) {
+      const existingField = fields[existingIndex];
+      fields[existingIndex] = {
+        ...existingField,
+        ...metaField,
+        id: existingField.id,
+        sourceFile: existingField.sourceFile,
+        order: existingField.order
+      };
+      return;
+    }
+
+    fields.push({
+      ...metaField,
+      order: fields.length
+    });
+  });
+
+  return fields.map((field, order) => withInferredDynamicParameterUnit({ ...field, order }));
+}
+
+/** 从 meta values 项中拆出真实值，兼容 { type, value, label } 包装和直接标量。 */
+function unwrapMetaParameterValue(value: unknown): unknown {
+  const record = asRecord(value);
+  return Object.prototype.hasOwnProperty.call(record, "value") ? record.value : value;
+}
+
+/** 按字段类型规范化 meta 参数值，非法值返回 undefined 而不污染模型 metadata。 */
+function normalizeMetaParameterValue(value: unknown, kind: DynamicInspectorFieldKind): DynamicParameterValue | undefined {
+  const unwrapped = unwrapMetaParameterValue(value);
+  if (kind === "number") {
+    if (typeof unwrapped === "number" && Number.isFinite(unwrapped)) {
+      return unwrapped;
+    }
+    if (typeof unwrapped === "string" && unwrapped.trim() && Number.isFinite(Number(unwrapped))) {
+      return Number(unwrapped);
+    }
+    return undefined;
+  }
+
+  if (kind === "string") {
+    return typeof unwrapped === "string" ? unwrapped : undefined;
+  }
+
+  if (kind === "boolean") {
+    if (typeof unwrapped === "boolean") {
+      return unwrapped;
+    }
+    if (typeof unwrapped === "string" && ["true", "false"].includes(unwrapped.trim().toLowerCase())) {
+      return unwrapped.trim().toLowerCase() === "true";
+    }
+    return undefined;
+  }
+
+  if (isColor3SnapshotValue(unwrapped)) {
+    const color = asRecord(unwrapped);
+    return {
+      r: Number(color.r),
+      g: Number(color.g),
+      b: Number(color.b)
+    };
+  }
+
+  return undefined;
+}
+
+/** 为 meta-only 字段提供安全默认值，确保字段结构始终可序列化。 */
+function getFallbackDynamicParameterValue(kind: DynamicInspectorFieldKind): DynamicParameterValue {
+  if (kind === "number") {
+    return 0;
+  }
+  if (kind === "boolean") {
+    return false;
+  }
+  if (kind === "color3") {
+    return { r: 1, g: 1, b: 1 } satisfies Color3Snapshot;
+  }
+  return "";
+}
+
+/** 读取有限数字，避免 NaN 或 Infinity 写入参数约束。 */
+function readFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return undefined;
+}
+
+/** 判断值是否是可序列化 Color3 快照。 */
+function isColor3SnapshotValue(value: unknown): value is Color3Snapshot {
+  const color = asRecord(value);
+  return [color.r, color.g, color.b].every((component) => typeof component === "number" && Number.isFinite(component));
 }
 
 /** 从模型包脚本中读取 dataDriven 语义定义，场景级连接配置仍由 Inspector 保存。 */
@@ -445,6 +902,10 @@ export function App() {
   const [sceneLoading, setSceneLoading] = useState(false);
   const [sceneLoadFailed, setSceneLoadFailed] = useState(false);
   const [sceneDialogOpen, setSceneDialogOpen] = useState(false);
+  const [sceneContextMenu, setSceneContextMenu] = useState<SceneContextMenuState | null>(null);
+  const [modelArrayDialog, setModelArrayDialog] = useState<ModelArrayDialogState | null>(null);
+  const [treeExpansionCommand, setTreeExpansionCommand] = useState<HierarchyExpansionCommand | null>(null);
+  const [assetLibraryFocusCommand, setAssetLibraryFocusCommand] = useState<AssetLibraryFocusCommand | null>(null);
   const [sceneName, setSceneName] = useState("New Scene");
   const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
   const [sceneDataDriven, setSceneDataDriven] = useState<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
@@ -460,6 +921,10 @@ export function App() {
   const cadRestoreActiveRef = useRef(false);
   const cadRestoreWarningRef = useRef<string | null>(null);
   const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
+  const selectedHierarchyNode = useMemo(
+    () => (selectedNode ? nodes.find((node) => node.id === selectedNode.id) ?? null : null),
+    [nodes, selectedNode]
+  );
   const workspaceStyle = useMemo(
     () =>
       ({
@@ -495,6 +960,30 @@ export function App() {
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  useEffect(() => {
+    if (!sceneContextMenu) {
+      return;
+    }
+
+    const closeMenu = () => setSceneContextMenu(null);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [sceneContextMenu]);
 
   const panelInspectorTarget = useMemo<InspectorTarget | null>(() => {
     if (!inspectorTarget) {
@@ -957,13 +1446,17 @@ export function App() {
       const scriptFile = chooseModelPackageParameterScriptFile(meta, result.textFiles, result.scriptFile, warnings);
       const runtimeScript = getMetaRuntimeScript(
         meta,
-        result.projectFiles.map((file) => file.relativePath),
+        result.textFiles,
         scriptFile ?? result.scriptFile,
         warnings
       );
       const scriptText = scriptFile ? result.textFiles[scriptFile] ?? "" : "";
       const parsed = parseModelPackageDecorators(scriptText, scriptFile ?? "");
-      warnings.push(...parsed.warnings);
+      const metaParameters = parseMetaParameterDefinition(meta, scriptFile, result.metaFile ?? "meta.json", warnings);
+      if (parsed.fields.length > 0 || metaParameters.fields.length === 0) {
+        warnings.push(...parsed.warnings);
+      }
+      const dynamicFields = mergeDynamicFields(parsed.fields, metaParameters.fields);
       const dataDriven = parseModelPackageDataDrivenFromScripts(
         result.textFiles,
         [runtimeScript.scriptFile, scriptFile, result.scriptFile],
@@ -982,7 +1475,8 @@ export function App() {
         metaFile: result.metaFile,
         meta,
         files: mapModelPackageFiles(result.projectFiles),
-        dynamicFields: parsed.fields,
+        dynamicFields,
+        initialValues: metaParameters.initialValues,
         warnings,
         importedAt: Date.now()
       };
@@ -1175,6 +1669,156 @@ export function App() {
     [engine]
   );
 
+  /** 下发模型树展开折叠命令，token 保证连续触发同类命令也会执行。 */
+  const runTreeExpansionCommand = useCallback((action: HierarchyExpansionCommand["action"], targetId?: number) => {
+    setTreeExpansionCommand((current) => ({
+      action,
+      targetId,
+      token: (current?.token ?? 0) + 1
+    }));
+  }, []);
+
+  /** 打开场景右键菜单，空白目标只展示树级命令，节点目标展示对象命令。 */
+  const openSceneContextMenu = useCallback((target: SceneContextMenuTarget | null, point: { x: number; y: number }) => {
+    setSceneContextMenu({
+      target,
+      ...clampSceneContextMenuPosition(point)
+    });
+  }, []);
+
+  /** 从层级树右键打开对象菜单，并同步当前选中节点。 */
+  const handleHierarchyNodeContextMenu = useCallback(
+    (node: SceneNodeSummary, point: { x: number; y: number }) => {
+      engine?.selectById(node.id);
+      openSceneContextMenu(createSceneContextTargetFromSceneNode(node), point);
+    },
+    [engine, openSceneContextMenu]
+  );
+
+  /** 从层级树空白区域打开树级菜单。 */
+  const handleHierarchyBlankContextMenu = useCallback(
+    (point: { x: number; y: number }) => {
+      openSceneContextMenu(null, point);
+    },
+    [openSceneContextMenu]
+  );
+
+  /** 从视口右键拾取结果打开对象菜单，空白位置只关闭已有菜单。 */
+  const handleViewportModelContextMenu = useCallback(
+    (target: TransformSnapshot | null, point: { x: number; y: number }) => {
+      if (!target) {
+        setSceneContextMenu(null);
+        return;
+      }
+
+      openSceneContextMenu(createSceneContextTargetFromTransformSnapshot(target), point);
+    },
+    [openSceneContextMenu]
+  );
+
+  /** 执行带节点目标的右键命令，确保右键命中的节点就是命令作用对象。 */
+  const runTargetedNodeCommand = useCallback(
+    (target: SceneContextMenuTarget | null, command: (target: SceneContextMenuTarget) => void) => {
+      if (!target || !engine) {
+        return;
+      }
+
+      engine.selectById(target.id);
+      command(target);
+      setSceneContextMenu(null);
+    },
+    [engine]
+  );
+
+  /** 右键重命名直接复用属性面板的更新入口，避免新增一套名称持久化逻辑。 */
+  const handleRenameSceneNode = useCallback(
+    (target: SceneContextMenuTarget | null) => {
+      if (!engine || !target || target.locked) {
+        return;
+      }
+
+      const nextName = window.prompt("重命名对象", target.name)?.trim();
+      if (!nextName || nextName === target.name) {
+        setSceneContextMenu(null);
+        return;
+      }
+
+      const nextSelection = engine.updateNodeById(target.id, { name: nextName });
+      if (nextSelection) {
+        setInspectorTarget({ type: "node", node: nextSelection });
+      }
+      setSceneContextMenu(null);
+    },
+    [engine]
+  );
+
+  /** 聚焦选中对象所在资源库卡片，文件夹和未登记资产不会产生空跳转。 */
+  const handleFocusAssetLibrary = useCallback(
+    (target: SceneContextMenuTarget | null = selectedHierarchyNode) => {
+      if (!engine || !target) {
+        return false;
+      }
+
+      const focusTarget = engine.getAssetLibraryFocusTargetById(target.id);
+      if (!focusTarget) {
+        return false;
+      }
+
+      setAssetLibraryFocusCommand((current) => ({
+        ...focusTarget,
+        token: (current?.token ?? 0) + 1
+      }));
+      return true;
+    },
+    [engine, selectedHierarchyNode]
+  );
+
+  /** 从右键菜单进入模型阵列弹窗，并填入默认参数。 */
+  const handleOpenModelArrayDialog = useCallback(() => {
+    if (!sceneContextMenu?.target || !canOpenModelArrayMenu(sceneContextMenu.target)) {
+      return;
+    }
+
+    setModelArrayDialog({
+      target: sceneContextMenu.target,
+      axis: MODEL_ARRAY_DEFAULT_AXIS,
+      count: MODEL_ARRAY_DEFAULT_COUNT,
+      spacing: MODEL_ARRAY_DEFAULT_SPACING
+    });
+    setSceneContextMenu(null);
+  }, [sceneContextMenu]);
+
+  /** 更新模型阵列表单字段，字符串状态保留用户正在输入的小数或空值。 */
+  const handleModelArrayDialogChange = useCallback((update: Partial<Omit<ModelArrayDialogState, "target">>) => {
+    setModelArrayDialog((current) => (current ? { ...current, ...update } : current));
+  }, []);
+
+  /** 提交模型阵列命令，失败原因直接展示在项目错误提示中。 */
+  const handleCreateModelArray = useCallback(() => {
+    if (!engine || !modelArrayDialog) {
+      return;
+    }
+
+    const result = engine.createModelArray({
+      targetId: modelArrayDialog.target.id,
+      axis: modelArrayDialog.axis,
+      count: Number(modelArrayDialog.count),
+      spacing: Number(modelArrayDialog.spacing)
+    });
+    if (!result.success) {
+      setProjectError(result.message ?? "创建模型阵列失败。");
+      setProjectErrorExpanded(false);
+      return;
+    }
+
+    if (result.selectedNode) {
+      setInspectorTarget({ type: "node", node: result.selectedNode });
+    }
+    setProjectError(null);
+    setProjectErrorExpanded(false);
+    setModelArrayDialog(null);
+  }, [engine, modelArrayDialog]);
+
   /** 删除当前选中的场景对象，支持导入模型和基础对象。 */
   const handleDeleteSelected = useCallback(() => {
     engine?.deleteSelected();
@@ -1195,6 +1839,7 @@ export function App() {
 
       const normalizedKey = event.key.toLowerCase();
       const isPlainSystemShortcut = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+      const hasSystemModifier = event.ctrlKey || event.metaKey || event.altKey;
       if (isPlainSystemShortcut && normalizedKey === "c") {
         if (engine.copySelected()) {
           event.preventDefault();
@@ -1209,6 +1854,53 @@ export function App() {
         return;
       }
 
+      if (isPlainSystemShortcut && normalizedKey === "k") {
+        if (engine.toggleSelectedLock()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (isPlainSystemShortcut && normalizedKey === "g") {
+        if (engine.groupSelected()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && normalizedKey === "g") {
+        if (engine.ungroupSelected()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (isPlainSystemShortcut && normalizedKey === "i") {
+        if (engine.invertSelection()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (!hasSystemModifier && normalizedKey === "f" && selectedNode) {
+        event.preventDefault();
+        engine.focusById(selectedNode.id);
+        return;
+      }
+
+      if (!hasSystemModifier && normalizedKey === "h") {
+        if (engine.toggleSelectedVisibility()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (!hasSystemModifier && normalizedKey === "p") {
+        event.preventDefault();
+        runTreeExpansionCommand("toggle", selectedHierarchyNode?.kind === "Group" ? selectedHierarchyNode.id : undefined);
+        return;
+      }
+
       if (!selectedNode || selectedNode.locked || (event.key !== "Delete" && event.key !== "Backspace")) {
         return;
       }
@@ -1219,7 +1911,7 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [engine, selectedNode]);
+  }, [engine, runTreeExpansionCommand, selectedHierarchyNode, selectedNode]);
 
   /** 从属性面板按当前快照节点 ID 提交对象变换、材质或 metadata 更新，避免引擎选中状态短暂失配。 */
   const handleInspectorChange = useCallback(
@@ -1524,6 +2216,11 @@ export function App() {
     : cadRestoreActive
     ? "CAD 图纸正在恢复，请等待完成后再导入新的 CAD 图纸"
     : undefined;
+  const contextTarget = sceneContextMenu?.target ?? null;
+  const contextTreeTargetId = contextTarget?.kind === "Group" && contextTarget.hasChildren ? contextTarget.id : undefined;
+  const contextAssetFocusTarget = contextTarget && engine ? engine.getAssetLibraryFocusTargetById(contextTarget.id) : null;
+  const contextCanEdit = Boolean(contextTarget && !contextTarget.locked);
+  const contextCanToggleLock = Boolean(contextTarget && (!contextTarget.lockedByAncestor || contextTarget.selfLocked));
 
   if (!activeProject) {
     return (
@@ -1654,12 +2351,15 @@ export function App() {
         <HierarchyPanel
           title={activeProject.name}
           nodes={nodes}
+          expansionCommand={treeExpansionCommand}
           onSelect={handleSelectNode}
           onFocus={handleFocusNode}
           onCreateNode={handleCreateHierarchyNode}
           onToggleVisibility={handleToggleNodeVisibility}
           onToggleLock={handleToggleNodeLock}
           onMoveNodeToGroup={handleMoveNodeToGroup}
+          onNodeContextMenu={handleHierarchyNodeContextMenu}
+          onBlankContextMenu={handleHierarchyBlankContextMenu}
         />
         <ViewportCanvas
           key={activeScene?.id ?? "empty-scene"}
@@ -1670,6 +2370,7 @@ export function App() {
           onEngineReady={handleEngineReady}
           onDropAsset={handleDropAsset}
           onDropFiles={handleDropFiles}
+          onModelContextMenu={handleViewportModelContextMenu}
         />
         <InspectorPanel
           target={panelInspectorTarget}
@@ -1685,6 +2386,7 @@ export function App() {
         />
         <AssetBrowser
           assets={assets}
+          focusCommand={assetLibraryFocusCommand}
           height={assetBrowserHeight}
           minHeight={MIN_ASSET_BROWSER_HEIGHT}
           maxHeight={assetBrowserMaxHeight}
@@ -1693,6 +2395,247 @@ export function App() {
           onImportModelPackage={handleImportModelPackage}
         />
       </div>
+
+      {sceneContextMenu && (
+        <div
+          className="model-context-menu scene-context-menu"
+          style={{ left: sceneContextMenu.x, top: sceneContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {contextTarget ? (
+            <>
+              <div className="scene-context-menu-title" title={contextTarget.name}>
+                {contextTarget.name}
+              </div>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => runTargetedNodeCommand(contextTarget, (target) => engine?.focusById(target.id))}
+              >
+                场景聚焦 <span>F</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextAssetFocusTarget}
+                onClick={() => {
+                  handleFocusAssetLibrary(contextTarget);
+                  setSceneContextMenu(null);
+                }}
+              >
+                库聚焦
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextCanEdit}
+                onClick={() =>
+                  runTargetedNodeCommand(contextTarget, (target) => engine?.setNodeVisibilityById(target.id, !target.visible))
+                }
+              >
+                {contextTarget.visible ? "隐藏对象" : "显示对象"} <span>H</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextCanEdit}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.copySelected())}
+              >
+                复制 <span>Ctrl+C</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  engine?.pasteClipboard();
+                  setSceneContextMenu(null);
+                }}
+              >
+                粘贴 <span>Ctrl+V</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextCanToggleLock}
+                onClick={() =>
+                  runTargetedNodeCommand(contextTarget, (target) => engine?.setNodeLockedById(target.id, !target.selfLocked))
+                }
+              >
+                {contextTarget.selfLocked ? "解锁对象" : "锁定对象"} <span>Ctrl+K</span>
+              </button>
+              <button className="model-context-menu-item" type="button" disabled={!contextCanEdit} onClick={() => handleRenameSceneNode(contextTarget)}>
+                重命名
+              </button>
+              <button
+                className="model-context-menu-item danger-item"
+                type="button"
+                disabled={!contextCanEdit}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => engine?.deleteSelected())}
+              >
+                删除 <span>Delete</span>
+              </button>
+              <div className="scene-context-menu-separator" />
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextCanEdit}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.groupSelected())}
+              >
+                群组对象 <span>Ctrl+G</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextCanEdit}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.ungroupSelected())}
+              >
+                解组对象 <span>Shift+G</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                disabled={!contextTarget.hasChildren}
+                onClick={() => runTargetedNodeCommand(contextTarget, (target) => void engine?.selectFirstChildById(target.id))}
+              >
+                选择子级
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  engine?.invertSelection();
+                  setSceneContextMenu(null);
+                }}
+              >
+                反选对象 <span>Ctrl+I</span>
+              </button>
+              <div className="scene-context-menu-separator" />
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  runTreeExpansionCommand("expand", contextTreeTargetId);
+                  setSceneContextMenu(null);
+                }}
+              >
+                展开树 <span>P</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  runTreeExpansionCommand("collapse", contextTreeTargetId);
+                  setSceneContextMenu(null);
+                }}
+              >
+                折叠树 <span>P</span>
+              </button>
+              {canOpenModelArrayMenu(contextTarget) && (
+                <>
+                  <div className="scene-context-menu-separator" />
+                  <button className="model-context-menu-item" type="button" onClick={handleOpenModelArrayDialog}>
+                    模型阵列
+                  </button>
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  handleCreateHierarchyNode();
+                  setSceneContextMenu(null);
+                }}
+              >
+                新建文件夹
+              </button>
+              <div className="scene-context-menu-separator" />
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  runTreeExpansionCommand("expand");
+                  setSceneContextMenu(null);
+                }}
+              >
+                展开树 <span>P</span>
+              </button>
+              <button
+                className="model-context-menu-item"
+                type="button"
+                onClick={() => {
+                  runTreeExpansionCommand("collapse");
+                  setSceneContextMenu(null);
+                }}
+              >
+                折叠树 <span>P</span>
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {modelArrayDialog && (
+        <div className="modal-backdrop">
+          <form
+            className="modal-panel model-array-dialog"
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleCreateModelArray();
+            }}
+          >
+            <div className="panel-title">模型阵列</div>
+            <div className="model-array-target" title={modelArrayDialog.target.name}>
+              当前模型：{modelArrayDialog.target.name}
+            </div>
+            <label className="field">
+              <span>阵列轴向</span>
+              <select
+                value={modelArrayDialog.axis}
+                onChange={(event) => handleModelArrayDialogChange({ axis: readModelArrayAxis(event.target.value) })}
+              >
+                <option value="x">X 轴（正向）</option>
+                <option value="-x">-X 轴（负向）</option>
+                <option value="z">Z 轴（正向）</option>
+                <option value="-z">-Z 轴（负向）</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>克隆数量</span>
+              <input
+                autoFocus
+                min={1}
+                max={50}
+                step={1}
+                type="number"
+                value={modelArrayDialog.count}
+                onChange={(event) => handleModelArrayDialogChange({ count: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>间距 m</span>
+              <input
+                min={0.001}
+                step={0.1}
+                type="number"
+                value={modelArrayDialog.spacing}
+                onChange={(event) => handleModelArrayDialogChange({ spacing: event.target.value })}
+              />
+            </label>
+            <div className="modal-actions">
+              <button className="icon-text-button" type="button" onClick={() => setModelArrayDialog(null)}>
+                取消
+              </button>
+              <button className="command-button" type="submit">
+                创建阵列
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {sceneDialogOpen && (
         <div className="modal-backdrop">

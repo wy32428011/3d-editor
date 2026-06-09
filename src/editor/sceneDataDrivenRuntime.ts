@@ -81,11 +81,22 @@ const DEFAULT_STACKER_SIMULATION_SETTINGS: StackerSimulationSettings = {
   forkSideRange: 0.18
 };
 
-/** 可被场景数据驱动运行时匹配和驱动的模型根节点。 */
+/** 根节点整体位姿字段映射，定位框可用它接收自定义字段。 */
+export interface SceneDataDrivenRootMotionFields {
+  positionX?: string[];
+  positionY?: string[];
+  positionZ?: string[];
+  rotationY?: string[];
+  interpolationMs?: number;
+}
+
+/** 可被场景数据驱动运行时匹配和驱动的模型或定位框根节点。 */
 export interface SceneDataDrivenTarget {
   root: TransformNode;
   matchFields: Record<string, string>;
   dataDriven?: ModelDataDrivenDefinition;
+  rootMotionFields?: SceneDataDrivenRootMotionFields;
+  requiresDeviceMatch?: boolean;
 }
 
 /** 场景数据驱动运行时的宿主能力，由 Babylon 引擎提供。 */
@@ -319,9 +330,10 @@ export class SceneDataDrivenRuntime {
       return existing;
     }
 
-    const legacyStackerGroups = this.createStackerMotionGroups(target);
-    const isStacker = this.isStackerTarget(target, legacyStackerGroups);
-    const motionGroups = this.createMotionGroups(target, isStacker, legacyStackerGroups);
+    const rootMotionOnly = Boolean(target.rootMotionFields);
+    const legacyStackerGroups = rootMotionOnly ? null : this.createStackerMotionGroups(target);
+    const isStacker = legacyStackerGroups ? this.isStackerTarget(target, legacyStackerGroups) : false;
+    const motionGroups = legacyStackerGroups ? this.createMotionGroups(target, isStacker, legacyStackerGroups) : [];
     const motionNodes = this.getMotionNodes(motionGroups);
     const motionBasePositions = this.captureNodePositions(motionNodes);
     const motionBaseRotations = this.captureNodeRotations(motionNodes);
@@ -441,7 +453,7 @@ export class SceneDataDrivenRuntime {
     }
 
     const state = this.ensureTargetState(target, now);
-    const configuredDuration = state.target.dataDriven?.device?.interpolationMs;
+    const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const duration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
     state.motionStartedAt = now;
     state.motionDurationMs = duration;
@@ -468,13 +480,18 @@ export class SceneDataDrivenRuntime {
   /** 根据数据帧创建整机根节点目标位置，文档坐标的 X/Y/H 对应 Babylon 的 X/Z/Y。 */
   private createRootTargetPosition(state: DataDrivenTargetState, frame: DataFrame): Vector3 {
     const position = state.target.root.position.clone();
-    const x = this.readNumber(frame, ["x", "position.x", "pos.x", "location.x", "root.x"]);
+    const x = this.readNumber(
+      frame,
+      this.getRootMotionFieldCandidates(state.target.rootMotionFields?.positionX, ["x", "position.x", "pos.x", "location.x", "root.x"])
+    );
     const yFields = state.usesDocumentCoordinateMapping
       ? ["h", "height", "position.z", "pos.z", "location.z", "root.z"]
       : ["y", "position.y", "pos.y", "location.y", "root.y"];
     const zFields = state.usesDocumentCoordinateMapping ? ["y"] : ["z", "h", "height", "position.z", "pos.z", "location.z", "root.z"];
-    const y = this.readNumber(frame, yFields);
-    const z = this.readNumber(frame, zFields);
+    const yFieldCandidates = this.getRootMotionFieldCandidates(state.target.rootMotionFields?.positionY, yFields);
+    const zFieldCandidates = this.getRootMotionFieldCandidates(state.target.rootMotionFields?.positionZ, zFields);
+    const y = this.readNumber(frame, yFieldCandidates);
+    const z = this.readNumber(frame, zFieldCandidates);
     if (x !== undefined) {
       position.x = x;
     }
@@ -489,12 +506,24 @@ export class SceneDataDrivenRuntime {
 
   /** 根据数据帧创建整机朝向，文档 twinspawn 的 r 和 yaw/rotationY 默认按角度解释。 */
   private createRootTargetRotationY(state: DataDrivenTargetState, frame: DataFrame): number | undefined {
-    const rotationY = this.readNumber(frame, ["r", "yaw", "rotationY", "rotation.y", "heading"]);
+    const rotationY = this.readNumber(
+      frame,
+      this.getRootMotionFieldCandidates(state.target.rootMotionFields?.rotationY, ["r", "yaw", "rotationY", "rotation.y", "heading"])
+    );
     if (rotationY === undefined) {
       return state.rootTargetRotationY;
     }
 
     return (rotationY * Math.PI) / 180;
+  }
+
+  /** 定位框可自定义根节点位姿字段；传入空数组时表示该轴不接收数据。 */
+  private getRootMotionFieldCandidates(customFields: string[] | undefined, fallbackFields: string[]): string[] {
+    if (customFields !== undefined) {
+      return customFields.map((field) => field.trim()).filter((field) => field.length > 0);
+    }
+
+    return fallbackFields;
   }
 
   /** 根据所有 translate 运动组合成内部部件目标位置。 */
@@ -655,7 +684,8 @@ export class SceneDataDrivenRuntime {
       }
     }
 
-    return !frameContainsDeviceId && targets.length === 1 ? targets[0] : null;
+    const fallbackTargets = targets.filter((target) => !target.requiresDeviceMatch);
+    return !frameContainsDeviceId && fallbackTargets.length === 1 ? fallbackTargets[0] : null;
   }
 
   /** 解析 JSON payload，非 JSON 文本会被忽略。 */

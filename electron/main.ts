@@ -60,6 +60,13 @@ let mainWindow: BrowserWindow | null = null;
 const authorizedProjectPaths = new Set<string>();
 const sceneMutationQueues = new Map<string, Promise<void>>();
 
+/** 尽早向 Chromium 申请高性能 GPU，避免混合显卡或黑名单策略落到低功耗/软件渲染路径。 */
+function configureGpuAcceleration(): void {
+  app.commandLine.appendSwitch("ignore-gpu-blocklist");
+  app.commandLine.appendSwitch("enable-gpu-rasterization");
+  app.commandLine.appendSwitch("force_high_performance_gpu");
+}
+
 interface RecentProjectRecord {
   id: string;
   name: string;
@@ -1327,5 +1334,6 @@ function enforceSingleInstance(): void {
   });
 }
 
+configureGpuAcceleration();
 enforceSingleInstance();
 registerAppLifecycle();

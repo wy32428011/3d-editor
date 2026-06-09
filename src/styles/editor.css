@@ -454,6 +454,16 @@ input {
   white-space: nowrap;
 }
 
+.stats-strip span {
+  min-width: 0;
+}
+
+.stats-strip span[title] {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .hidden-input {
   display: none;
 }
@@ -484,6 +494,83 @@ input {
   justify-content: flex-end;
   gap: 8px;
   padding: 12px;
+}
+
+.model-context-menu {
+  position: fixed;
+  z-index: 30;
+  width: 180px;
+  border: 1px solid #3f493b;
+  background: #171a18;
+  box-shadow: 0 12px 28px rgb(0 0 0 / 0.38);
+}
+
+.scene-context-menu {
+  width: 220px;
+  max-height: min(420px, calc(100vh - 16px));
+  overflow: auto;
+}
+
+.scene-context-menu-title {
+  min-width: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid #2f352f;
+  color: #aeb8a8;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-context-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: #2f352f;
+}
+
+.model-context-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  background: transparent;
+  color: #eee8d8;
+  padding: 0 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-context-menu-item span {
+  color: #8e978a;
+  font-size: 11px;
+}
+
+.model-context-menu-item:hover:not(:disabled) {
+  background: #25312a;
+  color: #c5f0b7;
+}
+
+.model-context-menu-item:disabled {
+  color: #6e766c;
+  cursor: not-allowed;
+}
+
+.model-context-menu-item.danger-item:hover:not(:disabled) {
+  background: #3b2424;
+  color: #ffb9b0;
+}
+
+.model-array-target {
+  min-width: 0;
+  padding: 12px;
+  border-bottom: 1px solid #2a2e29;
+  color: #d8dfd0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel {
@@ -667,6 +754,21 @@ input {
 .inspector-object-name:focus {
   outline: 1px solid #7f9b71;
   outline-offset: 0;
+}
+
+.inspector-unit-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.inspector-unit-suffix {
+  color: #9ca69c;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: left;
 }
 
 .inspector-range-row {
@@ -1382,6 +1484,13 @@ input {
   background: #253128;
 }
 
+.asset-tile.is-focused {
+  border-color: #c5f0b7;
+  outline: 2px solid rgb(197 240 183 / 0.45);
+  outline-offset: 2px;
+  background: #2b3a2d;
+}
+
 .asset-tile span,
 .asset-tile small {
   max-width: 100%;
@@ -1520,7 +1629,8 @@ input {
   font-weight: 700;
 }
 
-.field input {
+.field input,
+.field select {
   width: 100%;
   min-width: 0;
   height: 32px;

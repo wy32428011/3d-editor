@@ -3,6 +3,7 @@ import {
   Camera,
   ChevronDown,
   ChevronRight,
+  Cuboid,
   Eye,
   EyeOff,
   FileAxis3d,
@@ -15,18 +16,27 @@ import {
   Search,
   Unlock
 } from "lucide-react";
-import { useEffect, useMemo, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
 import type { SceneNodeKind, SceneNodeSummary } from "../types/editor";
+
+export interface HierarchyExpansionCommand {
+  action: "expand" | "collapse" | "toggle";
+  targetId?: number;
+  token: number;
+}
 
 interface HierarchyPanelProps {
   title?: string;
   nodes: SceneNodeSummary[];
+  expansionCommand?: HierarchyExpansionCommand | null;
   onSelect: (id: number) => void;
   onFocus: (id: number) => void;
   onCreateNode: () => void;
   onToggleVisibility: (id: number, visible: boolean) => void;
   onToggleLock: (id: number, locked: boolean) => void;
   onMoveNodeToGroup: (id: number, groupId: number | null) => void;
+  onNodeContextMenu: (node: SceneNodeSummary, point: { x: number; y: number }) => void;
+  onBlankContextMenu: (point: { x: number; y: number }) => void;
 }
 
 const nodeDragMimeType = "application/x-editor-scene-node";
@@ -35,17 +45,21 @@ const nodeDragMimeType = "application/x-editor-scene-node";
 export function HierarchyPanel({
   title = "模型树",
   nodes,
+  expansionCommand,
   onSelect,
   onFocus,
   onCreateNode,
   onToggleVisibility,
   onToggleLock,
-  onMoveNodeToGroup
+  onMoveNodeToGroup,
+  onNodeContextMenu,
+  onBlankContextMenu
 }: HierarchyPanelProps) {
   const [query, setQuery] = useState("");
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({});
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const [dropTargetId, setDropTargetId] = useState<number | "root" | null>(null);
+  const consumedExpansionTokenRef = useRef<number | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
   const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
 
@@ -62,6 +76,15 @@ export function HierarchyPanel({
       return changed ? next : current;
     });
   }, [nodes]);
+
+  useEffect(() => {
+    if (!expansionCommand || consumedExpansionTokenRef.current === expansionCommand.token) {
+      return;
+    }
+
+    consumedExpansionTokenRef.current = expansionCommand.token;
+    setExpandedGroups((current) => applyExpansionCommand(current, nodes, expansionCommand));
+  }, [expansionCommand, nodes]);
 
   const visibleNodes = useMemo(
     () => nodes.filter((node) => shouldRenderNode(node, nodes, nodeById, expandedGroups, normalizedQuery)),
@@ -152,12 +175,30 @@ export function HierarchyPanel({
 
   /** 拖到列表空白区域时把节点移回根级。 */
   const handleRootDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (draggingId === null) {
+      return;
+    }
+
     event.preventDefault();
     const nodeId = readDraggedNodeId(event);
     if (nodeId !== null) {
       onMoveNodeToGroup(nodeId, null);
     }
     handleDragEnd();
+  };
+
+  /** 打开节点右键菜单，具体可用命令由 App 按当前引擎状态继续校验。 */
+  const handleNodeContextMenu = (event: ReactMouseEvent<HTMLDivElement>, node: SceneNodeSummary) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onNodeContextMenu(node, { x: event.clientX, y: event.clientY });
+  };
+
+  /** 打开树空白区域右键菜单，用于新建文件夹和批量展开折叠。 */
+  const handleBlankContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onBlankContextMenu({ x: event.clientX, y: event.clientY });
   };
 
   return (
@@ -180,6 +221,7 @@ export function HierarchyPanel({
       </div>
       <div
         className={`node-list ${dropTargetId === "root" ? "is-root-drop-target" : ""}`}
+        onContextMenu={handleBlankContextMenu}
         onDragLeave={() => setDropTargetId((current) => (current === "root" ? null : current))}
         onDragOver={handleRootDragOver}
         onDrop={handleRootDrop}
@@ -201,6 +243,7 @@ export function HierarchyPanel({
               onDragLeave={() => setDropTargetId((current) => (current === node.id ? null : current))}
               onDragOver={(event) => handleRowDragOver(event, node)}
               onDrop={(event) => handleRowDrop(event, node)}
+              onContextMenu={(event) => handleNodeContextMenu(event, node)}
             >
               <button
                 className={`node-visibility-button ${node.visible ? "" : "is-hidden"}`}
@@ -279,7 +322,38 @@ function getNodeIcon(kind: SceneNodeKind) {
     return FileAxis3d;
   }
 
+  if (kind === "Locator") {
+    return Cuboid;
+  }
+
   return Box;
+}
+
+/** 执行外层快捷键或右键菜单下发的展开折叠命令，保持模型树状态仍归属本组件。 */
+function applyExpansionCommand(
+  current: Record<number, boolean>,
+  nodes: SceneNodeSummary[],
+  command: HierarchyExpansionCommand
+): Record<number, boolean> {
+  const groupIds = nodes.filter((node) => node.kind === "Group" && node.hasChildren).map((node) => node.id);
+  if (groupIds.length === 0) {
+    return current;
+  }
+
+  if (command.targetId !== undefined && groupIds.includes(command.targetId)) {
+    const expanded = command.action === "toggle" ? current[command.targetId] === false : command.action === "expand";
+    return {
+      ...current,
+      [command.targetId]: expanded
+    };
+  }
+
+  const shouldExpand = command.action === "toggle" ? groupIds.some((id) => current[id] === false) : command.action === "expand";
+  const next = { ...current };
+  groupIds.forEach((id) => {
+    next[id] = shouldExpand;
+  });
+  return next;
 }
 
 /** 判断节点是否匹配层级搜索关键词，支持名称和类型。 */

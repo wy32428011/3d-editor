@@ -3,6 +3,7 @@ import {
   BarChart3,
   Box,
   Circle,
+  Cuboid,
   Cylinder,
   FileArchive,
   GitBranch,
@@ -24,10 +25,11 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { POI_CATALOG_ITEMS } from "../editor/poiCatalog";
-import type { AssetRecord, PrimitiveKind } from "../types/editor";
+import type { AssetLibraryFocusTarget, AssetRecord, PrimitiveKind } from "../types/editor";
 
 interface AssetBrowserProps {
   assets: AssetRecord[];
+  focusCommand?: (AssetLibraryFocusTarget & { token: number }) | null;
   height: number;
   minHeight: number;
   maxHeight: number;
@@ -36,8 +38,9 @@ interface AssetBrowserProps {
   onImportModelPackage: () => void | Promise<void>;
 }
 
-const primitives: Array<{ kind: PrimitiveKind; label: string; icon: typeof Box }> = [
+const primitives: Array<{ kind: PrimitiveKind; label: string; icon: LucideIcon }> = [
   { kind: "cube", label: "Cube", icon: Box },
+  { kind: "locatorWireCube", label: "Locator Box", icon: Cuboid },
   { kind: "sphere", label: "Sphere", icon: Circle },
   { kind: "cylinder", label: "Cylinder", icon: Cylinder },
   { kind: "ground", label: "Ground", icon: Grid3X3 },
@@ -71,11 +74,22 @@ const poiIconMap: Record<string, LucideIcon> = {
 };
 
 /** 底部资源浏览器展示模型库和 POI 库，所有可用卡片都通过拖拽进入视口。 */
-export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightChange, onImportFiles, onImportModelPackage }: AssetBrowserProps) {
+export function AssetBrowser({
+  assets,
+  focusCommand,
+  height,
+  minHeight,
+  maxHeight,
+  onHeightChange,
+  onImportFiles,
+  onImportModelPackage
+}: AssetBrowserProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
+  const tileRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [activeLibrary, setActiveLibrary] = useState<AssetLibraryKey>("model");
   const [poiKeyword, setPoiKeyword] = useState("");
+  const [focusedTile, setFocusedTile] = useState<{ key: string; token: number } | null>(null);
   const importedAssets = assets.filter((asset) => asset.type !== "primitive");
   const filteredPoiItems = useMemo(() => {
     const keyword = poiKeyword.trim().toLowerCase();
@@ -103,6 +117,50 @@ export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightCha
 
   useEffect(() => {
     return () => resizeCleanupRef.current?.();
+  }, []);
+
+  useEffect(() => {
+    if (!focusCommand) {
+      return;
+    }
+
+    setActiveLibrary(focusCommand.type === "poi" ? "poi" : "model");
+    if (focusCommand.type === "poi") {
+      setPoiKeyword("");
+    }
+    setFocusedTile({ key: getAssetFocusTileKey(focusCommand), token: focusCommand.token });
+  }, [focusCommand]);
+
+  useEffect(() => {
+    if (!focusedTile) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const element = tileRefs.current.get(focusedTile.key);
+      element?.scrollIntoView({ block: "nearest", inline: "center" });
+      element?.focus({ preventScroll: true });
+    });
+    const timer = window.setTimeout(() => {
+      setFocusedTile((current) => (current?.token === focusedTile.token ? null : current));
+    }, 1400);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [activeLibrary, focusedTile, filteredPoiItems.length, importedAssets.length]);
+
+  /** 登记资源卡片 DOM，资源库聚焦命令需要直接滚动到目标卡片。 */
+  const registerTileRef = useCallback((key: string) => {
+    return (element: HTMLDivElement | null) => {
+      if (element) {
+        tileRefs.current.set(key, element);
+        return;
+      }
+
+      tileRefs.current.delete(key);
+    };
   }, []);
 
   /** 拖动资源库上边缘，按鼠标纵向位移调整底部区域高度。 */
@@ -238,8 +296,10 @@ export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightCha
                 return (
                   <div
                     key={item.kind}
-                    className="asset-tile"
+                    ref={registerTileRef(`primitive:${item.kind}`)}
+                    className={`asset-tile ${focusedTile?.key === `primitive:${item.kind}` ? "is-focused" : ""}`}
                     draggable
+                    tabIndex={-1}
                     title={item.label}
                     onDragStart={(event) => event.dataTransfer.setData("application/x-editor-primitive", item.kind)}
                   >
@@ -255,8 +315,12 @@ export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightCha
                 return (
                   <div
                     key={asset.id}
-                    className={`asset-tile imported-asset-tile ${placeable ? "" : "is-unavailable"}`}
+                    ref={registerTileRef(`asset:${asset.id}`)}
+                    className={`asset-tile imported-asset-tile ${placeable ? "" : "is-unavailable"} ${
+                      focusedTile?.key === `asset:${asset.id}` ? "is-focused" : ""
+                    }`}
                     draggable={placeable}
+                    tabIndex={-1}
                     title={placeable ? `${asset.name}，拖入视口添加到场景` : `${asset.name}，当前类型不可拖入场景`}
                     onDragStart={(event) => {
                       if (!placeable) {
@@ -289,8 +353,10 @@ export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightCha
               return (
                 <div
                   key={item.kind}
-                  className="asset-tile poi-asset-tile"
+                  ref={registerTileRef(`poi:${item.kind}`)}
+                  className={`asset-tile poi-asset-tile ${focusedTile?.key === `poi:${item.kind}` ? "is-focused" : ""}`}
                   draggable
+                  tabIndex={-1}
                   title={`${item.title}，${item.description}`}
                   onDragStart={(event) => {
                     event.dataTransfer.effectAllowed = "copy";
@@ -330,6 +396,19 @@ export function AssetBrowser({ assets, height, minHeight, maxHeight, onHeightCha
 /** 只有模型和 Babylon 场景资产可以从资产区拖入视口实例化。 */
 function isPlaceableAsset(asset: AssetRecord): boolean {
   return asset.type === "model" || asset.type === "scene";
+}
+
+/** 把 App 下发的资源库目标转成具体卡片 key。 */
+function getAssetFocusTileKey(command: AssetLibraryFocusTarget): string {
+  if (command.type === "asset") {
+    return `asset:${command.assetId}`;
+  }
+
+  if (command.type === "poi") {
+    return `poi:${command.poiKind}`;
+  }
+
+  return `primitive:${command.primitiveKind}`;
 }
 
 /** 组合资产大小和单位归一化提示，帮助用户确认模型会按米进入场景。 */

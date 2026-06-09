@@ -57,6 +57,12 @@ const modelPackageAllowedExtensions = new Set([
 let mainWindow = null;
 const authorizedProjectPaths = new Set();
 const sceneMutationQueues = new Map();
+/** 尽早向 Chromium 申请高性能 GPU，避免混合显卡或黑名单策略落到低功耗/软件渲染路径。 */
+function configureGpuAcceleration() {
+    app.commandLine.appendSwitch("ignore-gpu-blocklist");
+    app.commandLine.appendSwitch("enable-gpu-rasterization");
+    app.commandLine.appendSwitch("force_high_performance_gpu");
+}
 /** 判断未知值是否为普通对象，便于安全读取磁盘 JSON 字段。 */
 function isRecord(value) {
     return typeof value === "object" && value !== null;
@@ -1080,6 +1086,7 @@ function enforceSingleInstance() {
         mainWindow.focus();
     });
 }
+configureGpuAcceleration();
 enforceSingleInstance();
 registerAppLifecycle();
 //# sourceMappingURL=main.js.map
