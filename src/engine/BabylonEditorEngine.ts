@@ -163,6 +163,8 @@ const MAX_MODEL_ARRAY_CLONE_COUNT = 50;
 const CAD_LINE_ELEVATION_METERS = GRID_RENDER_ELEVATION_METERS + 0.045;
 const CAD_LINE_CHUNK_SEGMENTS = 32000;
 const CAD_LINE_PACK_MAX_BYTES = 20 * 1024 * 1024;
+const PROJECT_TEXTURE_SIDECAR_VERSION = 1;
+const PROJECT_TEXTURE_SIDECAR_MIN_BYTES = 1;
 const CAD_RESTORE_MESH_SEGMENTS = 32000;
 const CAD_RESTORE_BATCH_CHUNKS = 48;
 const CAD_RESTORE_YIELD_MESHES = 8;
@@ -261,10 +263,70 @@ interface CadDrawingImportOptions {
   onProgress?: (progress: CadDxfLineProgress) => void;
 }
 
-/** 加载项目场景时用于恢复 CAD 侧车线段文件。 */
+/** 项目保存时用于把运行时贴图写成场景侧车文件。 */
+interface ProjectSceneSerializeOptions {
+  persistExternalTexture?: (fileName: string, data: ArrayBuffer) => Promise<string>;
+}
+
+/** 项目场景贴图侧车清单，真实图片文件位于项目 assets/source 目录。 */
+interface ProjectExternalTextureManifest {
+  version: number;
+  files: ProjectExternalTextureFile[];
+}
+
+/** 单张外部化贴图的项目内文件记录。 */
+interface ProjectExternalTextureFile {
+  textureUniqueId: number;
+  fileName: string;
+  projectFile: string;
+  byteLength: number;
+  mimeType: string;
+  sourceName?: string;
+  sourceUrl?: string;
+}
+
+/** 加载项目场景时用于批量读回贴图侧车文件。 */
+interface ProjectExternalTextureLoadRequest {
+  projectFile: string;
+  fileName: string;
+  expectedByteLength?: number;
+  mimeType?: string;
+}
+
+/** 项目贴图侧车批量读取结果。 */
+interface ProjectExternalTextureLoadResult {
+  projectFile: string;
+  fileName: string;
+  data?: ArrayBuffer;
+  lastModified?: number;
+  error?: string;
+}
+
+/** 保存阶段从运行时贴图提取出的待持久化二进制。 */
+interface ProjectExternalTextureCandidate {
+  texture: Texture;
+  fileName: string;
+  data: ArrayBuffer;
+  byteLength: number;
+  mimeType: string;
+  sourceName?: string;
+  sourceUrl?: string;
+}
+
+/** 单张序列化贴图上的项目侧车诊断元数据。 */
+interface ProjectTextureNodeMetadata {
+  textureUniqueId?: number;
+  projectFile: string;
+  fileName: string;
+  byteLength: number;
+  mimeType: string;
+}
+
+/** 加载项目场景时用于恢复 CAD 侧车线段文件和贴图侧车文件。 */
 interface SerializedSceneLoadOptions {
   loadCadLineChunk?: (projectFile: string) => Promise<ArrayBuffer>;
   loadCadLineChunks?: (requests: CadLineChunkLoadRequest[]) => Promise<CadLineChunkLoadResult[]>;
+  loadExternalTextures?: (requests: ProjectExternalTextureLoadRequest[]) => Promise<ProjectExternalTextureLoadResult[]>;
   onCadRestoreProgress?: (progress: CadDxfLineProgress) => void;
 }
 
@@ -2949,7 +3011,7 @@ export class BabylonEditorEngine {
     URL.revokeObjectURL(url);
   }
 
-  /** 序列化当前编辑场景，供项目文件保存或浏览器下载复用。 */
+  /** 序列化当前编辑场景，供非项目模式 .babylon 下载保持自包含语义。 */
   public serializeScene(): unknown {
     if (this.previewMode) {
       this.exitPreviewMode();
@@ -2972,6 +3034,49 @@ export class BabylonEditorEngine {
     }
   }
 
+  /** 序列化项目场景，贴图二进制写入项目侧车文件，场景 JSON 只保留轻量引用。 */
+  public async serializeProjectScene(options: ProjectSceneSerializeOptions = {}): Promise<unknown> {
+    if (!options.persistExternalTexture) {
+      return this.serializeScene();
+    }
+
+    if (this.previewMode) {
+      this.exitPreviewMode();
+    }
+
+    const previousSerializeBuffers = Texture.SerializeBuffers;
+    const previousForceSerializeBuffers = Texture.ForceSerializeBuffers;
+    this.sceneBusinessRuntime.stop(true);
+    this.stopAllModelPackageRuntimes(true);
+    try {
+      const externalTextures = await this.persistProjectExternalTextures(options.persistExternalTexture);
+      Texture.SerializeBuffers = false;
+      Texture.ForceSerializeBuffers = false;
+      const serialized = SceneSerializer.Serialize(this.scene) as Record<string, unknown>;
+      this.stripEditorRuntimeSerialization(serialized);
+      this.applyProjectExternalTextureReferences(serialized, externalTextures);
+      const strippedBase64Count = this.stripProjectSceneEmbeddedTexturePayloads(serialized);
+      const projectExternalTextures = this.mergeProjectExternalTextureManifest(serialized, externalTextures);
+      serialized.metadata = this.withMetricSceneMetadata(serialized.metadata, {
+        savedAt: new Date().toISOString(),
+        assets: this.getSerializableAssets(),
+        sceneEnvironment: { backgroundColor: this.getSceneEnvironmentColor() },
+        projectExternalTextures,
+        projectTextureSerialization: {
+          version: 1,
+          serializeBuffers: false,
+          strippedBase64Count
+        }
+      });
+      return serialized;
+    } finally {
+      Texture.SerializeBuffers = previousSerializeBuffers;
+      Texture.ForceSerializeBuffers = previousForceSerializeBuffers;
+      this.applyModelPackageRuntimeToScene("serialize");
+      this.sceneBusinessRuntime.start();
+    }
+  }
+
   /** 从项目场景文件恢复 Babylon 内容，并保留编辑器自己的相机、网格和交互辅助对象。 */
   public async loadSerializedScene(serializedScene: unknown, options: SerializedSceneLoadOptions = {}): Promise<void> {
     if (!this.isSerializedScene(serializedScene)) {
@@ -2985,7 +3090,12 @@ export class BabylonEditorEngine {
     this.sceneBusinessRuntime.stop(true);
 
     const loadableScene = this.createLoadableSerializedScene(serializedScene);
+    const projectTextureFileRegistration = await this.registerProjectExternalTextureFilesForLoad(loadableScene, options);
     const sceneUrl = this.createSerializedSceneUrl(loadableScene);
+    const previousUseSerializedUrlIfAny = Texture.UseSerializedUrlIfAny;
+    if (projectTextureFileRegistration.size > 0) {
+      Texture.UseSerializedUrlIfAny = true;
+    }
     try {
       try {
         // 先完整解析到资产容器，成功后再替换视口内容，避免坏场景把当前场景清空。
@@ -2999,6 +3109,8 @@ export class BabylonEditorEngine {
         this.applySceneEditorSettings(sceneInspector.editorSettings);
       } finally {
         URL.revokeObjectURL(sceneUrl);
+        Texture.UseSerializedUrlIfAny = previousUseSerializedUrlIfAny;
+        this.restoreProjectExternalTextureFileRegistration(projectTextureFileRegistration);
       }
       this.scene.activeCamera = this.editorCamera;
       this.editorCamera.attachControl(this.canvas, true);
@@ -3023,6 +3135,643 @@ export class BabylonEditorEngine {
     const loadableScene = JSON.parse(JSON.stringify(serializedScene)) as Record<string, unknown>;
     this.stripEditorRuntimeSerialization(loadableScene);
     return loadableScene;
+  }
+
+  /** 从运行时材质贴图提取可持久化图片，并逐个写入项目侧车文件。 */
+  private async persistProjectExternalTextures(
+    persistExternalTexture?: (fileName: string, data: ArrayBuffer) => Promise<string>
+  ): Promise<ProjectExternalTextureFile[]> {
+    if (!persistExternalTexture) {
+      return [];
+    }
+
+    const candidates = await this.collectProjectExternalTextureCandidates();
+    const files: ProjectExternalTextureFile[] = [];
+    for (const candidate of candidates) {
+      const projectFile = await persistExternalTexture(candidate.fileName, candidate.data);
+      files.push({
+        textureUniqueId: candidate.texture.uniqueId,
+        fileName: candidate.fileName,
+        projectFile,
+        byteLength: candidate.byteLength,
+        mimeType: candidate.mimeType,
+        sourceName: candidate.sourceName,
+        sourceUrl: candidate.sourceUrl
+      });
+    }
+    return files;
+  }
+
+  /** 收集材质正在使用且带有原始二进制的 Texture，避免对 GPU 贴图做同步读回。 */
+  private async collectProjectExternalTextureCandidates(): Promise<ProjectExternalTextureCandidate[]> {
+    const candidates: ProjectExternalTextureCandidate[] = [];
+    const seenTextureIds = new Set<number>();
+    const seenTextureSources = new Set<string>();
+    const usedFileNames = new Set<string>();
+    for (const material of this.scene.materials) {
+      for (const baseTexture of material.getActiveTextures()) {
+        if (!(baseTexture instanceof Texture) || baseTexture instanceof DynamicTexture) {
+          continue;
+        }
+        if (seenTextureIds.has(baseTexture.uniqueId) || (baseTexture as { isRenderTarget?: boolean }).isRenderTarget) {
+          continue;
+        }
+
+        const data = await this.extractProjectTextureBuffer(baseTexture);
+        if (!data || data.byteLength < PROJECT_TEXTURE_SIDECAR_MIN_BYTES) {
+          continue;
+        }
+
+        seenTextureIds.add(baseTexture.uniqueId);
+        const sourceUrl = typeof baseTexture.url === "string" ? baseTexture.url : undefined;
+        const sourceName = typeof baseTexture.name === "string" ? baseTexture.name : undefined;
+        const sourceKey = this.getProjectTextureSourceKey(baseTexture, sourceUrl, sourceName);
+        if (seenTextureSources.has(sourceKey)) {
+          continue;
+        }
+        seenTextureSources.add(sourceKey);
+
+        const mimeType = this.detectProjectTextureMimeType(data, (baseTexture as { mimeType?: string }).mimeType, sourceUrl);
+        const fileName = this.createProjectExternalTextureFileName(baseTexture, mimeType, usedFileNames);
+        candidates.push({
+          texture: baseTexture,
+          fileName,
+          data,
+          byteLength: data.byteLength,
+          mimeType,
+          sourceName,
+          sourceUrl
+        });
+      }
+    }
+    return candidates;
+  }
+
+  /** 生成运行时贴图去重 key，同一 GLB image 或同一源文件只需要保存一份侧车。 */
+  private getProjectTextureSourceKey(texture: Texture, sourceUrl?: string, sourceName?: string): string {
+    if (sourceUrl && !sourceUrl.startsWith("blob:")) {
+      return "url:" + sourceUrl;
+    }
+    if (sourceName && !sourceName.startsWith("blob:")) {
+      return "name:" + sourceName;
+    }
+    return "texture:" + texture.uniqueId;
+  }
+
+  /** 从 Babylon Texture 的原始 buffer、data URL 或本地文件缓存中复制图片数据，无法确认来源时保持跳过。 */
+  private async extractProjectTextureBuffer(texture: Texture): Promise<ArrayBuffer | null> {
+    const textureWithBuffer = texture as { _buffer?: unknown; _texture?: { _buffer?: unknown } };
+    const bufferData = this.projectTextureBufferToArrayBuffer(textureWithBuffer._buffer ?? textureWithBuffer._texture?._buffer);
+    if (bufferData) {
+      return bufferData;
+    }
+
+    if (typeof texture.url === "string") {
+      const urlData = this.dataUrlToArrayBuffer(texture.url);
+      if (urlData) {
+        return urlData;
+      }
+    }
+
+    if (typeof texture.name === "string") {
+      const nameData = this.dataUrlToArrayBuffer(texture.name);
+      if (nameData) {
+        return nameData;
+      }
+    }
+
+    return this.readProjectTextureFileCache(texture);
+  }
+
+  /** 从 Babylon 全局本地文件缓存读取贴图源文件，覆盖 glTF/OBJ 依赖贴图和用户手动导入图片。 */
+  private async readProjectTextureFileCache(texture: Texture): Promise<ArrayBuffer | null> {
+    const file = this.findProjectTextureFileCache(texture);
+    if (!file) {
+      return null;
+    }
+
+    try {
+      return await file.arrayBuffer();
+    } catch (error) {
+      console.warn("项目贴图源文件缓存读取失败，已跳过外部化。", error);
+      return null;
+    }
+  }
+
+  /** 根据 Texture 的 url/name/metadata 在 FilesInputStore 中查找原始 File。 */
+  private findProjectTextureFileCache(texture: Texture): File | null {
+    for (const key of this.getProjectTextureFileLookupKeys(texture)) {
+      const file = FilesInputStore.FilesToLoad[key];
+      if (file) {
+        return file;
+      }
+    }
+    return null;
+  }
+
+  /** 生成贴图源文件缓存查找 key，Babylon 的 file: 解析表统一使用小写文件名。 */
+  private getProjectTextureFileLookupKeys(texture: Texture): string[] {
+    const keys = new Set<string>();
+    const metadata = this.asMetadataObject(texture.metadata);
+    const sourceTexture = this.asMetadataObject(metadata.editorSourceTexture);
+    const projectTexture = this.asMetadataObject(metadata.editorProjectTexture);
+    [
+      texture.url,
+      texture.name,
+      sourceTexture.fileName,
+      projectTexture.fileName
+    ].forEach((value) => {
+      const key = this.normalizeProjectTextureFileLookupKey(value);
+      if (key) {
+        keys.add(key);
+      }
+    });
+    return [...keys];
+  }
+
+  /** 把 file: URL、普通文件名或路径片段规整成 FilesInputStore 使用的 key。 */
+  private normalizeProjectTextureFileLookupKey(value: unknown): string | null {
+    if (typeof value !== "string" || value.length === 0 || value.startsWith("data:") || value.startsWith("blob:")) {
+      return null;
+    }
+
+    let fileName = value;
+    if (fileName.startsWith("file:")) {
+      try {
+        fileName = decodeURIComponent(fileName.substring(5));
+      } catch {
+        fileName = fileName.substring(5);
+      }
+    }
+    if (fileName.startsWith("./")) {
+      fileName = fileName.substring(2);
+    }
+    return this.getFileName(fileName).toLowerCase();
+  }
+
+  /** 将 Texture 内部可能出现的 data URL 或 typed array 统一转成独立 ArrayBuffer。 */
+  private projectTextureBufferToArrayBuffer(source: unknown): ArrayBuffer | null {
+    if (source instanceof ArrayBuffer) {
+      return source.slice(0);
+    }
+
+    if (ArrayBuffer.isView(source)) {
+      const view = source as ArrayBufferView;
+      const bytes = new Uint8Array(view.byteLength);
+      bytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      return bytes.buffer;
+    }
+
+    if (typeof source === "string") {
+      return this.dataUrlToArrayBuffer(source);
+    }
+
+    return null;
+  }
+
+  /** 解析浏览器 data URL，保存项目侧车时只接受可还原的内联图片数据。 */
+  private dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer | null {
+    const match = /^data:([^;,]+)?(;base64)?,(.*)$/i.exec(dataUrl);
+    if (!match) {
+      return null;
+    }
+
+    let binary: string;
+    try {
+      const payload = match[3] ?? "";
+      binary = match[2] ? atob(payload) : decodeURIComponent(payload);
+    } catch {
+      return null;
+    }
+
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index) & 0xff;
+    }
+    return bytes.buffer;
+  }
+
+  /** 根据显式 MIME、data URL 或图片魔数推断侧车文件类型。 */
+  private detectProjectTextureMimeType(data: ArrayBuffer, explicitMimeType?: string, sourceUrl?: string): string {
+    if (explicitMimeType?.startsWith("image/")) {
+      return explicitMimeType;
+    }
+
+    const dataUrlMimeType = typeof sourceUrl === "string" ? /^data:([^;,]+)/i.exec(sourceUrl)?.[1] : undefined;
+    if (dataUrlMimeType?.startsWith("image/")) {
+      return dataUrlMimeType;
+    }
+
+    const bytes = new Uint8Array(data, 0, Math.min(data.byteLength, 16));
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return "image/jpeg";
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+    return "image/png";
+  }
+
+  /** 为贴图侧车文件生成稳定且不含路径字符的文件名。 */
+  private createProjectExternalTextureFileName(texture: Texture, mimeType: string, usedFileNames: Set<string>): string {
+    const extension = this.getProjectTextureExtension(mimeType);
+    const existingFileName = this.getProjectTextureMetadataFileName(texture);
+    if (existingFileName && !usedFileNames.has(existingFileName.toLowerCase())) {
+      usedFileNames.add(existingFileName.toLowerCase());
+      return existingFileName;
+    }
+
+    const source = texture.name || texture.url || "texture-" + texture.uniqueId;
+    const sourceBaseName = source.startsWith("data:") ? "texture-" + texture.uniqueId : source.replace(/\.[^.]+$/, "");
+    const baseName = this.sanitizeProjectTextureFileName(sourceBaseName, "texture-" + texture.uniqueId);
+    let fileName = texture.uniqueId + "-" + baseName + "." + extension;
+    let index = 2;
+    while (usedFileNames.has(fileName.toLowerCase())) {
+      fileName = texture.uniqueId + "-" + baseName + "-" + index + "." + extension;
+      index += 1;
+    }
+    usedFileNames.add(fileName.toLowerCase());
+    return fileName;
+  }
+
+  /** 优先复用已加载侧车贴图自己的文件名，避免重复保存生成新文件。 */
+  private getProjectTextureMetadataFileName(texture: Texture): string | null {
+    const metadata = this.asMetadataObject(texture.metadata);
+    const projectTexture = this.asMetadataObject(metadata.editorProjectTexture);
+    if (projectTexture.version !== PROJECT_TEXTURE_SIDECAR_VERSION || typeof projectTexture.fileName !== "string") {
+      return null;
+    }
+
+    const leafName = this.getFileName(projectTexture.fileName);
+    const dotIndex = leafName.lastIndexOf(".");
+    const extension =
+      dotIndex > 0
+        ? this.sanitizeProjectTextureFileName(leafName.slice(dotIndex + 1), this.getProjectTextureExtension(String(projectTexture.mimeType ?? "")))
+        : this.getProjectTextureExtension(String(projectTexture.mimeType ?? ""));
+    return this.sanitizeProjectTextureFileName(dotIndex > 0 ? leafName.slice(0, dotIndex) : leafName, "texture-" + texture.uniqueId) + "." + extension;
+  }
+
+  /** 收敛贴图文件名片段，避免 data URL、路径和非法字符进入项目目录。 */
+  private sanitizeProjectTextureFileName(input: string, fallback: string): string {
+    const value = input
+      .split(/[\\/]/)
+      .pop()
+      ?.replace(/^data:/i, "")
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^\.+/, "")
+      .slice(0, 72)
+      .replace(/^-+|-+$/g, "");
+    return value || fallback;
+  }
+
+  /** 将 MIME 映射为项目侧车文件扩展名。 */
+  private getProjectTextureExtension(mimeType: string): string {
+    switch (mimeType.toLowerCase()) {
+      case "image/jpeg":
+        return "jpg";
+      case "image/webp":
+        return "webp";
+      case "image/ktx":
+        return "ktx";
+      case "image/ktx2":
+        return "ktx2";
+      default:
+        return "png";
+    }
+  }
+
+  /** 把序列化贴图改成 file: 侧车引用，并写入单贴图诊断 metadata。 */
+  private applyProjectExternalTextureReferences(serializedScene: Record<string, unknown>, externalTextures: ProjectExternalTextureFile[]): void {
+    if (externalTextures.length === 0) {
+      return;
+    }
+
+    const textureFilesById = new Map(externalTextures.map((file) => [file.textureUniqueId, file]));
+    const textureFilesBySourceUrl = this.createProjectExternalTextureSourceMap(externalTextures, "sourceUrl");
+    const textureFilesBySourceName = this.createProjectExternalTextureSourceMap(externalTextures, "sourceName");
+    this.visitSerializedObjects(serializedScene, (node) => {
+      if (!this.isSerializedTextureNode(node)) {
+        return;
+      }
+
+      const externalTexture = this.findProjectExternalTextureForSerializedNode(
+        node,
+        textureFilesById,
+        textureFilesBySourceUrl,
+        textureFilesBySourceName
+      );
+      if (!externalTexture) {
+        return;
+      }
+
+      node.name = externalTexture.fileName;
+      node.url = this.createProjectTextureFileUrl(externalTexture.fileName);
+      delete node.base64String;
+      node.metadata = {
+        ...this.asMetadataObject(node.metadata),
+        editorProjectTexture: {
+          version: PROJECT_TEXTURE_SIDECAR_VERSION,
+          textureUniqueId: externalTexture.textureUniqueId,
+          projectFile: externalTexture.projectFile,
+          fileName: externalTexture.fileName,
+          byteLength: externalTexture.byteLength,
+          mimeType: externalTexture.mimeType
+        }
+      };
+    });
+  }
+
+  /** 为序列化贴图的 url/name 匹配建立索引，兼容旧场景不序列化 Texture uniqueId 的情况。 */
+  private createProjectExternalTextureSourceMap(
+    externalTextures: ProjectExternalTextureFile[],
+    key: "sourceUrl" | "sourceName"
+  ): Map<string, ProjectExternalTextureFile> {
+    const map = new Map<string, ProjectExternalTextureFile>();
+    externalTextures.forEach((file) => {
+      const value = file[key];
+      if (value && !map.has(value)) {
+        map.set(value, file);
+      }
+    });
+    return map;
+  }
+
+  /** 按 uniqueId、原始 url、原始 name 依次匹配已写入的项目侧车贴图。 */
+  private findProjectExternalTextureForSerializedNode(
+    node: Record<string, unknown>,
+    textureFilesById: Map<number, ProjectExternalTextureFile>,
+    textureFilesBySourceUrl: Map<string, ProjectExternalTextureFile>,
+    textureFilesBySourceName: Map<string, ProjectExternalTextureFile>
+  ): ProjectExternalTextureFile | undefined {
+    const textureUniqueId = typeof node.uniqueId === "number" ? node.uniqueId : null;
+    if (textureUniqueId !== null) {
+      const byId = textureFilesById.get(textureUniqueId);
+      if (byId) {
+        return byId;
+      }
+    }
+
+    const url = typeof node.url === "string" ? node.url : undefined;
+    if (url) {
+      const byUrl = textureFilesBySourceUrl.get(url);
+      if (byUrl) {
+        return byUrl;
+      }
+    }
+
+    const name = typeof node.name === "string" ? node.name : undefined;
+    return name ? textureFilesBySourceName.get(name) : undefined;
+  }
+
+  /** 生成 Babylon 可安全 decode 的 file: 贴图引用。 */
+  private createProjectTextureFileUrl(fileName: string): string {
+    return "file:" + encodeURIComponent(fileName);
+  }
+
+  /** 合并新写入的贴图和场景中已有的项目侧车贴图，避免重开后再次保存清空清单。 */
+  private mergeProjectExternalTextureManifest(
+    serializedScene: Record<string, unknown>,
+    externalTextures: ProjectExternalTextureFile[]
+  ): ProjectExternalTextureManifest {
+    const filesByProjectFile = new Map<string, ProjectExternalTextureFile>();
+    const existingManifest = this.getProjectExternalTextureManifest(serializedScene);
+    this.collectSerializedProjectExternalTextures(serializedScene, existingManifest).forEach((file) => {
+      filesByProjectFile.set(file.projectFile, file);
+    });
+    externalTextures.forEach((file) => {
+      filesByProjectFile.set(file.projectFile, file);
+    });
+    return {
+      version: PROJECT_TEXTURE_SIDECAR_VERSION,
+      files: [...filesByProjectFile.values()]
+    };
+  }
+
+  /** 从序列化贴图节点上读取仍被引用的项目侧车贴图记录。 */
+  private collectSerializedProjectExternalTextures(
+    serializedScene: Record<string, unknown>,
+    existingManifest?: ProjectExternalTextureManifest | null
+  ): ProjectExternalTextureFile[] {
+    const files: ProjectExternalTextureFile[] = [];
+    const existingFilesByName = new Map(existingManifest?.files.map((file) => [file.fileName.toLowerCase(), file]) ?? []);
+    this.visitSerializedObjects(serializedScene, (node) => {
+      if (!this.isSerializedTextureNode(node)) {
+        return;
+      }
+
+      const projectTexture = this.getProjectTextureNodeMetadata(node);
+      if (projectTexture) {
+        files.push({
+          textureUniqueId: projectTexture.textureUniqueId ?? (typeof node.uniqueId === "number" ? node.uniqueId : -1),
+          fileName: projectTexture.fileName,
+          projectFile: projectTexture.projectFile,
+          byteLength: projectTexture.byteLength,
+          mimeType: projectTexture.mimeType
+        });
+        return;
+      }
+
+      const existingFile = this.findExistingProjectExternalTextureForSerializedNode(node, existingFilesByName);
+      if (existingFile) {
+        files.push(existingFile);
+      }
+    });
+    return files.filter((file) => file.textureUniqueId >= 0);
+  }
+
+  /** metadata 丢失但 file: 引用仍在时，用旧清单补回项目侧车记录。 */
+  private findExistingProjectExternalTextureForSerializedNode(
+    node: Record<string, unknown>,
+    existingFilesByName: Map<string, ProjectExternalTextureFile>
+  ): ProjectExternalTextureFile | undefined {
+    const urlFileName = this.getSerializedProjectTextureFileName(node.url);
+    if (urlFileName) {
+      const byUrl = existingFilesByName.get(urlFileName.toLowerCase());
+      if (byUrl) {
+        return byUrl;
+      }
+    }
+
+    const nameFileName = this.getSerializedProjectTextureFileName(node.name);
+    return nameFileName ? existingFilesByName.get(nameFileName.toLowerCase()) : undefined;
+  }
+
+  /** 从序列化贴图的 file: URL 或 name 中取回侧车文件名。 */
+  private getSerializedProjectTextureFileName(value: unknown): string | null {
+    const key = this.normalizeProjectTextureFileLookupKey(value);
+    return key ? this.getFileName(key) : null;
+  }
+
+  /** 双保险移除项目场景里残留的 base64String，防止大贴图继续进入 IPC。 */
+  private stripProjectSceneEmbeddedTexturePayloads(serializedScene: Record<string, unknown>): number {
+    let strippedCount = 0;
+    this.visitSerializedObjects(serializedScene, (node) => {
+      if (this.isSerializedTextureNode(node) && typeof node.base64String === "string") {
+        delete node.base64String;
+        strippedCount += 1;
+      }
+    });
+    return strippedCount;
+  }
+
+  /** 判断序列化对象是否像 Babylon Texture，限制 base64 清理范围。 */
+  private isSerializedTextureNode(node: Record<string, unknown>): boolean {
+    return (
+      typeof node.url === "string" ||
+        typeof node.invertY === "boolean" ||
+        typeof node.samplingMode === "number" ||
+        typeof node.internalTextureUniqueId === "number" ||
+      typeof node.base64String === "string"
+    );
+  }
+
+  /** 从贴图节点 metadata 中读取项目侧车记录，损坏 metadata 直接忽略。 */
+  private getProjectTextureNodeMetadata(node: Record<string, unknown>): ProjectTextureNodeMetadata | null {
+    const metadata = this.asMetadataObject(node.metadata);
+    const projectTexture = this.asMetadataObject(metadata.editorProjectTexture);
+    if (
+      projectTexture.version !== PROJECT_TEXTURE_SIDECAR_VERSION ||
+      typeof projectTexture.projectFile !== "string" ||
+      projectTexture.projectFile.length === 0 ||
+      typeof projectTexture.fileName !== "string" ||
+      projectTexture.fileName.length === 0 ||
+      typeof projectTexture.byteLength !== "number" ||
+      !Number.isFinite(projectTexture.byteLength) ||
+      projectTexture.byteLength < 0 ||
+      typeof projectTexture.mimeType !== "string" ||
+      projectTexture.mimeType.length === 0
+    ) {
+      return null;
+    }
+
+    return {
+      textureUniqueId:
+        typeof projectTexture.textureUniqueId === "number" && Number.isFinite(projectTexture.textureUniqueId)
+          ? projectTexture.textureUniqueId
+          : undefined,
+      projectFile: projectTexture.projectFile,
+      fileName: projectTexture.fileName,
+      byteLength: projectTexture.byteLength,
+      mimeType: projectTexture.mimeType
+    };
+  }
+
+  /** 深度遍历序列化 JSON 中的普通对象，用于贴图引用和诊断清理。 */
+  private visitSerializedObjects(value: unknown, visitor: (node: Record<string, unknown>) => void): void {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => this.visitSerializedObjects(item, visitor));
+      return;
+    }
+
+    const node = value as Record<string, unknown>;
+    visitor(node);
+    Object.values(node).forEach((item) => this.visitSerializedObjects(item, visitor));
+  }
+
+  /** 加载项目前读取贴图侧车文件，并临时注册到 Babylon file: 解析表。 */
+  private async registerProjectExternalTextureFilesForLoad(
+    serializedScene: Record<string, unknown>,
+    options: SerializedSceneLoadOptions
+  ): Promise<Map<string, File | undefined>> {
+    const previousFiles = new Map<string, File | undefined>();
+    const manifest = this.getProjectExternalTextureManifest(serializedScene);
+    if (!manifest || manifest.files.length === 0 || !options.loadExternalTextures) {
+      return previousFiles;
+    }
+
+    let results: ProjectExternalTextureLoadResult[];
+    try {
+      results = await options.loadExternalTextures(
+        manifest.files.map((file) => ({
+          projectFile: file.projectFile,
+          fileName: file.fileName,
+          expectedByteLength: file.byteLength,
+          mimeType: file.mimeType
+        }))
+      );
+    } catch (error) {
+      console.warn("项目贴图侧车批量读取失败，场景将继续尝试加载。", error);
+      return previousFiles;
+    }
+    const mimeTypesByProjectFile = new Map(manifest.files.map((file) => [file.projectFile, file]));
+    results.forEach((result) => {
+      if (!result.data || result.error) {
+        console.warn(result.error ?? "项目贴图侧车 " + result.projectFile + " 读取失败。");
+        return;
+      }
+
+      const manifestFile = mimeTypesByProjectFile.get(result.projectFile);
+      const fileName = result.fileName || manifestFile?.fileName || this.getFileName(result.projectFile);
+      const key = fileName.toLowerCase();
+      if (!previousFiles.has(key)) {
+        previousFiles.set(key, FilesInputStore.FilesToLoad[key]);
+      }
+      FilesInputStore.FilesToLoad[key] = new File([result.data], fileName, {
+        type: manifestFile?.mimeType ?? "application/octet-stream",
+        lastModified: result.lastModified
+      });
+    });
+    return previousFiles;
+  }
+
+  /** 加载完成后恢复 Babylon 全局 file: 缓存，避免侧车贴图长期占用内存。 */
+  private restoreProjectExternalTextureFileRegistration(previousFiles: Map<string, File | undefined>): void {
+    previousFiles.forEach((file, key) => {
+      if (file) {
+        FilesInputStore.FilesToLoad[key] = file;
+      } else {
+        delete FilesInputStore.FilesToLoad[key];
+      }
+    });
+  }
+
+  /** 从场景 metadata 中读取并校验项目贴图侧车清单。 */
+  private getProjectExternalTextureManifest(serializedScene: Record<string, unknown>): ProjectExternalTextureManifest | null {
+    const metadata = this.asMetadataObject(serializedScene.metadata);
+    const editorMetadata = this.asMetadataObject(metadata.editor);
+    const manifest = this.asMetadataObject(editorMetadata.projectExternalTextures);
+    if (manifest.version !== PROJECT_TEXTURE_SIDECAR_VERSION || !Array.isArray(manifest.files)) {
+      return null;
+    }
+
+    const files = manifest.files.filter((file): file is ProjectExternalTextureFile => this.isProjectExternalTextureFile(file));
+    return files.length > 0 ? { version: PROJECT_TEXTURE_SIDECAR_VERSION, files } : null;
+  }
+
+  /** 校验单个贴图侧车记录，损坏条目直接忽略，避免阻塞旧项目打开。 */
+  private isProjectExternalTextureFile(value: unknown): value is ProjectExternalTextureFile {
+    const file = this.asMetadataObject(value);
+    return (
+      typeof file.textureUniqueId === "number" &&
+      Number.isFinite(file.textureUniqueId) &&
+      typeof file.fileName === "string" &&
+      file.fileName.length > 0 &&
+      typeof file.projectFile === "string" &&
+      file.projectFile.length > 0 &&
+      typeof file.byteLength === "number" &&
+      Number.isFinite(file.byteLength) &&
+      file.byteLength >= 0 &&
+      typeof file.mimeType === "string" &&
+      file.mimeType.length > 0
+    );
   }
 
   /** 移除不应持久化的编辑器运行时对象，避免保存后再次加载失败或重复创建辅助层。 */
@@ -5412,7 +6161,18 @@ export class BabylonEditorEngine {
 
     const url = URL.createObjectURL(file);
     const material = this.ensureEditableMaterial(this.selectedNode);
-    material.diffuseTexture = new Texture(url, this.scene, false, false, undefined, () => URL.revokeObjectURL(url), () => URL.revokeObjectURL(url));
+    const texture = new Texture(url, this.scene, false, false, undefined, () => URL.revokeObjectURL(url), () => URL.revokeObjectURL(url));
+    texture.name = file.name;
+    texture.metadata = {
+      ...this.asMetadataObject(texture.metadata),
+      editorSourceTexture: {
+        fileName: file.name,
+        byteLength: file.size,
+        mimeType: file.type || "application/octet-stream",
+        lastModified: file.lastModified
+      }
+    };
+    material.diffuseTexture = texture;
     this.emitSelectionSnapshot();
   }
 
@@ -7037,6 +7797,8 @@ export class BabylonEditorEngine {
       sceneCamera?: Partial<SceneInspectorSnapshot["camera"]>;
       sceneEditorSettings?: Partial<SceneEditorSettingsSnapshot>;
       sceneDataDriven?: Partial<SceneDataDrivenSnapshot>;
+      projectExternalTextures?: ProjectExternalTextureManifest;
+      projectTextureSerialization?: Record<string, unknown>;
     } = {}
   ): Record<string, unknown> {
     const baseMetadata = this.asMetadataObject(metadata);
@@ -7090,6 +7852,14 @@ export class BabylonEditorEngine {
 
     if (editorOverrides.assets) {
       nextEditorMetadata.assets = editorOverrides.assets;
+    }
+
+    if (editorOverrides.projectExternalTextures) {
+      nextEditorMetadata.projectExternalTextures = editorOverrides.projectExternalTextures;
+    }
+
+    if (editorOverrides.projectTextureSerialization) {
+      nextEditorMetadata.projectTextureSerialization = editorOverrides.projectTextureSerialization;
     }
 
     return {

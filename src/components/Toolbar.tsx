@@ -12,6 +12,7 @@ import {
   Move3D,
   Package,
   Play,
+  RadioTower,
   Rotate3D,
   Save,
   Scaling,
@@ -32,6 +33,9 @@ interface ToolbarProps {
   onImportFiles: (files: FileList) => void;
   onImportCadDrawing: (files: FileList | File[]) => void;
   onImportModelPackage: () => void;
+  onOpenDataSourceConfig: () => void;
+  dataSourceConfigDisabled?: boolean;
+  dataSourceConfigDisabledReason?: string;
   onSave: () => void;
   saveDisabled?: boolean;
   saveDisabledReason?: string;
@@ -98,6 +102,9 @@ export function Toolbar({
   onImportFiles,
   onImportCadDrawing,
   onImportModelPackage,
+  onOpenDataSourceConfig,
+  dataSourceConfigDisabled = false,
+  dataSourceConfigDisabledReason,
   onSave,
   saveDisabled = false,
   saveDisabledReason,
@@ -199,6 +206,16 @@ export function Toolbar({
           onClick={onSave}
         >
           <Save size={18} />
+        </button>
+        <button
+          className="icon-button"
+          aria-label="统一数据源配置"
+          title={dataSourceConfigDisabled ? dataSourceConfigDisabledReason ?? "场景准备完成后才能配置数据源" : "统一配置 MQTT / Socket 地址"}
+          type="button"
+          disabled={dataSourceConfigDisabled}
+          onClick={onOpenDataSourceConfig}
+        >
+          <RadioTower size={18} />
         </button>
         <button
           className={`icon-button ${previewMode ? "is-active" : ""}`}

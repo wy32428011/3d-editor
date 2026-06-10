@@ -17,7 +17,7 @@
 - Babylon.js Engine / Scene / ArcRotateCamera 渲染生命周期
 - 默认场景：编辑网格、场景内 X/Y/Z 坐标轴、环境光、方向光、立方体、球体、地面；项目条和右侧场景属性可配置场景环境背景色，避免视口背景固定为全黑
 - 米制单位：编辑器约定 `1 Babylon unit = 1 m`，默认对象、工作网格、属性面板位置和模型尺寸都按 `m` 展示；导入模型不会修改源文件，编辑器会在 Babylon/glTF 节点变换生效后按真实世界包围盒阈值启发式推断米、厘米或毫米来源，并把进入场景的模型实例归一到米，单位决策会写入模型和资产元数据；工作网格默认每小格为 `1 m`，会随相机位置和缩放动态覆盖视口，并通过全网格同相位闪烁帮助定位编辑平面
-- 工具栏：选择、移动、旋转、缩放、创建基础对象、创建定位线框立方体、导入、导入 CAD 图纸、保存、整场景动画预览、Inspector、性能预览
+- 工具栏：选择、移动、旋转、缩放、创建基础对象、创建定位线框立方体、导入、导入 CAD 图纸、保存、统一数据源配置、整场景动画预览、Inspector、性能预览
 - GizmoManager：选中对象后支持移动、旋转、缩放
 - OutlineRenderer：选中对象只显示外轮廓，不覆盖模型主体材质和贴图
 - 点击拾取：从视口或层级树选中对象，双击层级节点或视口模型可快速定位到对象；左侧模型树支持新建逻辑 group、模型拖拽归组、group 展开折叠、显隐切换和锁定保护，选中 group 时会高亮其下所有普通 mesh 模型
@@ -26,7 +26,7 @@
 - 复制粘贴：选中模型后可通过 `Ctrl+C` 复制，再用 `Ctrl+V` 粘贴为带水平偏移的独立副本；左侧模型树或视口中右击普通模型可打开“模型阵列”，按 `X/-X/Z/-Z` 地面轴向、克隆数量和米制间距批量生成真实可编辑副本，`X/Z` 表示世界坐标正向，`-X/-Z` 表示世界坐标负向，克隆数量表示新增副本数；副本资产编号按源编号追加递增数字，例如 `ABC` 会生成 `ABC-1`、`ABC-2`，并自动跳过同场景中已占用的编号；属性面板输入框等文本编辑区域仍保留系统复制粘贴行为，预览模式下不会复制、粘贴或阵列场景模型
 - 属性编辑：右侧属性面板采用深色折叠分组样式，支持对象名称、显隐、位置、旋转、缩放、主体颜色、旧版 MeshVertexModifyComponent 参数、文件夹模型包解析出的动态参数和业务资产编号编辑；变换与颜色会实时驱动视口模型变化，组件参数、动态参数和资产编号会写入节点 metadata 并随场景保存恢复
 - 资产导入：支持从工具栏和资产面板按钮导入 `.glb`、`.gltf`、`.babylon`、`.obj`、`.stl`、常见图片贴图，以及 `.gltf/.obj` 同批依赖的 `.bin/.mtl/贴图` 文件；桌面模式支持导入包含 `meta.json`/`meta.js`、单个 TypeScript 模型脚本和主 `.glb` 的文件夹模型包，导入后会复制到项目 `assets/source/`，属性栏会优先按 `meta.json` 的 `parameterScripts[].scriptFilename` 选择参数脚本，并静态解析 `visibleAsNumber` / `visibleAsString` / `visibleAsBoolean` / `visibleAsColor3` 装饰器生成动态参数；`meta.json.parameterScripts[].fields/defaultValue/values` 会作为模型自身给出的基础参数填入右侧属性面板，`values` 优先于字段默认值并同步到 `metadata.editor.modelPackageInstance.values` 与 `metadata.scripts[].values`；长度、宽度、高度、深度、半径、间距和位置类数字参数会在右侧属性面板按 `m` 展示，并把 `unit: "m"` 同步到 `metadata.scripts[].fields` 供运行脚本按米制场景尺寸消费；同一个 `.model.ts` 可以同时声明 `ParametricModelParamsComponent` 和 `ParametricModelRuntimeComponent`，`meta.json` 保留不同 `className` 供兼容运行环境识别；模型包实例化后会在 Electron renderer 中执行项目内已复制的本地运行脚本，属性栏参数会同步到 `metadata.scripts[].values` 并实时触发 `ParametricModelRuntimeComponent` 驱动几何、阵列和显隐变化，脚本执行时会临时把模型根节点归一到局部基准坐标系并在结束后恢复用户设置的位置、旋转和缩放，避免模型旋转后参数化配置失效；脚本异常会降级为属性栏告警且不阻断参数保存；项目模式下导入的源文件会复制到项目 `assets/source/`，模型和场景文件会先进入资产浏览器，不立即写入当前场景，重新打开项目后资产卡片会按需读取项目内源文件和同批依赖继续拖入使用；旧项目没有源文件副本时，会尝试从当前场景内同源模型克隆新实例，模型实例化到场景后，带子节点的模型在层级面板只展示主模型，保持列表简洁
-- 数据驱动：右侧场景属性的 `SceneDataDrivenComponent` 支持配置 WebSocket 或 MQTT over WebSocket 数据源、通道/Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备类型、默认编号、payload 字段、运动轴向、参与节点、固定节点和本地模拟范围，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，整机生成/位姿走 `twinspawn`，内部动作走 `twindatadriven/joint` 的 `{e,p,v}` 点位格式；`travel_pos` 驱动堆垛机行走机构沿轨道方向位移，`lift_pos` 驱动载货台和货叉升降，`fork_extend` 驱动货叉伸出，`fork_side` 驱动货叉侧向微调；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
+- 数据驱动：右侧场景属性和顶部工具栏“统一数据源配置”共用同一份 `SceneDataDrivenComponent`，支持配置 WebSocket 或 MQTT over WebSocket 数据源、通道/Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备类型、默认编号、payload 字段、运动轴向、参与节点、固定节点和本地模拟范围，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，整机生成/位姿走 `twinspawn`，内部动作走 `twindatadriven/joint` 的 `{e,p,v}` 点位格式；`travel_pos` 驱动堆垛机行走机构沿轨道方向位移，`lift_pos` 驱动载货台和货叉升降，`fork_extend` 驱动货叉伸出，`fork_side` 驱动货叉侧向微调；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
 - 定位框动画连接：定位线框立方体可在右侧“动画连接”中启用数据驱动接收端，配置绑定设备、设备字段、匹配字段、X/Y/Z/朝向字段和插值时长；配置保存到 `metadata.editor.locatorAnimationConnection`，仍复用场景级 `SceneDataDrivenComponent` 连接。定位框只有显式启用且填写绑定设备后才会被预览数据驱动，默认按 `x/h/y/r` 映射到 Babylon 的 X/Y/Z/朝向；它仍是内置 primitive，不进入 `AssetRecord`、`assets/source` 或模型包链路，货物仍由用户手动摆放到框内。
 - CAD 图纸导入：工具栏提供独立的“导入 CAD 图纸”按钮，当前支持 `.dxf` 文本图纸；导入目标收敛为“所有可解析矢量线”，会把 LINE、LWPOLYLINE、POLYLINE/VERTEX、CIRCLE、ARC、ELLIPSE、SPLINE、SOLID/TRACE/3DFACE 外轮廓、LEADER/MLINE/MLEADER/MULTILEADER、RAY/XLINE 有限参考线、DIMENSION 块或 fallback 线以及 BLOCK/INSERT 嵌套内容解析为贴到 XZ 工作网格的米制线段；非线内容如文字、图片、填充面、遮罩和点不作为本次 CAD 导入目标，避免非线内容污染图纸 bounds 并产生放射状乱线。解析器优先导入模型空间线，模型空间没有可绘制线时才兜底导入布局/图纸空间并提示；若 DXF 的二维内容来自三维/剖面导出并落在 XZ 或 YZ 平面，导入器会读取实体 Z、高程和 OCS 挤出方向后自动选择面积最大的二维平面投影，避免只读 XY 导致所有线段压扁重叠；优先读取 DXF `$INSUNITS` 单位声明并换算到项目米制尺寸，未声明单位且原始尺寸明显过大时会推断为毫米；DXF 文件大小和线段数量不做截断，CAD 解析在 Worker 中输出二进制 typed-array chunk，Babylon 端直接用 `LinesMesh + VertexData` 分块渲染。项目模式会把多个线段 chunk 合并保存为约 16-24MB 的 `*.cadlines.pack.bin` 侧车包，场景 JSON 只保留 CAD 根节点 metadata、bounds、单位和 chunk manifest；旧项目中的单 chunk `*.cadlines.bin` 侧车仍可兼容恢复。图纸按包围盒中心平移到世界原点并在导入后自动取景，导入结果作为可选中、可删除、可随场景保存恢复的 CAD 根节点；选中 CAD 根节点后可在右侧“CAD 显示”中调整整张图纸透明度，不改变原始线色和几何数据。DWG 需先转换为 DXF 后导入。
 - CAD 导入与恢复进度：导入 DXF 时项目条会显示专用进度条，按读取文件、测量图纸、输出线段、创建网格和保存侧车包等阶段更新；能拿到总量的阶段显示百分比，测量等未知总量阶段显示不确定进度。重新打开项目时普通场景会先完成加载并可操作，CAD 侧车线段在后台渐进恢复，顶部显示“CAD 恢复中”的 chunk/mesh 进度；恢复完成前会暂时禁用保存，避免把未恢复完整的 CAD 状态写回场景文件。导入中和恢复中的状态不会再占用错误提示。
@@ -35,7 +35,7 @@
 - POI 运行态：POI 作为内置轻量场景节点保存，不进入 `AssetRecord` 文件资产链路；可持久化配置写入 `metadata.editor.poiConfig`，顶层 `metadata.poi` 继续保留用于旧场景识别。编辑态和预览态都会启用 `SceneBusinessRuntime`，运行中间态、最新 payload、运行计数、临时图表面板、路径线、占位生成模型、WebSocket/MQTT 句柄都只放在内存或 `doNotSerialize` 临时节点上，保存、删除、清场、退出预览和 dispose 时统一清理，不写入 `.babylon` 文件。
 - POI 数据源与发送器：POI 运行态复用场景级 `SceneDataDrivenComponent` 的 WebSocket/MQTT over WebSocket 数据源接收外部数据；发送器支持内部事件、WebSocket JSON 外发和 MQTT publish 三种输出，默认输出为内部事件。WebSocket/MQTT 外发需要在发送器配置中显式填写连接地址和 Topic，运行态继续保留消息大小、帧数、重连和 topic 保护。
 - 拖拽操作：资产面板基础对象、定位线框立方体和导入模型都以统一资产卡片展示，拖到视口创建或实例化；定位线框立方体是可保存、可选中和可变换的 1.5m 线框参考对象，用于把货物手动摆入框内，不会自动吸附、约束或归组货物；同一模型资产可以像内置 Cube/Sphere 一样反复拖入生成多个实例；外部模型文件直接拖到视口仍按落点导入并同步登记为可复用资产，拖入后的模型保持选中但不自动改变当前相机视角，拖放落点通过透明地面和相机射线兜底计算，避免网格不可见时回退到原点
-- 场景保存：导出 `.babylon` 文件，并附带编辑器资产元数据、场景环境背景色和 `metadata.editor.sceneDataDriven` 场景数据驱动配置；项目内重新打开场景时会注册 Babylon 序列化场景加载器，并清洗相机、选中高亮、数据连接和预览态等编辑器运行时数据，避免保存后重新打开模型消失或保留实时数据中间帧
+- 场景保存：非项目模式导出 `.babylon` 文件时保持自包含，并附带编辑器资产元数据、场景环境背景色和 `metadata.editor.sceneDataDriven` 场景数据驱动配置；项目模式保存会把运行时大贴图写入 `assets/source/editor-scene-textures-<sceneId>/` 侧车文件，场景 JSON 只保留 `metadata.editor.projectExternalTextures` 清单和 `file:<name>` 轻量引用，避免 GLB 内嵌贴图以大段 `base64String` 进入 `*.scene.json`；项目内重新打开场景时会注册 Babylon 序列化场景加载器，读回 CAD/贴图侧车文件，并清洗相机、选中高亮、数据连接和预览态等编辑器运行时数据，避免保存后重新打开模型消失或保留实时数据中间帧
 - 默认高清渲染：视口会按 3840x2160 目标像素量自动设置 Babylon 后备缓冲，低于 4K 的窗口自动超采样，避免高 DPI/大屏下画面发糊或出现马赛克；工具栏状态栏可悬停查看真实渲染分辨率、硬件缩放和 GPU renderer。
 - 性能预览：仅在用户手动打开时降低渲染分辨率并关闭指针移动拾取，便于大场景快速预览；关闭后会自动恢复默认 4K 高清策略。
 - Electron 桌面壳：安全 preload、主窗口生命周期、开发/生产双入口、Windows NSIS 安装包
@@ -84,7 +84,7 @@ set ELECTRON_DEV_SMOKE_EXIT_MS=3000&& npm run electron:dev
 
 ## 数据驱动协议
 
-场景属性面板的 `SceneDataDrivenComponent` 只保存非敏感连接配置；选中模型后的对象属性面板也会在“数据驱动”分区复用同一份场景级数据源，并把“绑定设备”写入对象资产编号。MQTT 需要 broker 开启 WebSocket 端口，例如 `ws://127.0.0.1:8083/mqtt` 或 `wss://broker.example.com/mqtt`；普通 WebSocket 会在连接成功后发送 `{"type":"subscribe","channel":"<通道>"}` 作为轻量订阅请求。
+顶部工具栏的“统一数据源配置”、场景属性面板的 `SceneDataDrivenComponent` 和对象属性面板的“数据驱动”分区复用同一份场景级非敏感连接配置，并保存到 `metadata.editor.sceneDataDriven`；选中模型后的“绑定设备”仍写入对象资产编号。MQTT 需要 broker 开启 WebSocket 端口，例如 `ws://127.0.0.1:8083/mqtt` 或 `wss://broker.example.com/mqtt`；普通 WebSocket 会在连接成功后发送 `{"type":"subscribe","channel":"<通道>"}` 作为轻量订阅请求。
 
 模型包脚本可以导出 `dataDriven` 对象，把运动语义放回模型资产自身，例如 Stacker 在 `stacker.model.ts` 中声明 `device.devType = "stacker"`、`device.defaultAssetCode = "Stacker01"`、`device.deviceIdField = "e"`、`motion.travel/lift/fork/forkSide` 的 MQTT 文档点位字段、轴向和节点列表，以及 `fixedNodes` 与 `simulation` 范围。`motion.*.kind` 可选 `translate` 或 `rotate`，缺省按 `translate` 兼容旧模型；`translate` 的 `v` 表示米制目标位移，`rotate` 的 `v` 表示相对进入预览基线姿态的角度目标值（单位：度）。位移动作的 `motion.*.axis` 表示模型根节点的局部轴，不是世界坐标轴；运行时会先把该局部轴转换为世界方向，再写入运动部件的父级局部坐标，所以模型根节点在场景中旋转后，行走、升降和货叉伸缩方向会跟随模型自身朝向。旋转动作按参与节点自身局部轴旋转，适合辊筒、移载辊等内部机构。编辑器导入时只静态解析普通对象字面量，不执行脚本来读取配置；旧模型包没有该字段时继续使用内置 Stacker 兜底规则。
 
@@ -236,6 +236,8 @@ release/Babylon 3D Editor-0.1.0-Setup.exe
 - 2026-06-08：模型包导入会解析 `meta.json.parameterScripts[].fields` 和 `values`，用模型给出的基础参数初始化右侧属性面板；首次导入、资产区再次拖入和运行脚本读取都以合并后的 `metadata.editor.modelPackageInstance.values` 为准。
 - 2026-06-08：模型包动态数字参数新增单位语义推断，长度类字段在右侧属性面板显示 `m` 并同步到脚本 metadata；`E:\公司文件\数字孪生\模型文件\models` 下 11 个模型包的 `meta.json` 和 `.model.ts` 默认长度值已按导入后米制基线回填，脚本会把长度参数换算为目标场景尺寸，避免继续把长度输入当比例倍率。
 - 2026-06-09：兼容旧版文件夹模型包的参数接入；当 `meta.json` 没有声明 `parameterScripts` 或目录内存在辅助 TS 时，导入流程会自动选择包含 `@visibleAsNumber/String/Boolean/Color3` 的根脚本生成右侧参数面板，并从默认导出的旧脚本类名推断运行类，避免同目录其他模型参数无法附加到属性面板。
+- 2026-06-09：项目模式保存新增场景贴图侧车文件；保存前会临时关闭 Babylon 贴图 buffer 序列化，把可还原的大贴图写入 `assets/source/editor-scene-textures-<sceneId>/`，`*.scene.json` 只保存 `file:<name>` 引用和 `metadata.editor.projectExternalTextures` 清单，降低 JSON/IPC/内存峰值，避免点击保存后界面黑屏。非项目 `.babylon` 下载仍走自包含导出语义。
+- 2026-06-09：顶部工具栏新增“统一数据源配置”按钮，可一次配置 MQTT/WebSocket 地址、Topic、设备字段和插值等场景级连接参数；入口与右侧场景属性、模型数据驱动分区共用 `metadata.editor.sceneDataDriven`，预览中修改仍会走现有运行时重启链路。
 - 2026-06-04：CAD/DXF 导入从单一折线升级为完整二维 primitive 导入，支持原 CAD 颜色、文字、HATCH/SOLID 填充、POINT、LEADER、DIMENSION 块和嵌套 INSERT；移除 180000 线段截断，导入后按 CAD bounds 自动取景，选中 CAD 时不再用高亮层覆盖原图配色。
 - 2026-06-04：修复包含 `IMAGE/IMAGEDEF` 外部栅格参照的 DXF 只显示少量残留线条的问题；CAD 导入现在支持同批选择或拖拽 DXF 与图片文件，Electron 桌面端会尝试从 DXF 同目录读取外部图片，并按 IMAGE 四角贴到 XZ 网格。
 - 2026-06-04：补齐 CAD 保存恢复后的媒体重建；文字会根据 `cadText` metadata 重新绘制 DynamicTexture，Electron 环境会根据保存的原始 DXF 路径从同目录恢复 IMAGE 图片贴图。
@@ -282,8 +284,8 @@ ProjectName/
 ```
 
 - `.babylon-editor/project.json` 保存项目名称、创建时间、更新时间、场景索引和当前激活场景。
-- `assets/source/` 保存导入资产的源文件副本；多文件模型会把同批选择的依赖文件一起记录到场景元数据，文件夹模型包会保留 `meta.json`/`meta.js`、参数脚本和主 `.glb`，重新打开项目后拖入资产时再按需读取。
-- `scenes/*.scene.json` 保存单个场景的 Babylon 原生序列化数据以及编辑器元数据，包含场景环境背景色、非敏感数据连接配置和 SceneDataDrivenComponent 设置。
+- `assets/source/` 保存导入资产的源文件副本；多文件模型会把同批选择的依赖文件一起记录到场景元数据，文件夹模型包会保留 `meta.json`/`meta.js`、参数脚本和主 `.glb`，重新打开项目后拖入资产时再按需读取；项目场景保存生成的 `editor-scene-textures-<sceneId>/` 目录保存从 GLB 内嵌贴图拆出的 PNG/JPEG/WebP 侧车文件。
+- `scenes/*.scene.json` 保存单个场景的 Babylon 原生序列化数据以及编辑器元数据，包含场景环境背景色、非敏感数据连接配置、SceneDataDrivenComponent 设置和项目贴图侧车清单；项目模式下大贴图只保存 `file:<name>` 引用，不再把完整 `base64String` 写入场景 JSON。
 - `scenes/.backups/*.scene.json` 保存场景覆盖前的自动备份，每个场景默认保留最近 10 份，便于误保存后手动恢复。
 - Electron 的 `userData/app-state.json` 保存最近项目列表，仅用于启动页快速访问，不参与项目内容版本管理。
 

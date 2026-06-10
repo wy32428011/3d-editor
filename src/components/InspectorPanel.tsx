@@ -703,8 +703,8 @@ interface DataSourceConnectionEditorProps {
   onChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
 }
 
-/** 场景统一数据源连接字段，场景属性和对象数据驱动分区共用同一套写回逻辑。 */
-function DataSourceConnectionEditor({ value, onChange }: DataSourceConnectionEditorProps) {
+/** 场景统一数据源连接字段，场景属性、对象数据驱动和工具栏弹窗共用同一套写回逻辑。 */
+export function DataSourceConnectionEditor({ value, onChange }: DataSourceConnectionEditorProps) {
   return (
     <>
       <InspectorCheckboxRow

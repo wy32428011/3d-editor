@@ -489,6 +489,39 @@ input {
   width: min(420px, calc(100vw - 32px));
 }
 
+.data-source-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.data-source-dialog-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 12px;
+  border-bottom: 1px solid #2a2e29;
+  background: #161816;
+  color: #bdb8a6;
+  font-size: 12px;
+}
+
+.data-source-dialog-summary span {
+  min-width: 0;
+  overflow: hidden;
+  padding: 6px 8px;
+  border: 1px solid #303a30;
+  background: #20231f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-source-dialog-body {
+  padding: 12px;
+}
+
+.data-source-dialog-body .inspector-row {
+  grid-template-columns: 110px minmax(0, 1fr);
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

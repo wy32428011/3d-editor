@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { AssetBrowser } from "./components/AssetBrowser";
 import { HierarchyPanel, type HierarchyExpansionCommand } from "./components/HierarchyPanel";
-import { InspectorPanel } from "./components/InspectorPanel";
+import { DataSourceConnectionEditor, InspectorPanel } from "./components/InspectorPanel";
 import { ProjectLauncher } from "./components/ProjectLauncher";
 import { Toolbar } from "./components/Toolbar";
 import { ViewportCanvas } from "./components/ViewportCanvas";
@@ -240,9 +240,27 @@ function createCadLineAssetId(file: File): string {
   return `cad-lines-${file.name}-${file.size}-${file.lastModified}-${randomId}`;
 }
 
+/** 为项目场景贴图侧车文件生成独立资产目录，避免大贴图重新进入 scene JSON。 */
+function createSceneTextureAssetId(sceneId: string): string {
+  return `editor-scene-textures-${sceneId}`;
+}
+
 /** 格式化进度计数，CAD 大图纸常见百万级线段，必须保持可读。 */
 function formatCadProgressCount(value: number | undefined): string {
   return Math.max(0, Math.trunc(value ?? 0)).toLocaleString("zh-CN");
+}
+
+/** 将场景数据源类型显示为用户可识别的协议名称。 */
+function formatSceneDataSourceType(value: SceneDataDrivenSnapshot["dataSourceType"]): string {
+  if (value === "websocket") {
+    return "WebSocket";
+  }
+
+  if (value === "mqtt") {
+    return "MQTT";
+  }
+
+  return "未配置";
 }
 
 /** 计算当前 CAD 阶段的百分比，未知总量时返回 null 让 UI 显示不确定进度。 */
@@ -902,6 +920,7 @@ export function App() {
   const [sceneLoading, setSceneLoading] = useState(false);
   const [sceneLoadFailed, setSceneLoadFailed] = useState(false);
   const [sceneDialogOpen, setSceneDialogOpen] = useState(false);
+  const [dataSourceDialogOpen, setDataSourceDialogOpen] = useState(false);
   const [sceneContextMenu, setSceneContextMenu] = useState<SceneContextMenuState | null>(null);
   const [modelArrayDialog, setModelArrayDialog] = useState<ModelArrayDialogState | null>(null);
   const [treeExpansionCommand, setTreeExpansionCommand] = useState<HierarchyExpansionCommand | null>(null);
@@ -1221,6 +1240,24 @@ export function App() {
               const assetPayload = await projectsApi.loadAssetFile(activeProject.path, projectFile);
               return assetPayload.data;
             },
+            loadExternalTextures: projectsApi.loadAssetFiles
+              ? async (requests) => {
+                  const results = await projectsApi.loadAssetFiles!(
+                    activeProject.path,
+                    requests.map((request) => ({
+                      projectFile: request.projectFile,
+                      expectedByteLength: request.expectedByteLength
+                    }))
+                  );
+                  return results.map((result, index) => ({
+                    projectFile: result.projectFile,
+                    fileName: requests[index]?.fileName ?? getProjectFileName(result.projectFile),
+                    data: result.data,
+                    lastModified: result.lastModified,
+                    error: result.error
+                  }));
+                }
+              : undefined,
             onCadRestoreProgress: (progress) => {
               if (cancelled || cadRestoreRequestRef.current !== restoreRequestId) {
                 return;
@@ -1968,7 +2005,12 @@ export function App() {
       const projectPath = activeProject.path;
       const sceneId = activeScene.id;
       try {
-        const project = await window.electronApp.projects.saveScene(projectPath, sceneId, engine.serializeScene());
+        const textureAssetId = createSceneTextureAssetId(sceneId);
+        const serializedScene = await engine.serializeProjectScene({
+          persistExternalTexture: (fileName, data) =>
+            window.electronApp!.projects.saveAssetFile(projectPath, textureAssetId, fileName, data)
+        });
+        const project = await window.electronApp.projects.saveScene(projectPath, sceneId, serializedScene);
         const currentContext = activeSceneRef.current;
         if (currentContext.projectPath === projectPath) {
           setActiveProject(project);
@@ -2029,7 +2071,7 @@ export function App() {
   /** 从对象属性面板更新场景级数据源配置，保持选中模型不被强制切回场景属性。 */
   const handleSceneDataDrivenChange = useCallback(
     (dataDriven: Partial<SceneDataDrivenSnapshot>) => {
-      if (!engine) {
+      if (!engine || sceneLoading || sceneLoadFailed || cadImportActiveRef.current || cadRestoreActiveRef.current) {
         return;
       }
 
@@ -2048,7 +2090,7 @@ export function App() {
         return { type: "scene", scene: namedSceneSnapshot };
       });
     },
-    [activeScene?.name, engine]
+    [activeScene?.name, engine, sceneLoadFailed, sceneLoading]
   );
 
   /** 启动 Stacker 内置模拟预览，不依赖外部 MQTT/WebSocket 数据源。 */
@@ -2216,6 +2258,26 @@ export function App() {
     : cadRestoreActive
     ? "CAD 图纸正在恢复，请等待完成后再导入新的 CAD 图纸"
     : undefined;
+  const dataSourceConfigDisabledReason = !engine
+    ? "场景引擎尚未准备好"
+    : sceneLoading
+    ? "场景读取完成后才能配置数据源"
+    : sceneLoadFailed
+      ? "当前场景加载失败，已阻止配置数据源"
+      : cadImportActive
+        ? "CAD 图纸导入完成后才能配置数据源"
+        : cadRestoreActive
+          ? "CAD 图纸恢复完成后才能配置数据源"
+          : undefined;
+  const dataSourceConfigDisabled = Boolean(dataSourceConfigDisabledReason);
+
+  /** 场景切换、加载失败或 CAD 忙状态出现时关闭数据源弹窗，避免继续写入旧场景配置。 */
+  useEffect(() => {
+    if (dataSourceConfigDisabled) {
+      setDataSourceDialogOpen(false);
+    }
+  }, [dataSourceConfigDisabled]);
+
   const contextTarget = sceneContextMenu?.target ?? null;
   const contextTreeTargetId = contextTarget?.kind === "Group" && contextTarget.hasChildren ? contextTarget.id : undefined;
   const contextAssetFocusTarget = contextTarget && engine ? engine.getAssetLibraryFocusTargetById(contextTarget.id) : null;
@@ -2247,6 +2309,9 @@ export function App() {
         onImportFiles={handleImportFiles}
         onImportCadDrawing={handleImportCadDrawing}
         onImportModelPackage={handleImportModelPackage}
+        onOpenDataSourceConfig={() => setDataSourceDialogOpen(true)}
+        dataSourceConfigDisabled={dataSourceConfigDisabled}
+        dataSourceConfigDisabledReason={dataSourceConfigDisabledReason}
         onSave={handleSave}
         saveDisabled={projectSaveBlocked}
         saveDisabledReason={saveDisabledReason}
@@ -2634,6 +2699,30 @@ export function App() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {dataSourceDialogOpen && (
+        <div className="modal-backdrop">
+          <section className="modal-panel data-source-dialog" role="dialog" aria-modal="true" aria-labelledby="data-source-dialog-title">
+            <div className="panel-title" id="data-source-dialog-title">
+              统一数据源配置
+            </div>
+            <div className="data-source-dialog-summary">
+              <span>{sceneDataDriven.dataConnectionEnabled ? "连接已启用" : "连接未启用"}</span>
+              <span>{formatSceneDataSourceType(sceneDataDriven.dataSourceType)}</span>
+              <span title={sceneDataDriven.dataEndpoint || "未填写连接地址"}>{sceneDataDriven.dataEndpoint || "未填写连接地址"}</span>
+              <span title={sceneDataDriven.dataChannel || "未填写通道/Topic"}>{sceneDataDriven.dataChannel || "未填写通道/Topic"}</span>
+            </div>
+            <div className="data-source-dialog-body">
+              <DataSourceConnectionEditor value={sceneDataDriven} onChange={handleSceneDataDrivenChange} />
+            </div>
+            <div className="modal-actions">
+              <button className="command-button" type="button" onClick={() => setDataSourceDialogOpen(false)}>
+                完成
+              </button>
+            </div>
+          </section>
         </div>
       )}
 
