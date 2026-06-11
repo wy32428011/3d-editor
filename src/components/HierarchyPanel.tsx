@@ -17,7 +17,7 @@ import {
   Unlock
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
-import type { SceneNodeKind, SceneNodeSummary } from "../types/editor";
+import type { HierarchySelectionIntent, SceneNodeKind, SceneNodeSummary } from "../types/editor";
 
 export interface HierarchyExpansionCommand {
   action: "expand" | "collapse" | "toggle";
@@ -29,7 +29,7 @@ interface HierarchyPanelProps {
   title?: string;
   nodes: SceneNodeSummary[];
   expansionCommand?: HierarchyExpansionCommand | null;
-  onSelect: (id: number) => void;
+  onSelect: (intent: HierarchySelectionIntent) => void;
   onFocus: (id: number) => void;
   onCreateNode: () => void;
   onToggleVisibility: (id: number, visible: boolean) => void;
@@ -194,6 +194,16 @@ export function HierarchyPanel({
     onNodeContextMenu(node, { x: event.clientX, y: event.clientY });
   };
 
+  /** 把鼠标修饰键和当前可见行顺序交给 App 计算最终选区。 */
+  const handleNodeSelect = (event: ReactMouseEvent<HTMLButtonElement>, node: SceneNodeSummary) => {
+    onSelect({
+      id: node.id,
+      visibleIds: visibleNodes.map((item) => item.id),
+      toggle: event.ctrlKey || event.metaKey,
+      range: event.shiftKey
+    });
+  };
+
   /** 打开树空白区域右键菜单，用于新建文件夹和批量展开折叠。 */
   const handleBlankContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -234,7 +244,9 @@ export function HierarchyPanel({
           return (
             <div
               key={node.id}
-              className={`node-row ${node.selected ? "is-selected" : ""} ${node.visible ? "" : "is-hidden"} ${
+              className={`node-row ${node.selected ? "is-selected" : ""} ${node.primarySelected ? "is-primary-selected" : ""} ${
+                node.visible ? "" : "is-hidden"
+              } ${
                 node.locked ? "is-locked" : ""
               } ${canDrop ? "is-drop-target" : ""}`}
               draggable={!node.locked}
@@ -268,7 +280,7 @@ export function HierarchyPanel({
                 style={{ paddingLeft: 6 + node.depth * 18 }}
                 type="button"
                 title={`${node.name} (${node.kind})`}
-                onClick={() => onSelect(node.id)}
+                onClick={(event) => handleNodeSelect(event, node)}
                 onDoubleClick={() => onFocus(node.id)}
               >
                 <span className="node-expander-slot">

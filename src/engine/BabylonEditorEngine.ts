@@ -525,6 +525,7 @@ export class BabylonEditorEngine {
   private readonly sceneBusinessRuntime: SceneBusinessRuntime;
   private readonly sceneInstrumentation: SceneInstrumentation;
   private readonly localImportFileKeys = new Set<string>();
+  private selectedNodeIds = new Set<number>();
   private selectedNode: TransformNode | null = null;
   private currentTool: EditorTool = "move";
   private performanceMode = false;
@@ -600,7 +601,8 @@ export class BabylonEditorEngine {
       scene: this.scene,
       getConfig: () => this.createSceneInspectorSnapshot().dataDriven,
       getTargets: () => this.createSceneDataDrivenTargets(),
-      onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now)
+      onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now),
+      onConnectionStatusChanged: (status) => this.callbacks.onDataConnectionStatusChange(status)
     });
     this.sceneBusinessRuntime = new SceneBusinessRuntime({
       scene: this.scene,
@@ -875,7 +877,7 @@ export class BabylonEditorEngine {
     this.stopPreviewAnimations();
     this.restorePreviewCameraSnapshot();
     this.previewMode = false;
-    this.applyHighlight(this.selectedNode);
+    this.applyHighlight();
     this.syncGizmoMode();
     this.scene.render();
   }
@@ -1302,6 +1304,38 @@ export class BabylonEditorEngine {
     }
   }
 
+  /** 根据层级树计算出的节点 ID 集合设置选区，primaryId 对应属性面板和 Gizmo 的主对象。 */
+  public setSelectionByIds(ids: number[], primaryId: number | null): void {
+    const uniqueIds = [...new Set(ids)];
+    const transformNodeById = this.createTransformNodeLookup();
+    const nodes = uniqueIds
+      .map((id) => transformNodeById.get(id))
+      .filter((node): node is TransformNode => node instanceof TransformNode && !node.metadata?.[HELPER_FLAG]);
+    const primaryNode = primaryId === null ? null : nodes.find((node) => node.uniqueId === primaryId) ?? null;
+
+    this.setSelection(nodes, primaryNode);
+  }
+
+  /** 多选右键已选节点时只切换主对象，保留其它已选项用于继续高亮。 */
+  public setPrimarySelectionById(id: number): boolean {
+    if (!this.selectedNodeIds.has(id)) {
+      return false;
+    }
+
+    const node = this.findTransformNodeByUniqueId(id);
+    if (!(node instanceof TransformNode) || node.metadata?.[HELPER_FLAG]) {
+      return false;
+    }
+
+    this.selectedNode = node;
+    this.applyHighlight();
+    this.syncGizmoMode();
+    this.emitSelectionSnapshot();
+    this.refreshSceneGraph();
+    this.scene.render();
+    return true;
+  }
+
   /** 选中指定节点的第一个可展示子级，供“选择子级”右键命令使用。 */
   public selectFirstChildById(id: number): boolean {
     const node = this.findTransformNodeByUniqueId(id);
@@ -1318,14 +1352,18 @@ export class BabylonEditorEngine {
     return true;
   }
 
-  /** 根据层级面板传入的 uniqueId 快速定位到场景节点。 */
-  public focusById(id: number): void {
+  /** 根据层级面板传入的 uniqueId 快速定位到场景节点，可选择保留当前多选集合。 */
+  public focusById(id: number, preserveSelection = false): void {
     const node = this.findTransformNodeByUniqueId(id);
     if (!(node instanceof TransformNode) || node.metadata?.[HELPER_FLAG]) {
       return;
     }
 
-    this.selectNode(node);
+    if (preserveSelection && this.selectedNodeIds.has(id)) {
+      this.setPrimarySelectionById(id);
+    } else {
+      this.selectNode(node);
+    }
     this.frameNodeInView(node);
   }
 
@@ -1352,23 +1390,37 @@ export class BabylonEditorEngine {
 
   /** 选中对象时切换自身显隐状态，右键和快捷键共用同一入口。 */
   public toggleSelectedVisibility(): boolean {
-    const node = this.selectedNode;
-    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+    const nodes = this.getTopLevelSelectedTransformNodes().filter((node) => !this.isNodeLocked(node));
+    const primaryNode = this.selectedNode && nodes.some((node) => node.uniqueId === this.selectedNode?.uniqueId) ? this.selectedNode : nodes[0];
+    if (!primaryNode || nodes.length === 0) {
       return false;
     }
 
-    this.setNodeVisibilityById(node.uniqueId, !this.getNodeVisibility(node));
+    const nextVisible = !this.getNodeVisibility(primaryNode);
+    nodes.forEach((node) => {
+      this.updateNodeVisibility(node, nextVisible);
+      this.refreshNodeWorldMatrices(node);
+    });
+    this.emitSelectionSnapshot();
+    this.refreshSceneGraph();
+    this.scene.render();
     return true;
   }
 
   /** 选中对象时切换自身锁定状态，父级锁定对象不允许在子级上反向解锁。 */
   public toggleSelectedLock(): boolean {
-    const node = this.selectedNode;
-    if (!node || node.metadata?.[HELPER_FLAG] || (this.isNodeLockedByAncestor(node) && !this.isNodeSelfLocked(node))) {
+    const nodes = this.getTopLevelSelectedTransformNodes().filter((node) => !this.isNodeLockedByAncestor(node) || this.isNodeSelfLocked(node));
+    const primaryNode = this.selectedNode && nodes.some((node) => node.uniqueId === this.selectedNode?.uniqueId) ? this.selectedNode : nodes[0];
+    if (!primaryNode || nodes.length === 0) {
       return false;
     }
 
-    this.setNodeLockedById(node.uniqueId, !this.isNodeSelfLocked(node));
+    const nextLocked = !this.isNodeSelfLocked(primaryNode);
+    nodes.forEach((node) => this.mergeNodeEditorMetadata(node, { locked: nextLocked }));
+    this.emitSelectionSnapshot();
+    this.syncGizmoMode();
+    this.refreshSceneGraph();
+    this.scene.render();
     return true;
   }
 
@@ -1404,28 +1456,33 @@ export class BabylonEditorEngine {
 
   /** 删除当前选中的可编辑节点，并同步层级树、属性面板和性能统计。 */
   public deleteSelected(): void {
-    const node = this.selectedNode;
-    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+    const nodes = this.getTopLevelSelectedTransformNodes().filter((node) => !this.isNodeLocked(node));
+    if (nodes.length === 0) {
       return;
     }
 
     this.selectNode(null);
-    this.cleanupPoiRuntimeInHierarchy(node);
-    this.disposeEditableNode(node);
+    nodes.forEach((node) => {
+      this.cleanupPoiRuntimeInHierarchy(node);
+      this.disposeEditableNode(node);
+    });
     this.refreshSceneGraph();
     this.callbacks.onStatsChange(this.collectStats());
+    this.scene.render();
   }
 
-  /** 把当前选中节点放入新建逻辑分组，单选结构下用于快捷群组当前对象。 */
+  /** 把当前选区中的顶层节点放入新建逻辑分组，单选时保持原有群组体验。 */
   public groupSelected(): boolean {
-    const node = this.selectedNode;
-    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
+    const nodes = this.getTopLevelSelectedTransformNodes().filter((node) => !this.isNodeLocked(node));
+    if (nodes.length === 0) {
       return false;
     }
 
-    const previousParent = node.parent instanceof TransformNode ? node.parent : null;
+    const firstParent = nodes[0].parent instanceof TransformNode ? nodes[0].parent : null;
+    const sameParent = nodes.every((node) => node.parent === firstParent);
+    const previousParent = sameParent ? firstParent : null;
     const group = new TransformNode(this.createUniqueGroupName(), this.scene);
-    group.position.copyFrom(node.getAbsolutePosition());
+    group.position.copyFrom(this.getSelectionGroupPosition(nodes));
     group.metadata = {
       [ROOT_FLAG]: true,
       editor: {
@@ -1433,8 +1490,10 @@ export class BabylonEditorEngine {
       }
     };
     group.setParent(previousParent);
-    node.setParent(group);
-    this.refreshNodeWorldMatrices(node);
+    nodes.forEach((node) => {
+      node.setParent(group);
+      this.refreshNodeWorldMatrices(node);
+    });
     this.selectNode(group);
     this.scene.render();
     return true;
@@ -1572,7 +1631,11 @@ export class BabylonEditorEngine {
       return null;
     }
 
-    this.selectNode(targetRoot);
+    if (this.selectedNodeIds.has(targetRoot.uniqueId)) {
+      this.setPrimarySelectionById(targetRoot.uniqueId);
+    } else {
+      this.selectNode(targetRoot);
+    }
     return this.createTransformSnapshot(targetRoot);
   }
 
@@ -6358,11 +6421,55 @@ export class BabylonEditorEngine {
 
   /** 选中指定节点，并同步高亮、Gizmo、层级树和属性快照。 */
   private selectNode(node: TransformNode | null): void {
-    this.selectedNode = node;
-    this.applyHighlight(node);
+    this.setSelection(node ? [node] : [], node);
+  }
+
+  /** 写入选区集合，并保证主对象始终来自集合，避免属性面板指向已经取消选择的节点。 */
+  private setSelection(nodes: TransformNode[], primaryNode: TransformNode | null): void {
+    const selectableNodes = nodes.filter((node) => !node.metadata?.[HELPER_FLAG]);
+    const selectableIds = new Set(selectableNodes.map((node) => node.uniqueId));
+    const nextPrimary =
+      primaryNode && selectableIds.has(primaryNode.uniqueId) ? primaryNode : selectableNodes[selectableNodes.length - 1] ?? null;
+
+    this.selectedNodeIds = new Set(selectableNodes.map((node) => node.uniqueId));
+    this.selectedNode = nextPrimary;
+    this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
     this.refreshSceneGraph();
+  }
+
+  /** 读取当前选区中的可编辑 TransformNode，并过滤掉已经由选中祖先覆盖的子节点。 */
+  private getTopLevelSelectedTransformNodes(): TransformNode[] {
+    const transformNodeById = this.createTransformNodeLookup();
+    const selectedNodes = [...this.selectedNodeIds]
+      .map((id) => transformNodeById.get(id))
+      .filter((node): node is TransformNode => node instanceof TransformNode && !node.metadata?.[HELPER_FLAG]);
+    const selectedIds = new Set(selectedNodes.map((node) => node.uniqueId));
+
+    return selectedNodes.filter((node) => !this.hasSelectedAncestor(node, selectedIds));
+  }
+
+  /** 判断节点是否已经被选区中的祖先覆盖，用于避免批量命令重复处理父子节点。 */
+  private hasSelectedAncestor(node: TransformNode, selectedIds: Set<number>): boolean {
+    let current = node.parent;
+    while (current) {
+      if (selectedIds.has(current.uniqueId)) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
+  /** 用选中节点世界坐标中心作为新 group 位置，避免多节点群组时 group 偏到某个单项上。 */
+  private getSelectionGroupPosition(nodes: TransformNode[]): Vector3 {
+    if (nodes.length === 0) {
+      return Vector3.Zero();
+    }
+
+    const sum = nodes.reduce((position, node) => position.addInPlace(node.getAbsolutePosition()), Vector3.Zero());
+    return sum.scaleInPlace(1 / nodes.length);
   }
 
   /** 从被拾取的子网格向上查找导入根节点或可编辑根节点。 */
@@ -6381,6 +6488,11 @@ export class BabylonEditorEngine {
   /** 按 uniqueId 在可编辑变换节点中查找节点，兼容 Babylon 9 的 Scene API。 */
   private findTransformNodeByUniqueId(id: number): TransformNode | undefined {
     return [...this.scene.meshes, ...this.scene.transformNodes].find((node) => node.uniqueId === id);
+  }
+
+  /** 为本次批量选择创建一次性节点索引，避免 Shift 大范围选择时反复扫描场景。 */
+  private createTransformNodeLookup(): Map<number, TransformNode> {
+    return new Map([...this.scene.meshes, ...this.scene.transformNodes].map((node) => [node.uniqueId, node]));
   }
 
   /** 按 uniqueId 查找层级面板可展示的场景节点。 */
@@ -6492,17 +6604,35 @@ export class BabylonEditorEngine {
     this.getEditableMeshes(node).forEach((mesh) => mesh.computeWorldMatrix(true));
   }
 
-  /** 刷新选中轮廓，把同一模型的子网格作为一个整体描边，避免内部零件边界被染亮。 */
-  private applyHighlight(node: TransformNode | null): void {
+  /** 刷新选中轮廓，把多选集合中各模型的子网格去重后统一描边。 */
+  private applyHighlight(explicitNode?: TransformNode | null): void {
     this.selectionOutlineLayer.clearSelection();
 
-    if (!node || this.isCadDrawingNode(node)) {
+    const transformNodeById = explicitNode === undefined ? this.createTransformNodeLookup() : null;
+    const nodes =
+      explicitNode === undefined
+        ? [...this.selectedNodeIds]
+            .map((id) => transformNodeById?.get(id))
+            .filter((node): node is TransformNode => node instanceof TransformNode && !node.metadata?.[HELPER_FLAG])
+        : explicitNode
+          ? [explicitNode]
+          : [];
+    if (nodes.length === 0) {
       return;
     }
 
-    const meshes = this.getEditableMeshes(node)
-      .filter((mesh): mesh is Mesh => mesh instanceof Mesh && !mesh.metadata?.[HELPER_FLAG] && !this.isCadDrawingNode(mesh))
-      .filter((mesh) => mesh.isEnabled() && mesh.isVisible && mesh.getTotalVertices() > 0);
+    const meshesById = new Map<number, Mesh>();
+    nodes.forEach((node) => {
+      if (this.isCadDrawingNode(node)) {
+        return;
+      }
+
+      this.getEditableMeshes(node)
+        .filter((mesh): mesh is Mesh => mesh instanceof Mesh && !mesh.metadata?.[HELPER_FLAG] && !this.isCadDrawingNode(mesh))
+        .filter((mesh) => mesh.isEnabled() && mesh.isVisible && mesh.getTotalVertices() > 0)
+        .forEach((mesh) => meshesById.set(mesh.uniqueId, mesh));
+    });
+    const meshes = [...meshesById.values()];
 
     if (meshes.length > 0) {
       this.selectionOutlineLayer.addSelection(meshes);
@@ -6984,7 +7114,7 @@ export class BabylonEditorEngine {
     this.refreshNodeWorldMatrices(root);
     this.ensureNodeGridCoverage(root);
     if (reason === "parameter" || reason === "import" || reason === "load") {
-      this.applyHighlight(this.selectedNode);
+      this.applyHighlight();
       this.callbacks.onStatsChange(this.collectStats());
     }
   }
@@ -7451,7 +7581,8 @@ export class BabylonEditorEngine {
         name: node.name,
         kind: this.getNodeKind(node),
         depth,
-        selected: this.selectedNode?.uniqueId === node.uniqueId,
+        selected: this.selectedNodeIds.has(node.uniqueId),
+        primarySelected: this.selectedNode?.uniqueId === node.uniqueId,
         visible: node instanceof TransformNode ? this.getNodeVisibility(node) : node.isEnabled(),
         hasChildren: childNodes.length > 0,
         childCount: childNodes.length,
@@ -8092,7 +8223,8 @@ export class BabylonEditorEngine {
       (definition.device === undefined || this.isModelDataDrivenDeviceDefinition(definition.device)) &&
       (definition.motion === undefined || this.isModelDataDrivenMotionDefinitions(definition.motion)) &&
       (definition.fixedNodes === undefined || this.isStringArray(definition.fixedNodes)) &&
-      (definition.simulation === undefined || this.isModelDataDrivenSimulationDefinition(definition.simulation))
+      (definition.simulation === undefined || this.isModelDataDrivenSimulationDefinition(definition.simulation)) &&
+      (definition.cargoHandling === undefined || this.isModelDataDrivenCargoHandlingDefinition(definition.cargoHandling))
     );
   }
 
@@ -8127,7 +8259,55 @@ export class BabylonEditorEngine {
       (group.kind === undefined || group.kind === "translate" || group.kind === "rotate") &&
       ["x", "y", "z"].includes(String(group.axis)) &&
       this.isStringArray(group.nodes) &&
-      (group.fallbackPattern === undefined || typeof group.fallbackPattern === "string")
+      (group.fallbackPattern === undefined || typeof group.fallbackPattern === "string") &&
+      (group.speed === undefined || (typeof group.speed === "number" && Number.isFinite(group.speed) && group.speed > 0)) &&
+      (group.limits === undefined || this.isModelDataDrivenMotionLimitDefinition(group.limits))
+    );
+  }
+
+  /** 校验模型包运动行程限制定义，缺省字段保持兼容旧模型包。 */
+  private isModelDataDrivenMotionLimitDefinition(value: unknown): boolean {
+    const limits = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      (limits.min === undefined || (typeof limits.min === "number" && Number.isFinite(limits.min))) &&
+      (limits.max === undefined || (typeof limits.max === "number" && Number.isFinite(limits.max))) &&
+      (limits.blockerNodes === undefined || this.isStringArray(limits.blockerNodes)) &&
+      (limits.blockerFallbackPattern === undefined || typeof limits.blockerFallbackPattern === "string") &&
+      (limits.clearance === undefined || (typeof limits.clearance === "number" && Number.isFinite(limits.clearance) && limits.clearance >= 0))
+    );
+  }
+
+  /** 校验模型包货箱取放吸附定义。 */
+  private isModelDataDrivenCargoHandlingDefinition(value: unknown): boolean {
+    const cargoHandling = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      (cargoHandling.actionFields === undefined || this.isStringArray(cargoHandling.actionFields)) &&
+      (cargoHandling.cargoFields === undefined || this.isStringArray(cargoHandling.cargoFields)) &&
+      (cargoHandling.pickupValues === undefined || this.isStringArray(cargoHandling.pickupValues)) &&
+      (cargoHandling.dropValues === undefined || this.isStringArray(cargoHandling.dropValues)) &&
+      (cargoHandling.pickupMinForkExtension === undefined || (typeof cargoHandling.pickupMinForkExtension === "number" && Number.isFinite(cargoHandling.pickupMinForkExtension))) &&
+      (cargoHandling.pickupMaxDistance === undefined || (typeof cargoHandling.pickupMaxDistance === "number" && Number.isFinite(cargoHandling.pickupMaxDistance))) &&
+      (cargoHandling.anchorNodes === undefined || this.isStringArray(cargoHandling.anchorNodes)) &&
+      (cargoHandling.anchorFallbackPattern === undefined || typeof cargoHandling.anchorFallbackPattern === "string") &&
+      (cargoHandling.anchorOffset === undefined || this.isVector3SnapshotLike(cargoHandling.anchorOffset))
+    );
+  }
+
+  /** 校验三维向量快照形状，供模型包声明货箱吸附偏移使用。 */
+  private isVector3SnapshotLike(value: unknown): boolean {
+    const vector = this.asMetadataObject(value);
+    return Boolean(
+      value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        typeof vector.x === "number" &&
+        Number.isFinite(vector.x) &&
+        typeof vector.y === "number" &&
+        Number.isFinite(vector.y) &&
+        typeof vector.z === "number" &&
+        Number.isFinite(vector.z)
     );
   }
 

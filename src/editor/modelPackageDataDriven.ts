@@ -1,9 +1,11 @@
 import ts from "typescript";
 import type {
   ModelDataDrivenAxis,
+  ModelDataDrivenCargoHandlingDefinition,
   ModelDataDrivenDefinition,
   ModelDataDrivenDeviceDefinition,
   ModelDataDrivenMotionGroupDefinition,
+  ModelDataDrivenMotionLimitDefinition,
   ModelDataDrivenMotionKind,
   ModelDataDrivenSimulationDefinition
 } from "../types/editor";
@@ -168,6 +170,7 @@ function normalizeDataDrivenDefinition(
   const motion = normalizeMotionDefinitions(asLiteralRecord(record.motion), warnings, sourceFile);
   const fixedNodes = readStringArray(record.fixedNodes);
   const simulation = normalizeSimulationDefinition(asLiteralRecord(record.simulation));
+  const cargoHandling = normalizeCargoHandlingDefinition(asLiteralRecord(record.cargoHandling));
 
   if (device) {
     definition.device = device;
@@ -181,8 +184,11 @@ function normalizeDataDrivenDefinition(
   if (simulation) {
     definition.simulation = simulation;
   }
+  if (cargoHandling) {
+    definition.cargoHandling = cargoHandling;
+  }
 
-  if (!definition.device && !definition.motion && !definition.fixedNodes && !definition.simulation) {
+  if (!definition.device && !definition.motion && !definition.fixedNodes && !definition.simulation && !definition.cargoHandling) {
     warnings.push(`${sourceFile} 中 dataDriven 没有可用字段，已忽略。`);
     return undefined;
   }
@@ -255,10 +261,48 @@ function normalizeMotionDefinitions(
     if (fallbackPattern) {
       group.fallbackPattern = fallbackPattern;
     }
+    const speed = readPositiveNumber(groupRecord.speed);
+    if (speed !== undefined) {
+      group.speed = speed;
+    }
+    const limits = normalizeMotionLimitDefinition(asLiteralRecord(groupRecord.limits));
+    if (limits) {
+      group.limits = limits;
+    }
     groups[groupName] = group;
   });
 
   return Object.keys(groups).length > 0 ? groups : undefined;
+}
+
+/** 归一化运动行程限制字段，非法字段直接忽略并由运行态兜底保护。 */
+function normalizeMotionLimitDefinition(record: Record<string, LiteralValue> | undefined): ModelDataDrivenMotionLimitDefinition | undefined {
+  if (!record) {
+    return undefined;
+  }
+
+  const limits: ModelDataDrivenMotionLimitDefinition = {};
+  const min = readNumber(record.min);
+  const max = readNumber(record.max);
+  const blockerNodes = readStringArray(record.blockerNodes);
+  const blockerFallbackPattern = readString(record.blockerFallbackPattern);
+  const clearance = readNonNegativeNumber(record.clearance);
+  if (min !== undefined) {
+    limits.min = min;
+  }
+  if (max !== undefined) {
+    limits.max = max;
+  }
+  if (blockerNodes.length > 0) {
+    limits.blockerNodes = blockerNodes;
+  }
+  if (blockerFallbackPattern) {
+    limits.blockerFallbackPattern = blockerFallbackPattern;
+  }
+  if (clearance !== undefined) {
+    limits.clearance = clearance;
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined;
 }
 
 /** 归一化本地模拟范围字段。 */
@@ -293,6 +337,64 @@ function normalizeSimulationDefinition(record: Record<string, LiteralValue> | un
     simulation.forkSideRange = forkSideRange;
   }
   return Object.keys(simulation).length > 0 ? simulation : undefined;
+}
+
+/** 归一化货箱吸附配置，运行态仍会对距离和动作值做二次保护。 */
+function normalizeCargoHandlingDefinition(record: Record<string, LiteralValue> | undefined): ModelDataDrivenCargoHandlingDefinition | undefined {
+  if (!record) {
+    return undefined;
+  }
+
+  const cargoHandling: ModelDataDrivenCargoHandlingDefinition = {};
+  const actionFields = readStringArray(record.actionFields);
+  const cargoFields = readStringArray(record.cargoFields);
+  const pickupValues = readStringArray(record.pickupValues);
+  const dropValues = readStringArray(record.dropValues);
+  const pickupMinForkExtension = readNonNegativeNumber(record.pickupMinForkExtension);
+  const pickupMaxDistance = readNonNegativeNumber(record.pickupMaxDistance);
+  const anchorNodes = readStringArray(record.anchorNodes);
+  const anchorFallbackPattern = readString(record.anchorFallbackPattern);
+  const anchorOffset = readVector3(asLiteralRecord(record.anchorOffset));
+  if (actionFields.length > 0) {
+    cargoHandling.actionFields = actionFields;
+  }
+  if (cargoFields.length > 0) {
+    cargoHandling.cargoFields = cargoFields;
+  }
+  if (pickupValues.length > 0) {
+    cargoHandling.pickupValues = pickupValues;
+  }
+  if (dropValues.length > 0) {
+    cargoHandling.dropValues = dropValues;
+  }
+  if (pickupMinForkExtension !== undefined) {
+    cargoHandling.pickupMinForkExtension = pickupMinForkExtension;
+  }
+  if (pickupMaxDistance !== undefined) {
+    cargoHandling.pickupMaxDistance = pickupMaxDistance;
+  }
+  if (anchorNodes.length > 0) {
+    cargoHandling.anchorNodes = anchorNodes;
+  }
+  if (anchorFallbackPattern) {
+    cargoHandling.anchorFallbackPattern = anchorFallbackPattern;
+  }
+  if (anchorOffset) {
+    cargoHandling.anchorOffset = anchorOffset;
+  }
+  return Object.keys(cargoHandling).length > 0 ? cargoHandling : undefined;
+}
+
+/** 读取三维向量字面量，缺少任一轴时保持未声明以避免半截配置。 */
+function readVector3(record: Record<string, LiteralValue> | undefined): { x: number; y: number; z: number } | undefined {
+  if (!record) {
+    return undefined;
+  }
+
+  const x = readNumber(record.x);
+  const y = readNumber(record.y);
+  const z = readNumber(record.z);
+  return x !== undefined && y !== undefined && z !== undefined ? { x, y, z } : undefined;
 }
 
 /** 读取字符串数组并去重，过滤空字符串和非字符串值。 */
@@ -330,6 +432,12 @@ function readNumber(value: LiteralValue | undefined): number | undefined {
 function readNonNegativeNumber(value: LiteralValue | undefined): number | undefined {
   const numberValue = readNumber(value);
   return numberValue !== undefined && numberValue >= 0 ? numberValue : undefined;
+}
+
+/** 读取正数有限数字，速度字段必须大于 0 才有物理意义。 */
+function readPositiveNumber(value: LiteralValue | undefined): number | undefined {
+  const numberValue = readNumber(value);
+  return numberValue !== undefined && numberValue > 0 ? numberValue : undefined;
 }
 
 /** 判断解析值是否是普通对象。 */

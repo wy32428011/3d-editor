@@ -158,6 +158,18 @@ export interface ModelDataDrivenMotionGroupDefinition {
   axis: ModelDataDrivenAxis;
   nodes: string[];
   fallbackPattern?: string;
+  /** 运动组物理速度；translate 为 m/s，rotate 为 deg/s。 */
+  speed?: number;
+  limits?: ModelDataDrivenMotionLimitDefinition;
+}
+
+/** 模型脚本声明的运动行程限制，用于防止行走机构越过端部防撞物体。 */
+export interface ModelDataDrivenMotionLimitDefinition {
+  min?: number;
+  max?: number;
+  blockerNodes?: string[];
+  blockerFallbackPattern?: string;
+  clearance?: number;
 }
 
 /** Stacker 等模型用于本地模拟预览的非持久化数据范围。 */
@@ -170,12 +182,26 @@ export interface ModelDataDrivenSimulationDefinition {
   forkSideRange?: number;
 }
 
+/** 模型脚本声明的货箱吸附语义，运行态只根据这些字段临时移动货箱。 */
+export interface ModelDataDrivenCargoHandlingDefinition {
+  actionFields?: string[];
+  cargoFields?: string[];
+  pickupValues?: string[];
+  dropValues?: string[];
+  pickupMinForkExtension?: number;
+  pickupMaxDistance?: number;
+  anchorNodes?: string[];
+  anchorFallbackPattern?: string;
+  anchorOffset?: Vector3Snapshot;
+}
+
 /** 模型脚本导出的数据驱动语义定义；场景级连接仍保存到 sceneDataDriven。 */
 export interface ModelDataDrivenDefinition {
   device?: ModelDataDrivenDeviceDefinition;
   motion?: Record<string, ModelDataDrivenMotionGroupDefinition>;
   fixedNodes?: string[];
   simulation?: ModelDataDrivenSimulationDefinition;
+  cargoHandling?: ModelDataDrivenCargoHandlingDefinition;
 }
 
 /** 模型包中文件在导入协议中的角色。 */
@@ -400,6 +426,14 @@ export interface SceneDataDrivenSnapshot {
   credentialProfileId: string;
 }
 
+/** 场景数据连接运行态，只用于界面状态显示，不写入场景文件。 */
+export interface SceneDataConnectionStatusSnapshot {
+  state: "idle" | "connecting" | "connected" | "subscribed" | "reconnecting" | "stale" | "error";
+  label: string;
+  lastMessageAt?: number;
+  lastError?: string;
+}
+
 /** 右侧属性面板的场景级快照。 */
 export interface SceneInspectorSnapshot {
   name: string;
@@ -470,7 +504,10 @@ export interface SceneNodeSummary {
   name: string;
   kind: SceneNodeKind;
   depth: number;
+  /** 当前节点是否属于层级树选区，允许多个节点同时为 true。 */
   selected: boolean;
+  /** 当前节点是否是属性面板、Gizmo 和单对象命令使用的主选中对象。 */
+  primarySelected: boolean;
   visible: boolean;
   hasChildren: boolean;
   childCount: number;
@@ -480,6 +517,14 @@ export interface SceneNodeSummary {
   locked: boolean;
   /** 当前节点是否继承了父级 group 的锁定。 */
   lockedByAncestor: boolean;
+}
+
+/** 层级树点击传入的选择意图，App 根据当前节点快照计算最终选区。 */
+export interface HierarchySelectionIntent {
+  id: number;
+  visibleIds: number[];
+  toggle: boolean;
+  range: boolean;
 }
 
 /** 资产浏览器中的资源记录。 */
@@ -534,4 +579,5 @@ export interface EditorEngineCallbacks {
   onSelectionChange: (target: InspectorTarget) => void;
   onAssetsChange: (assets: AssetRecord[]) => void;
   onStatsChange: (stats: EditorStats) => void;
+  onDataConnectionStatusChange: (status: SceneDataConnectionStatusSnapshot) => void;
 }

@@ -9,6 +9,7 @@ const WS_HOST = process.env.STACKER_DEMO_WS_HOST ?? "127.0.0.1";
 const WS_PORT = Number(process.env.STACKER_DEMO_WS_PORT ?? 18083);
 const WS_PATH = process.env.STACKER_DEMO_WS_PATH ?? "/stacker";
 const DEVICE_ID = process.env.STACKER_DEMO_DEVICE_ID ?? "Stacker01";
+const DEMO_CARGO_ID = process.env.STACKER_DEMO_CARGO_ID ?? "Box01";
 const PUBLISH_INTERVAL_MS = Number(process.env.STACKER_DEMO_INTERVAL_MS ?? 500);
 const MQTT_KEEP_ALIVE_SECONDS = 30;
 const ONCE_MODE = process.argv.includes("--once") || process.env.STACKER_DEMO_ONCE === "1";
@@ -175,18 +176,24 @@ function handleCompleteMqttPacket(packet, fixedHeaderLength, remainingLength) {
   }
 }
 
-/** 根据时间生成可视化明显的 Stacker 运动帧。 */
+/** 根据时间生成可视化明显的 Stacker 运动帧，并在伸叉端点发送货箱取放事件。 */
 function createStackerFrame() {
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
   const travelPhase = elapsedSeconds * 0.65;
   const liftPhase = elapsedSeconds * 1.1;
+  const cargoPhase = Math.sin(liftPhase + Math.PI / 3);
   const ts = Date.now();
-  return [
+  const frame = [
     { e: DEVICE_ID, p: "travel_pos", v: roundNumber(Math.sin(travelPhase) * 3), ts },
     { e: DEVICE_ID, p: "lift_pos", v: roundNumber(0.4 + ((Math.sin(liftPhase) + 1) / 2) * 2.2), ts },
-    { e: DEVICE_ID, p: "fork_extend", v: roundNumber(((Math.sin(liftPhase + Math.PI / 3) + 1) / 2) * 0.8), ts },
+    { e: DEVICE_ID, p: "fork_extend", v: roundNumber(((cargoPhase + 1) / 2) * 0.8), ts },
     { e: DEVICE_ID, p: "fork_side", v: roundNumber(Math.sin(travelPhase * 1.4) * 0.2), ts }
   ];
+  const cargoAction = cargoPhase > 0.92 ? "pickup" : cargoPhase < -0.92 ? "drop" : "";
+  if (cargoAction) {
+    frame.push({ e: DEVICE_ID, p: "cargo_action", v: cargoAction, ts }, { e: DEVICE_ID, p: "cargo", v: DEMO_CARGO_ID, ts });
+  }
+  return frame;
 }
 
 /** 四舍五入到 3 位小数，避免日志和消息过长。 */

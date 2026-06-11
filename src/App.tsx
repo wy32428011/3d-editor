@@ -18,6 +18,7 @@ import {
   parseModelPackageDecorators,
   parseModelPackageDefaultExportClassName
 } from "./editor/modelPackageDecorators";
+import { formatLogisticsMqttChannelSummary } from "./editor/mqttLogisticsProtocol";
 import { DEFAULT_MODEL_PACKAGE_RUNTIME_CLASS } from "./editor/modelPackageRuntimeCompiler";
 import { DEFAULT_SCENE_ENVIRONMENT_COLOR, type BabylonEditorEngine } from "./engine/BabylonEditorEngine";
 import { DEFAULT_SCENE_DATA_DRIVEN } from "./types/editor";
@@ -31,12 +32,14 @@ import type {
   EditorEngineCallbacks,
   EditorStats,
   EditorTool,
+  HierarchySelectionIntent,
   InspectorTarget,
   ModelArrayAxis,
   ModelDataDrivenDefinition,
   ModelPackageManifest,
   ModelPackageProjectFile,
   PrimitiveKind,
+  SceneDataConnectionStatusSnapshot,
   SceneDataDrivenSnapshot,
   SceneInspectorUpdate,
   SceneNodeKind,
@@ -85,6 +88,12 @@ interface ModelArrayDialogState {
   spacing: string;
 }
 
+interface HierarchySelectionResult {
+  ids: number[];
+  primaryId: number | null;
+  anchorId: number | null;
+}
+
 const initialStats: EditorStats = {
   fps: 0,
   meshes: 0,
@@ -97,6 +106,11 @@ const initialStats: EditorStats = {
   gpuVendor: "未知 GPU",
   gpuRenderer: "未知渲染器",
   contextLost: false
+};
+
+const initialDataConnectionStatus: SceneDataConnectionStatusSnapshot = {
+  state: "idle",
+  label: "数据驱动未运行"
 };
 
 const ASSET_BROWSER_HEIGHT_STORAGE_KEY = "babylon-editor.assetBrowserHeight";
@@ -210,6 +224,81 @@ function readModelArrayAxis(value: string): ModelArrayAxis {
   return value === "-x" || value === "z" || value === "-z" ? value : "x";
 }
 
+/** 对 ID 列表去重并保留原顺序，保证层级树选择结果稳定。 */
+function uniqueNumberIds(ids: number[]): number[] {
+  return [...new Set(ids)];
+}
+
+/** 根据当前树节点快照读取已选 ID，App 不额外维护一份易失选区。 */
+function getSelectedHierarchyIds(nodes: SceneNodeSummary[]): number[] {
+  return nodes.filter((node) => node.selected).map((node) => node.id);
+}
+
+/** 判断节点是否已被选中祖先覆盖，批量菜单和引擎使用同样的顶层选区语义。 */
+function hasSelectedHierarchyAncestor(node: SceneNodeSummary, selectedIds: Set<number>, nodeById: Map<number, SceneNodeSummary>): boolean {
+  let parentId = node.parentId;
+  while (parentId !== undefined) {
+    if (selectedIds.has(parentId)) {
+      return true;
+    }
+
+    parentId = nodeById.get(parentId)?.parentId;
+  }
+  return false;
+}
+
+/** 取当前选区中的顶层树节点，避免父子同时选中时菜单文案与引擎批量基准不一致。 */
+function getTopLevelSelectedHierarchyNodes(nodes: SceneNodeSummary[]): SceneNodeSummary[] {
+  const selectedNodes = nodes.filter((node) => node.selected);
+  const selectedIds = new Set(selectedNodes.map((node) => node.id));
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  return selectedNodes.filter((node) => !hasSelectedHierarchyAncestor(node, selectedIds, nodeById));
+}
+
+/** 计算层级树 Ctrl/Shift 点击后的最终选区，范围始终只来自当前可见行。 */
+function resolveHierarchySelection(
+  intent: HierarchySelectionIntent,
+  nodes: SceneNodeSummary[],
+  anchorId: number | null
+): HierarchySelectionResult {
+  const currentIds = getSelectedHierarchyIds(nodes);
+  const currentPrimaryId = nodes.find((node) => node.primarySelected)?.id ?? null;
+  const knownIds = new Set(nodes.map((node) => node.id));
+  const visibleIds = intent.visibleIds.filter((id) => knownIds.has(id));
+  const clickedVisibleIndex = visibleIds.indexOf(intent.id);
+  const anchorVisibleIndex = anchorId === null ? -1 : visibleIds.indexOf(anchorId);
+
+  if (intent.range && clickedVisibleIndex >= 0 && anchorVisibleIndex >= 0) {
+    const start = Math.min(clickedVisibleIndex, anchorVisibleIndex);
+    const end = Math.max(clickedVisibleIndex, anchorVisibleIndex);
+    const rangeIds = visibleIds.slice(start, end + 1);
+    const ids = intent.toggle ? uniqueNumberIds([...currentIds, ...rangeIds]) : rangeIds;
+    return {
+      ids,
+      primaryId: intent.id,
+      anchorId
+    };
+  }
+
+  if (intent.toggle) {
+    const clickedSelected = currentIds.includes(intent.id);
+    const ids = clickedSelected ? currentIds.filter((id) => id !== intent.id) : uniqueNumberIds([...currentIds, intent.id]);
+    const fallbackPrimaryId = ids.length > 0 ? ids[ids.length - 1] : null;
+    const primaryId = ids.includes(intent.id) ? intent.id : currentPrimaryId && ids.includes(currentPrimaryId) ? currentPrimaryId : fallbackPrimaryId;
+    return {
+      ids,
+      primaryId,
+      anchorId: intent.id
+    };
+  }
+
+  return {
+    ids: [intent.id],
+    primaryId: intent.id,
+    anchorId: intent.id
+  };
+}
+
 /** 根据文件名推断基础 MIME，供从项目资产恢复 File 对象时使用。 */
 function getProjectAssetMimeType(fileName: string): string {
   const extension = fileName.slice(fileName.lastIndexOf(".")).toLowerCase();
@@ -261,6 +350,15 @@ function formatSceneDataSourceType(value: SceneDataDrivenSnapshot["dataSourceTyp
   }
 
   return "未配置";
+}
+
+/** 格式化实时数据最近到达时间，便于判断 MQTT/WebSocket 是否仍在流动。 */
+function formatDataConnectionLastMessage(status: SceneDataConnectionStatusSnapshot): string {
+  if (!status.lastMessageAt) {
+    return "尚未收到数据";
+  }
+
+  return `最近数据 ${new Date(status.lastMessageAt).toLocaleTimeString("zh-CN", { hour12: false })}`;
 }
 
 /** 计算当前 CAD 阶段的百分比，未知总量时返回 null 让 UI 显示不确定进度。 */
@@ -928,6 +1026,7 @@ export function App() {
   const [sceneName, setSceneName] = useState("New Scene");
   const [sceneEnvironmentColor, setSceneEnvironmentColor] = useState(DEFAULT_SCENE_ENVIRONMENT_COLOR);
   const [sceneDataDriven, setSceneDataDriven] = useState<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
+  const [dataConnectionStatus, setDataConnectionStatus] = useState<SceneDataConnectionStatusSnapshot>(initialDataConnectionStatus);
   const [assetBrowserHeight, setAssetBrowserHeight] = useState(readStoredAssetBrowserHeight);
   const [assetBrowserMaxHeight, setAssetBrowserMaxHeight] = useState(getAssetBrowserMaxHeight);
 
@@ -939,11 +1038,26 @@ export function App() {
   const cadRestoreRequestRef = useRef(0);
   const cadRestoreActiveRef = useRef(false);
   const cadRestoreWarningRef = useRef<string | null>(null);
+  const hierarchySelectionAnchorRef = useRef<number | null>(null);
   const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
   const selectedHierarchyNode = useMemo(
     () => (selectedNode ? nodes.find((node) => node.id === selectedNode.id) ?? null : null),
     [nodes, selectedNode]
   );
+  const selectedHierarchyNodes = useMemo(() => nodes.filter((node) => node.selected), [nodes]);
+  const topLevelSelectedHierarchyNodes = useMemo(() => getTopLevelSelectedHierarchyNodes(nodes), [nodes]);
+  const selectedEditableHierarchyNodes = useMemo(
+    () => topLevelSelectedHierarchyNodes.filter((node) => !node.locked),
+    [topLevelSelectedHierarchyNodes]
+  );
+  const selectedLockToggleHierarchyNodes = useMemo(
+    () => topLevelSelectedHierarchyNodes.filter((node) => !node.lockedByAncestor || node.selfLocked),
+    [topLevelSelectedHierarchyNodes]
+  );
+  const selectedBatchCount = selectedHierarchyNodes.length;
+  const hasBatchSelection = selectedBatchCount > 1;
+  const canEditSelectedBatch = selectedEditableHierarchyNodes.length > 0;
+  const canToggleSelectedBatchLock = selectedLockToggleHierarchyNodes.length > 0;
   const workspaceStyle = useMemo(
     () =>
       ({
@@ -1049,7 +1163,8 @@ export function App() {
       onSceneGraphChange: setNodes,
       onSelectionChange: handleSelectionChange,
       onAssetsChange: setAssets,
-      onStatsChange: setStats
+      onStatsChange: setStats,
+      onDataConnectionStatusChange: setDataConnectionStatus
     }),
     [handleSelectionChange]
   );
@@ -1173,6 +1288,7 @@ export function App() {
   const handleEngineReady = useCallback(
     (nextEngine: BabylonEditorEngine | null) => {
       const sceneSnapshot = nextEngine?.getSceneInspectorSnapshot();
+      hierarchySelectionAnchorRef.current = null;
       setEngine(nextEngine);
       setEngineSceneId(nextEngine ? activeSceneId : null);
       setSceneEnvironmentColor(sceneSnapshot?.environment.backgroundColor ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
@@ -1666,12 +1782,18 @@ export function App() {
     [ensureProjectAssetFile]
   );
 
-  /** 从层级面板选中指定节点。 */
+  /** 从层级面板按 Windows 风格修饰键计算选区，并交给 Babylon 引擎统一高亮。 */
   const handleSelectNode = useCallback(
-    (id: number) => {
-      engine?.selectById(id);
+    (intent: HierarchySelectionIntent) => {
+      if (!engine) {
+        return;
+      }
+
+      const selection = resolveHierarchySelection(intent, nodes, hierarchySelectionAnchorRef.current);
+      hierarchySelectionAnchorRef.current = selection.anchorId;
+      engine.setSelectionByIds(selection.ids, selection.primaryId);
     },
-    [engine]
+    [engine, nodes]
   );
 
   /** 从层级面板双击节点时，快速把视角定位到该对象。 */
@@ -1726,7 +1848,14 @@ export function App() {
   /** 从层级树右键打开对象菜单，并同步当前选中节点。 */
   const handleHierarchyNodeContextMenu = useCallback(
     (node: SceneNodeSummary, point: { x: number; y: number }) => {
-      engine?.selectById(node.id);
+      if (engine) {
+        if (engine.setPrimarySelectionById(node.id)) {
+          hierarchySelectionAnchorRef.current = node.id;
+        } else {
+          hierarchySelectionAnchorRef.current = node.id;
+          engine.selectById(node.id);
+        }
+      }
       openSceneContextMenu(createSceneContextTargetFromSceneNode(node), point);
     },
     [engine, openSceneContextMenu]
@@ -1748,6 +1877,7 @@ export function App() {
         return;
       }
 
+      hierarchySelectionAnchorRef.current = target.id;
       openSceneContextMenu(createSceneContextTargetFromTransformSnapshot(target), point);
     },
     [openSceneContextMenu]
@@ -1760,7 +1890,9 @@ export function App() {
         return;
       }
 
-      engine.selectById(target.id);
+      if (!engine.setPrimarySelectionById(target.id)) {
+        engine.selectById(target.id);
+      }
       command(target);
       setSceneContextMenu(null);
     },
@@ -1921,7 +2053,7 @@ export function App() {
 
       if (!hasSystemModifier && normalizedKey === "f" && selectedNode) {
         event.preventDefault();
-        engine.focusById(selectedNode.id);
+        engine.focusById(selectedNode.id, true);
         return;
       }
 
@@ -1938,7 +2070,7 @@ export function App() {
         return;
       }
 
-      if (!selectedNode || selectedNode.locked || (event.key !== "Delete" && event.key !== "Backspace")) {
+      if (!canEditSelectedBatch || (event.key !== "Delete" && event.key !== "Backspace")) {
         return;
       }
 
@@ -1948,7 +2080,7 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [engine, runTreeExpansionCommand, selectedHierarchyNode, selectedNode]);
+  }, [canEditSelectedBatch, engine, runTreeExpansionCommand, selectedHierarchyNode, selectedNode]);
 
   /** 从属性面板按当前快照节点 ID 提交对象变换、材质或 metadata 更新，避免引擎选中状态短暂失配。 */
   const handleInspectorChange = useCallback(
@@ -2281,8 +2413,36 @@ export function App() {
   const contextTarget = sceneContextMenu?.target ?? null;
   const contextTreeTargetId = contextTarget?.kind === "Group" && contextTarget.hasChildren ? contextTarget.id : undefined;
   const contextAssetFocusTarget = contextTarget && engine ? engine.getAssetLibraryFocusTargetById(contextTarget.id) : null;
+  const contextTargetSelected = Boolean(contextTarget && selectedHierarchyNodes.some((node) => node.id === contextTarget.id));
+  const contextUsesBatchSelection = contextTargetSelected && hasBatchSelection;
   const contextCanEdit = Boolean(contextTarget && !contextTarget.locked);
   const contextCanToggleLock = Boolean(contextTarget && (!contextTarget.lockedByAncestor || contextTarget.selfLocked));
+  const contextCanBatchEdit = contextUsesBatchSelection ? canEditSelectedBatch : contextCanEdit;
+  const contextCanBatchToggleLock = contextUsesBatchSelection ? canToggleSelectedBatchLock : contextCanToggleLock;
+  const contextBatchVisibilityTarget =
+    contextUsesBatchSelection && contextTarget
+      ? selectedEditableHierarchyNodes.find((node) => node.id === contextTarget.id) ?? selectedEditableHierarchyNodes[0]
+      : contextTarget;
+  const contextBatchLockTarget =
+    contextUsesBatchSelection && contextTarget
+      ? selectedLockToggleHierarchyNodes.find((node) => node.id === contextTarget.id) ?? selectedLockToggleHierarchyNodes[0]
+      : contextTarget;
+  const contextVisibilityLabel = contextBatchVisibilityTarget?.visible
+    ? contextUsesBatchSelection
+      ? "隐藏选中"
+      : "隐藏对象"
+    : contextUsesBatchSelection
+      ? "显示选中"
+      : "显示对象";
+  const contextLockLabel = contextBatchLockTarget?.selfLocked
+    ? contextUsesBatchSelection
+      ? "解锁选中"
+      : "解锁对象"
+    : contextUsesBatchSelection
+      ? "锁定选中"
+      : "锁定对象";
+  const contextDeleteLabel = contextUsesBatchSelection ? "删除选中" : "删除";
+  const contextGroupLabel = contextUsesBatchSelection ? "群组选中" : "群组对象";
 
   if (!activeProject) {
     return (
@@ -2360,7 +2520,7 @@ export function App() {
         >
           新建场景
         </button>
-        <button className="icon-text-button danger-button" type="button" disabled={!selectedNode || selectedNode.locked} onClick={handleDeleteSelected}>
+        <button className="icon-text-button danger-button" type="button" disabled={!canEditSelectedBatch} onClick={handleDeleteSelected}>
           删除选中
         </button>
         {activeCadProgress && cadImportText && (
@@ -2440,6 +2600,7 @@ export function App() {
         <InspectorPanel
           target={panelInspectorTarget}
           sceneDataDriven={sceneDataDriven}
+          dataConnectionStatus={dataConnectionStatus}
           onNodeChange={handleInspectorChange}
           onSceneChange={handleSceneInspectorChange}
           onSceneDataDrivenChange={handleSceneDataDrivenChange}
@@ -2476,7 +2637,7 @@ export function App() {
               <button
                 className="model-context-menu-item"
                 type="button"
-                onClick={() => runTargetedNodeCommand(contextTarget, (target) => engine?.focusById(target.id))}
+                onClick={() => runTargetedNodeCommand(contextTarget, (target) => engine?.focusById(target.id, true))}
               >
                 场景聚焦 <span>F</span>
               </button>
@@ -2494,12 +2655,10 @@ export function App() {
               <button
                 className="model-context-menu-item"
                 type="button"
-                disabled={!contextCanEdit}
-                onClick={() =>
-                  runTargetedNodeCommand(contextTarget, (target) => engine?.setNodeVisibilityById(target.id, !target.visible))
-                }
+                disabled={!contextCanBatchEdit}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.toggleSelectedVisibility())}
               >
-                {contextTarget.visible ? "隐藏对象" : "显示对象"} <span>H</span>
+                {contextVisibilityLabel} <span>H</span>
               </button>
               <button
                 className="model-context-menu-item"
@@ -2522,12 +2681,10 @@ export function App() {
               <button
                 className="model-context-menu-item"
                 type="button"
-                disabled={!contextCanToggleLock}
-                onClick={() =>
-                  runTargetedNodeCommand(contextTarget, (target) => engine?.setNodeLockedById(target.id, !target.selfLocked))
-                }
+                disabled={!contextCanBatchToggleLock}
+                onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.toggleSelectedLock())}
               >
-                {contextTarget.selfLocked ? "解锁对象" : "锁定对象"} <span>Ctrl+K</span>
+                {contextLockLabel} <span>Ctrl+K</span>
               </button>
               <button className="model-context-menu-item" type="button" disabled={!contextCanEdit} onClick={() => handleRenameSceneNode(contextTarget)}>
                 重命名
@@ -2535,19 +2692,19 @@ export function App() {
               <button
                 className="model-context-menu-item danger-item"
                 type="button"
-                disabled={!contextCanEdit}
+                disabled={!contextCanBatchEdit}
                 onClick={() => runTargetedNodeCommand(contextTarget, () => engine?.deleteSelected())}
               >
-                删除 <span>Delete</span>
+                {contextDeleteLabel} <span>Delete</span>
               </button>
               <div className="scene-context-menu-separator" />
               <button
                 className="model-context-menu-item"
                 type="button"
-                disabled={!contextCanEdit}
+                disabled={!contextCanBatchEdit}
                 onClick={() => runTargetedNodeCommand(contextTarget, () => void engine?.groupSelected())}
               >
-                群组对象 <span>Ctrl+G</span>
+                {contextGroupLabel} <span>Ctrl+G</span>
               </button>
               <button
                 className="model-context-menu-item"
@@ -2711,11 +2868,23 @@ export function App() {
             <div className="data-source-dialog-summary">
               <span>{sceneDataDriven.dataConnectionEnabled ? "连接已启用" : "连接未启用"}</span>
               <span>{formatSceneDataSourceType(sceneDataDriven.dataSourceType)}</span>
+              <span title={dataConnectionStatus.lastError ?? dataConnectionStatus.label}>{dataConnectionStatus.label}</span>
+              <span>{formatDataConnectionLastMessage(dataConnectionStatus)}</span>
               <span title={sceneDataDriven.dataEndpoint || "未填写连接地址"}>{sceneDataDriven.dataEndpoint || "未填写连接地址"}</span>
-              <span title={sceneDataDriven.dataChannel || "未填写通道/Topic"}>{sceneDataDriven.dataChannel || "未填写通道/Topic"}</span>
+              <span title={sceneDataDriven.dataChannel || "未填写通道/Topic"}>
+                {sceneDataDriven.dataChannel
+                  ? sceneDataDriven.dataSourceType === "mqtt"
+                    ? formatLogisticsMqttChannelSummary(sceneDataDriven.dataChannel)
+                    : sceneDataDriven.dataChannel
+                  : "未填写通道/Topic"}
+              </span>
             </div>
             <div className="data-source-dialog-body">
-              <DataSourceConnectionEditor value={sceneDataDriven} onChange={handleSceneDataDrivenChange} />
+              <DataSourceConnectionEditor
+                value={sceneDataDriven}
+                status={dataConnectionStatus}
+                onChange={handleSceneDataDrivenChange}
+              />
             </div>
             <div className="modal-actions">
               <button className="command-button" type="button" onClick={() => setDataSourceDialogOpen(false)}>

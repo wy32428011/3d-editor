@@ -11,7 +11,8 @@ import { Node } from "@babylonjs/core/node";
 import type { Observer } from "@babylonjs/core/Misc/observable";
 import type { PointerInfo } from "@babylonjs/core/Events/pointerEvents";
 import type { Scene } from "@babylonjs/core/scene";
-import { createBusinessDataConnection, type BusinessDataConnection } from "./businessDataConnection";
+import { createBusinessDataConnection, type BusinessDataConnection, type BusinessDataMessageMetadata } from "./businessDataConnection";
+import { applyLogisticsMqttFrameDefaults, parseLogisticsMqttTopic } from "./mqttLogisticsProtocol";
 import type { AssetRecord, PoiConfigSnapshot, PoiRuntimeState, SceneDataDrivenSnapshot } from "../types/editor";
 
 const POI_RUNTIME_FLAG = "isPoiRuntimeGenerated";
@@ -205,7 +206,7 @@ export class SceneBusinessRuntime {
 
     const generation = this.nextConnectionGeneration();
     this.connection = createBusinessDataConnection(config, {
-      onMessage: (text) => this.handleMessage(text, generation)
+      onMessage: (text, metadata) => this.handleMessage(text, generation, metadata)
     });
     this.connection?.start();
   }
@@ -228,7 +229,7 @@ export class SceneBusinessRuntime {
   }
 
   /** 收到外部消息后更新数据条件、图表、报警和模型产生器。 */
-  private handleMessage(text: string, generation: number): void {
+  private handleMessage(text: string, generation: number, metadata?: BusinessDataMessageMetadata): void {
     if (!this.running || generation !== this.connectionGeneration || text.length > 1024 * 1024) {
       return;
     }
@@ -238,12 +239,15 @@ export class SceneBusinessRuntime {
       return;
     }
 
+    const topicMetadata = parseLogisticsMqttTopic(metadata?.mqttTopic);
     const frames = Array.isArray(payload) ? payload.slice(0, 200) : [payload];
     frames.forEach((frame) => {
       if (!this.isRecord(frame)) {
         return;
       }
-      this.applyDataFrame(frame);
+      const normalizedFrame = { ...frame };
+      applyLogisticsMqttFrameDefaults(normalizedFrame, topicMetadata);
+      this.applyDataFrame(normalizedFrame);
     });
   }
 

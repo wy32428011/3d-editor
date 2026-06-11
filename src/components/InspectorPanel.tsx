@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from "react";
+import {
+  DEFAULT_LOGISTICS_MQTT_DATA_CHANNEL,
+  formatLogisticsMqttChannelSummary,
+  isLegacyDefaultLogisticsMqttChannel
+} from "../editor/mqttLogisticsProtocol";
 import { LENGTH_UNIT_SYMBOL, ROTATION_UNIT_SYMBOL, SCALE_UNIT_SYMBOL } from "../editor/units";
 import type {
   AssetInfoSnapshot,
@@ -16,6 +21,7 @@ import type {
   PoiConfigUpdate,
   PoiSenderOutputType,
   PoiTriggerMode,
+  SceneDataConnectionStatusSnapshot,
   SceneDataDrivenSnapshot,
   SceneDataSourceType,
   SceneInspectorSnapshot,
@@ -28,6 +34,7 @@ import type {
 interface InspectorPanelProps {
   target: InspectorTarget | null;
   sceneDataDriven: SceneDataDrivenSnapshot;
+  dataConnectionStatus: SceneDataConnectionStatusSnapshot;
   onNodeChange: (update: TransformUpdate) => void;
   onSceneChange: (update: SceneInspectorUpdate) => void | Promise<void>;
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
@@ -85,11 +92,22 @@ const poiSenderOutputLabels: Record<PoiSenderOutputType, string> = {
 const stackerDemoDeviceId = "Stacker01";
 const stackerDemoEndpoint = "ws://127.0.0.1:18083/stacker";
 const stackerDemoTopic = "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
+const defaultMqttTopic = DEFAULT_LOGISTICS_MQTT_DATA_CHANNEL;
+const defaultMqttWebSocketPath = "/mqtt";
+const tcpMqttPort = "1883";
+
+interface MqttEndpointDraft {
+  protocol: "ws" | "wss";
+  host: string;
+  port: string;
+  path: string;
+}
 
 /** 右侧属性面板负责按当前目标编辑对象属性或场景级属性。 */
 export function InspectorPanel({
   target,
   sceneDataDriven,
+  dataConnectionStatus,
   onNodeChange,
   onSceneChange,
   onSceneDataDrivenChange,
@@ -122,6 +140,7 @@ export function InspectorPanel({
       <aside className="panel inspector-panel inspector-panel-redesign">
         <SceneInspector
           scene={target.scene}
+          dataConnectionStatus={dataConnectionStatus}
           onChange={onSceneChange}
           onImportCad={() => {
             if (!cadImportDisabled) {
@@ -149,6 +168,7 @@ export function InspectorPanel({
     <NodeInspector
       selection={target.node}
       sceneDataDriven={sceneDataDriven}
+      dataConnectionStatus={dataConnectionStatus}
       onChange={onNodeChange}
       onSceneDataDrivenChange={onSceneDataDrivenChange}
       onStartStackerDemoPreview={onStartStackerDemoPreview}
@@ -159,13 +179,21 @@ export function InspectorPanel({
 interface NodeInspectorProps {
   selection: TransformSnapshot;
   sceneDataDriven: SceneDataDrivenSnapshot;
+  dataConnectionStatus: SceneDataConnectionStatusSnapshot;
   onChange: (update: TransformUpdate) => void;
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
   onStartStackerDemoPreview: (nodeId: number) => void;
 }
 
 /** 对象属性分支，保留原有模型、组件参数和资产编号编辑能力。 */
-function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDrivenChange, onStartStackerDemoPreview }: NodeInspectorProps) {
+function NodeInspector({
+  selection,
+  sceneDataDriven,
+  dataConnectionStatus,
+  onChange,
+  onSceneDataDrivenChange,
+  onStartStackerDemoPreview
+}: NodeInspectorProps) {
   const isLocked = selection.locked;
   const isGroup = selection.kind === "Group";
   const isCad = selection.kind === "CAD";
@@ -301,6 +329,7 @@ function NodeInspector({ selection, sceneDataDriven, onChange, onSceneDataDriven
                 nodeLocked={isLocked}
                 selection={selection}
                 sceneDataDriven={sceneDataDriven}
+                dataConnectionStatus={dataConnectionStatus}
                 onNodeChange={onChange}
                 onSceneDataDrivenChange={onSceneDataDrivenChange}
                 onStartStackerDemoPreview={onStartStackerDemoPreview}
@@ -508,6 +537,7 @@ function CadDisplayEditor({ opacity, onChange }: CadDisplayEditorProps) {
 
 interface SceneInspectorProps {
   scene: SceneInspectorSnapshot;
+  dataConnectionStatus: SceneDataConnectionStatusSnapshot;
   onChange: (update: SceneInspectorUpdate) => void | Promise<void>;
   onImportCad: () => void;
   cadImportDisabled?: boolean;
@@ -518,6 +548,7 @@ interface SceneInspectorProps {
 /** 场景属性分支，点击非模型区域后显示并编辑场景级配置。 */
 function SceneInspector({
   scene,
+  dataConnectionStatus,
   onChange,
   onImportCad,
   cadImportDisabled = false,
@@ -602,6 +633,7 @@ function SceneInspector({
       <InspectorSection title="SceneDataDrivenComponent" defaultOpen>
         <SceneDataDrivenEditor
           value={scene.dataDriven}
+          dataConnectionStatus={dataConnectionStatus}
           onChange={(dataDriven) => void onChange({ dataDriven })}
         />
       </InspectorSection>
@@ -656,11 +688,12 @@ function SceneNameEditor({ name, onCommit }: SceneNameEditorProps) {
 
 interface SceneDataDrivenEditorProps {
   value: SceneDataDrivenSnapshot;
+  dataConnectionStatus: SceneDataConnectionStatusSnapshot;
   onChange: (update: Partial<SceneDataDrivenSnapshot>) => void;
 }
 
 /** SceneDataDrivenComponent 配置编辑器，保存连接参数并由预览模式启动真实数据驱动。 */
-function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) {
+function SceneDataDrivenEditor({ value, dataConnectionStatus, onChange }: SceneDataDrivenEditorProps) {
   return (
     <>
       <InspectorSelectRow
@@ -693,20 +726,72 @@ function SceneDataDrivenEditor({ value, onChange }: SceneDataDrivenEditorProps) 
         onChange={(boxLineGenerator) => onChange({ boxLineGenerator })}
       />
       <InspectorNumberRow label="Size" step="1" value={value.size} onChange={(size) => onChange({ size })} />
-      <DataSourceConnectionEditor value={value} onChange={onChange} />
+      <DataSourceConnectionEditor value={value} status={dataConnectionStatus} onChange={onChange} />
     </>
   );
 }
 
 interface DataSourceConnectionEditorProps {
   value: SceneDataDrivenSnapshot;
+  status?: SceneDataConnectionStatusSnapshot;
   onChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
 }
 
 /** 场景统一数据源连接字段，场景属性、对象数据驱动和工具栏弹窗共用同一套写回逻辑。 */
-export function DataSourceConnectionEditor({ value, onChange }: DataSourceConnectionEditorProps) {
+export function DataSourceConnectionEditor({ value, status, onChange }: DataSourceConnectionEditorProps) {
+  const isMqtt = value.dataSourceType === "mqtt";
+  const mqttEndpointDraft = parseMqttEndpointDraft(value.dataEndpoint);
+  const mqttEndpointLooksLikeTcp = isMqtt && mqttEndpointDraft.port === tcpMqttPort;
+  const mqttEndpointHelp = mqttEndpointLooksLikeTcp
+    ? "1883 通常是普通 MQTT TCP 端口；编辑器需要 Broker 的 MQTT over WebSocket 端口，例如 8083。"
+    : `系统会自动生成 ${buildMqttEndpoint(mqttEndpointDraft) || "ws://<IP>:<端口>/mqtt"}，并补齐位姿与数据驱动 Topic。`;
+  const topicHelp = isMqtt
+    ? `Topic 自动订阅 ${formatLogisticsMqttChannelSummary(value.dataChannel.trim() || defaultMqttTopic)}；payload 仍建议携带设备字段，缺省时会按 Topic 设备号兜底。`
+    : "普通 WebSocket 会在连接成功后发送轻量订阅消息。";
+
+  useEffect(() => {
+    if (!isMqtt) {
+      return;
+    }
+
+    const autoFillUpdate = createMqttAutoFillUpdate(value, value.dataEndpoint);
+    if (!shouldApplyMqttAutoFill(value, autoFillUpdate)) {
+      return;
+    }
+
+    void onChange(autoFillUpdate);
+  }, [isMqtt, onChange, value]);
+
+  /** 切换到 MQTT 时把旧配置收敛成 IP/端口派生的完整连接配置。 */
+  const handleDataSourceTypeChange = (dataSourceType: string) => {
+    const nextDataSourceType = dataSourceType as SceneDataSourceType;
+    if (nextDataSourceType !== "mqtt") {
+      onChange({ dataSourceType: nextDataSourceType });
+      return;
+    }
+
+    const draft =
+      value.dataSourceType === "mqtt" ? mqttEndpointDraft : { ...mqttEndpointDraft, protocol: "ws" as const, path: defaultMqttWebSocketPath };
+    onChange(createMqttAutoFillUpdate(value, buildMqttEndpoint(draft)));
+  };
+
+  /** MQTT 基础字段变化时，只写回完整 endpoint 和自动补齐字段，避免新增持久化结构。 */
+  const handleMqttEndpointDraftChange = (update: Partial<MqttEndpointDraft>) => {
+    const nextDraft = {
+      ...mqttEndpointDraft,
+      ...update
+    };
+    onChange(createMqttAutoFillUpdate(value, buildMqttEndpoint(nextDraft)));
+  };
+
   return (
     <>
+      {status && (
+        <div className={`inspector-data-runtime-status is-${status.state}`} title={status.lastError ?? status.label}>
+          <span>{status.label}</span>
+          <span>{formatRuntimeStatusLastMessage(status)}</span>
+        </div>
+      )}
       <InspectorCheckboxRow
         label="启用连接"
         checked={value.dataConnectionEnabled}
@@ -717,32 +802,180 @@ export function DataSourceConnectionEditor({ value, onChange }: DataSourceConnec
         options={dataSourceTypeOptions}
         optionLabels={dataSourceTypeLabels}
         value={value.dataSourceType}
-        onChange={(dataSourceType) => onChange({ dataSourceType: dataSourceType as SceneDataSourceType })}
+        onChange={handleDataSourceTypeChange}
       />
-      <InspectorTextRow label="连接地址" value={value.dataEndpoint} onChange={(dataEndpoint) => onChange({ dataEndpoint })} />
-      <InspectorTextRow label="通道/Topic" value={value.dataChannel} onChange={(dataChannel) => onChange({ dataChannel })} />
-      <InspectorTextRow label="设备字段" value={value.deviceIdField} onChange={(deviceIdField) => onChange({ deviceIdField })} />
-      <InspectorTextRow label="匹配字段" value={value.assetCodeField} onChange={(assetCodeField) => onChange({ assetCodeField })} />
-      <InspectorTextRow label="数据路径" value={value.payloadPath} onChange={(payloadPath) => onChange({ payloadPath })} />
-      <InspectorNumberRow
-        label="插值(ms)"
-        step="50"
-        value={value.interpolationMs}
-        onChange={(interpolationMs) => onChange({ interpolationMs })}
-      />
-      <InspectorTextRow
-        label="凭证引用"
-        value={value.credentialProfileId}
-        onChange={(credentialProfileId) => onChange({ credentialProfileId })}
-      />
+      {isMqtt ? (
+        <>
+          <InspectorTextRow
+            label="Broker IP"
+            value={mqttEndpointDraft.host}
+            onChange={(host) => handleMqttEndpointDraftChange({ host: host.trim() })}
+          />
+          <InspectorTextRow
+            label="WS端口"
+            value={mqttEndpointDraft.port}
+            onChange={(port) => handleMqttEndpointDraftChange({ port: normalizeMqttPortInput(port) })}
+          />
+          <div className={mqttEndpointLooksLikeTcp ? "inspector-field-hint is-warning" : "inspector-field-hint"}>{mqttEndpointHelp}</div>
+          <div className="inspector-field-hint">{topicHelp}</div>
+        </>
+      ) : (
+        <>
+          <InspectorTextRow label="连接地址" value={value.dataEndpoint} onChange={(dataEndpoint) => onChange({ dataEndpoint })} />
+          <InspectorTextRow label="通道/Topic" value={value.dataChannel} onChange={(dataChannel) => onChange({ dataChannel })} />
+          <div className="inspector-field-hint">{topicHelp}</div>
+          <InspectorTextRow label="设备字段" value={value.deviceIdField} onChange={(deviceIdField) => onChange({ deviceIdField })} />
+          <InspectorTextRow label="匹配字段" value={value.assetCodeField} onChange={(assetCodeField) => onChange({ assetCodeField })} />
+          <InspectorTextRow label="数据路径" value={value.payloadPath} onChange={(payloadPath) => onChange({ payloadPath })} />
+          <InspectorNumberRow
+            label="插值(ms)"
+            step="50"
+            value={value.interpolationMs}
+            onChange={(interpolationMs) => onChange({ interpolationMs })}
+          />
+          <InspectorTextRow
+            label="凭证引用"
+            value={value.credentialProfileId}
+            onChange={(credentialProfileId) => onChange({ credentialProfileId })}
+          />
+        </>
+      )}
     </>
   );
+}
+
+/** 把 MQTT endpoint 反解析为界面只需要展示的 Broker、端口和隐藏路径。 */
+function parseMqttEndpointDraft(endpoint: string): MqttEndpointDraft {
+  const trimmed = endpoint.trim();
+  if (!trimmed) {
+    return { protocol: "ws", host: "", port: "", path: defaultMqttWebSocketPath };
+  }
+
+  const normalized = trimmed.replace(/^mqtt:\/\//i, "ws://").replace(/^mqtts:\/\//i, "wss://");
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(normalized) ? normalized : `ws://${normalized}`;
+  try {
+    const url = new URL(withScheme);
+    return {
+      protocol: url.protocol === "wss:" ? "wss" : "ws",
+      host: url.hostname,
+      port: url.port,
+      path: normalizeMqttWebSocketPath(`${url.pathname}${url.search}${url.hash}`)
+    };
+  } catch {
+    return parseLooseMqttEndpoint(trimmed);
+  }
+}
+
+/** 兜底解析不完整地址，保证旧场景或手写值不会让配置面板崩溃。 */
+function parseLooseMqttEndpoint(endpoint: string): MqttEndpointDraft {
+  const withoutScheme = endpoint.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const [hostAndPort, rawPath = ""] = withoutScheme.split(/\/(.+)/, 2);
+  const separatorIndex = hostAndPort.lastIndexOf(":");
+  if (separatorIndex > 0) {
+    return {
+      protocol: "ws",
+      host: hostAndPort.slice(0, separatorIndex),
+      port: normalizeMqttPortInput(hostAndPort.slice(separatorIndex + 1)),
+      path: normalizeMqttWebSocketPath(rawPath ? `/${rawPath}` : "")
+    };
+  }
+
+  return {
+    protocol: "ws",
+    host: hostAndPort,
+    port: "",
+    path: normalizeMqttWebSocketPath(rawPath ? `/${rawPath}` : "")
+  };
+}
+
+/** 根据 Broker 草稿生成实际保存的 MQTT over WebSocket 地址。 */
+function buildMqttEndpoint(draft: MqttEndpointDraft): string {
+  const host = draft.host.trim();
+  if (!host) {
+    return "";
+  }
+
+  const normalizedHost = host.includes(":") && !host.startsWith("[") && !host.endsWith("]") ? `[${host}]` : host;
+  const port = normalizeMqttPortInput(draft.port);
+  return `${draft.protocol}://${normalizedHost}${port ? `:${port}` : ""}${normalizeMqttWebSocketPath(draft.path)}`;
+}
+
+/** 用 Broker 和端口展示 MQTT 配置摘要，避免用户误以为需要手动填写完整 URL。 */
+function formatMqttEndpointSummary(draft: MqttEndpointDraft): string {
+  if (!draft.host.trim()) {
+    return "未填写 Broker IP";
+  }
+
+  const port = normalizeMqttPortInput(draft.port);
+  return port ? `Broker：${draft.host}:${port}` : `Broker：${draft.host}`;
+}
+
+/** 创建 MQTT 自动补齐配置，保留用户已经填写的自定义 Topic、字段和插值。 */
+function createMqttAutoFillUpdate(
+  value: SceneDataDrivenSnapshot,
+  dataEndpoint: string
+): Partial<SceneDataDrivenSnapshot> {
+  const deviceIdField = value.deviceIdField.trim();
+  return {
+    dataSourceType: "mqtt",
+    dataEndpoint,
+    dataChannel: resolveMqttDataChannel(value.dataChannel),
+    deviceIdField: !deviceIdField || deviceIdField === "deviceId" ? "e" : value.deviceIdField,
+    assetCodeField: value.assetCodeField.trim() || "assetCode",
+    payloadPath: value.payloadPath,
+    interpolationMs: Number.isFinite(value.interpolationMs) ? value.interpolationMs : 200,
+    credentialProfileId: value.credentialProfileId
+  };
+}
+
+/** MQTT 自动补齐时只升级空值和旧 joint 默认值，避免覆盖用户自定义 Topic。 */
+function resolveMqttDataChannel(dataChannel: string): string {
+  const trimmed = dataChannel.trim();
+  return !trimmed || isLegacyDefaultLogisticsMqttChannel(trimmed) ? defaultMqttTopic : dataChannel;
+}
+
+/** 判断 MQTT 自动补齐是否真的改变配置，避免 React effect 重复写回。 */
+function shouldApplyMqttAutoFill(value: SceneDataDrivenSnapshot, update: Partial<SceneDataDrivenSnapshot>): boolean {
+  return (
+    value.dataSourceType !== update.dataSourceType ||
+    value.dataEndpoint !== update.dataEndpoint ||
+    value.dataChannel !== update.dataChannel ||
+    value.deviceIdField !== update.deviceIdField ||
+    value.assetCodeField !== update.assetCodeField ||
+    value.payloadPath !== update.payloadPath ||
+    value.interpolationMs !== update.interpolationMs ||
+    value.credentialProfileId !== update.credentialProfileId
+  );
+}
+
+/** 端口只保留数字，避免生成浏览器无法解析的 WebSocket URL。 */
+function normalizeMqttPortInput(port: string): string {
+  return port.replace(/[^\d]/g, "").slice(0, 5);
+}
+
+/** MQTT WebSocket 未显式配置路径时按文档默认使用 /mqtt。 */
+function normalizeMqttWebSocketPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed || trimmed === "/") {
+    return defaultMqttWebSocketPath;
+  }
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+/** 格式化数据连接最近消息时间，避免运行态面板显示原始时间戳。 */
+function formatRuntimeStatusLastMessage(status: SceneDataConnectionStatusSnapshot): string {
+  if (!status.lastMessageAt) {
+    return "无实时数据";
+  }
+
+  return `最近 ${new Date(status.lastMessageAt).toLocaleTimeString("zh-CN", { hour12: false })}`;
 }
 
 interface NodeDataDrivenEditorProps {
   nodeLocked: boolean;
   selection: TransformSnapshot;
   sceneDataDriven: SceneDataDrivenSnapshot;
+  dataConnectionStatus: SceneDataConnectionStatusSnapshot;
   onNodeChange: (update: TransformUpdate) => void;
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
   onStartStackerDemoPreview: (nodeId: number) => void;
@@ -753,13 +986,21 @@ function NodeDataDrivenEditor({
   nodeLocked,
   selection,
   sceneDataDriven,
+  dataConnectionStatus,
   onNodeChange,
   onSceneDataDrivenChange,
   onStartStackerDemoPreview
 }: NodeDataDrivenEditorProps) {
   const sourceTypeLabel = dataSourceTypeLabels[sceneDataDriven.dataSourceType] ?? sceneDataDriven.dataSourceType;
-  const endpointText = sceneDataDriven.dataEndpoint.trim() || "未填写连接地址";
-  const channelText = sceneDataDriven.dataChannel.trim() || "未填写通道/Topic";
+  const mqttEndpointDraft = parseMqttEndpointDraft(sceneDataDriven.dataEndpoint);
+  const endpointText =
+    sceneDataDriven.dataSourceType === "mqtt"
+      ? formatMqttEndpointSummary(mqttEndpointDraft)
+      : sceneDataDriven.dataEndpoint.trim() || "未填写连接地址";
+  const channelText =
+    sceneDataDriven.dataSourceType === "mqtt"
+      ? `Topic：${formatLogisticsMqttChannelSummary(sceneDataDriven.dataChannel.trim() || defaultMqttTopic)}`
+      : sceneDataDriven.dataChannel.trim() || "未填写通道/Topic";
   const connectionText = sceneDataDriven.dataConnectionEnabled ? "连接已启用" : "连接未启用";
   /** 一键填入本地桥接 demo 配置，模型侧只写绑定设备，连接参数仍写入场景级配置。 */
   const applyStackerDemoConfig = () => {
@@ -823,7 +1064,11 @@ function NodeDataDrivenEditor({
         />
       </label>
       <div className="inspector-data-source-editor">
-        <DataSourceConnectionEditor value={sceneDataDriven} onChange={onSceneDataDrivenChange} />
+        <DataSourceConnectionEditor
+          value={sceneDataDriven}
+          status={dataConnectionStatus}
+          onChange={onSceneDataDrivenChange}
+        />
       </div>
     </>
   );

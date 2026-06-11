@@ -1042,6 +1042,52 @@ input {
   white-space: nowrap;
 }
 
+.inspector-data-runtime-status {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(124, 148, 171, 0.26);
+  border-radius: 6px;
+  background: rgba(20, 29, 35, 0.72);
+  color: #d9e5ec;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.inspector-data-runtime-status span:last-child {
+  color: #91a4b1;
+}
+
+.inspector-data-runtime-status.is-connected,
+.inspector-data-runtime-status.is-subscribed {
+  border-color: rgba(74, 222, 128, 0.35);
+}
+
+.inspector-data-runtime-status.is-reconnecting,
+.inspector-data-runtime-status.is-stale {
+  border-color: rgba(250, 204, 21, 0.42);
+}
+
+.inspector-data-runtime-status.is-error {
+  border-color: rgba(248, 113, 113, 0.52);
+}
+
+.inspector-field-hint {
+  margin: -4px 0 8px 92px;
+  color: #8fa1ad;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.data-source-dialog-body .inspector-field-hint {
+  margin-left: 110px;
+}
+
+.inspector-field-hint.is-warning {
+  color: #f8c671;
+}
+
 .inspector-data-source-editor {
   margin-top: 8px;
 }
@@ -1232,6 +1278,10 @@ input {
 .node-row.is-selected {
   background: #2f80ff;
   color: #ffffff;
+}
+
+.node-row.is-primary-selected {
+  box-shadow: inset 3px 0 0 #ffffff;
 }
 
 .node-row.is-drop-target {
