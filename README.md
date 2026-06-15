@@ -15,26 +15,31 @@
 
 - 四区编辑器布局：层级、视口、属性、资产浏览器
 - Babylon.js Engine / Scene / ArcRotateCamera 渲染生命周期
+- 编辑视口相机：滚轮缩放不再保留 2m 最近距离限制，可贴近并穿过模型观察内部结构，同时保留原有轨道旋转、平移和聚焦手感
 - 默认场景：编辑网格、场景内 X/Y/Z 坐标轴、环境光、方向光、立方体、球体、地面；项目条和右侧场景属性可配置场景环境背景色，避免视口背景固定为全黑
-- 米制单位：编辑器约定 `1 Babylon unit = 1 m`，默认对象、工作网格、属性面板位置和模型尺寸都按 `m` 展示；导入模型不会修改源文件，编辑器会在 Babylon/glTF 节点变换生效后按真实世界包围盒阈值启发式推断米、厘米或毫米来源，并把进入场景的模型实例归一到米，单位决策会写入模型和资产元数据；工作网格默认每小格为 `1 m`，会随相机位置和缩放动态覆盖视口，并通过全网格同相位闪烁帮助定位编辑平面
-- 工具栏：选择、移动、旋转、缩放、创建基础对象、创建定位线框立方体、导入、导入 CAD 图纸、保存、统一数据源配置、整场景动画预览、Inspector、性能预览
-- GizmoManager：选中对象后支持移动、旋转、缩放
+- 米制单位：编辑器约定 `1 Babylon unit = 1 m`，默认对象、工作网格、属性面板位置和模型尺寸都按 `m` 展示；导入模型不会修改源文件，编辑器会在 Babylon/glTF 节点变换生效后按真实世界包围盒阈值启发式推断米、厘米或毫米来源，并把进入场景的模型实例归一到米，单位决策会写入模型和资产元数据；工作网格默认每小格为 `1 m`，会随相机位置和缩放动态覆盖视口，并通过全网格同相位呼吸闪烁和专用光晕层帮助定位编辑平面，光晕层只作用于编辑器网格 helper，不影响模型拾取、CAD、选中描边或场景保存
+- 工具栏：选择、移动、旋转、缩放、创建基础对象、创建定位线框立方体、导入、导入 CAD 图纸、保存、发布、统一数据源配置、整场景动画预览、Inspector、性能预览
+- GizmoManager：选中可变换对象后会自动切换到移动工具并显示 X/Y/Z 方向轴，仍支持手动切换旋转和缩放；锁定对象和预览模式下不会显示移动轴
 - OutlineRenderer：选中对象只显示外轮廓，不覆盖模型主体材质和贴图
 - 点击拾取：从视口或层级树选中对象，双击层级节点或视口模型可快速定位到对象；左侧模型树支持 Windows 风格多选，普通点击替换选区，`Ctrl` 点击切换单项，`Shift` 按当前可见行做范围选择，选区会同步到树行高亮和视口轮廓高亮；左侧模型树支持新建逻辑 group、模型拖拽归组、group 展开折叠、显隐切换和锁定保护，选中 group 时会高亮其下所有普通 mesh 模型
 - 右键与快捷键：模型树空白区域右键可新建文件夹、展开树和折叠树；文件夹、模型和 POI 右键可执行场景聚焦、库聚焦、显隐、复制、粘贴、锁定/解锁、重命名、删除、群组、解组、选择子级、反选、展开树和折叠树，文件夹不会显示可用的库聚焦。多选时删除、显示/隐藏、锁定/解锁和群组会作用于选区内可编辑的顶层对象，属性面板、Gizmo、复制、重命名、阵列、选择子级和库聚焦仍作用于主选中对象；在已选项上右键会保留多选集合并切换主对象。快捷键支持 `F` 场景聚焦、`H` 显示/隐藏对象、`Ctrl+C` 复制、`Ctrl+V` 粘贴、`Ctrl+K` 锁定/解锁、`Delete`/`Backspace` 删除、`Ctrl+G` 群组对象、`Shift+G` 解组对象、`Ctrl+I` 反选对象、`P` 按当前树状态展开或折叠树；输入框和文本编辑区域保留系统键盘行为。
 - 删除对象：选中基础对象或拖入模型后，可通过项目条按钮、Delete 或 Backspace 删除；多选时会批量删除选区内未锁定的顶层模型或 group，若同时选中父 group 和子模型，只删除父 group 一次
-- 复制粘贴：选中模型后可通过 `Ctrl+C` 复制，再用 `Ctrl+V` 粘贴为带水平偏移的独立副本；左侧模型树或视口中右击普通模型可打开“模型阵列”，按 `X/-X/Z/-Z` 地面轴向、克隆数量和米制间距批量生成真实可编辑副本，`X/Z` 表示世界坐标正向，`-X/-Z` 表示世界坐标负向，克隆数量表示新增副本数；副本资产编号按源编号追加递增数字，例如 `ABC` 会生成 `ABC-1`、`ABC-2`，并自动跳过同场景中已占用的编号；属性面板输入框等文本编辑区域仍保留系统复制粘贴行为，预览模式下不会复制、粘贴或阵列场景模型
-- 属性编辑：右侧属性面板采用深色折叠分组样式，支持对象名称、显隐、位置、旋转、缩放、主体颜色、旧版 MeshVertexModifyComponent 参数、文件夹模型包解析出的动态参数和业务资产编号编辑；变换与颜色会实时驱动视口模型变化，组件参数、动态参数和资产编号会写入节点 metadata 并随场景保存恢复
-- 资产导入：支持从工具栏和资产面板按钮导入 `.glb`、`.gltf`、`.babylon`、`.obj`、`.stl`、常见图片贴图，以及 `.gltf/.obj` 同批依赖的 `.bin/.mtl/贴图` 文件；桌面模式支持导入包含 `meta.json`/`meta.js`、单个 TypeScript 模型脚本和主 `.glb` 的文件夹模型包，导入后会复制到项目 `assets/source/`，属性栏会优先按 `meta.json` 的 `parameterScripts[].scriptFilename` 选择参数脚本，并静态解析 `visibleAsNumber` / `visibleAsString` / `visibleAsBoolean` / `visibleAsColor3` 装饰器生成动态参数；`meta.json.parameterScripts[].fields/defaultValue/values` 会作为模型自身给出的基础参数填入右侧属性面板，`values` 优先于字段默认值并同步到 `metadata.editor.modelPackageInstance.values` 与 `metadata.scripts[].values`；长度、宽度、高度、深度、半径、间距和位置类数字参数会在右侧属性面板按 `m` 展示，并把 `unit: "m"` 同步到 `metadata.scripts[].fields` 供运行脚本按米制场景尺寸消费；同一个 `.model.ts` 可以同时声明 `ParametricModelParamsComponent` 和 `ParametricModelRuntimeComponent`，`meta.json` 保留不同 `className` 供兼容运行环境识别；模型包实例化后会在 Electron renderer 中执行项目内已复制的本地运行脚本，属性栏参数会同步到 `metadata.scripts[].values` 并实时触发 `ParametricModelRuntimeComponent` 驱动几何、阵列和显隐变化，脚本执行时会临时把模型根节点归一到局部基准坐标系并在结束后恢复用户设置的位置、旋转和缩放，避免模型旋转后参数化配置失效；脚本异常会降级为属性栏告警且不阻断参数保存；项目模式下导入的源文件会复制到项目 `assets/source/`，模型和场景文件会先进入资产浏览器，不立即写入当前场景，重新打开项目后资产卡片会按需读取项目内源文件和同批依赖继续拖入使用；旧项目没有源文件副本时，会尝试从当前场景内同源模型克隆新实例，模型实例化到场景后，带子节点的模型在层级面板只展示主模型，保持列表简洁
-- 数据驱动：右侧场景属性和顶部工具栏“统一数据源配置”共用同一份 `SceneDataDrivenComponent`，支持配置 WebSocket 数据源，MQTT over WebSocket 模式只需填写 Broker IP/域名和 WebSocket 端口，系统会补齐默认 Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备类型、默认编号、payload 字段、运动轴向、参与节点、固定节点、本地模拟范围和货箱吸附语义，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，整机生成/位姿走 `twinspawn`，内部动作走 `twindatadriven/joint` 的 `{e,p,v}` 点位格式；`travel_pos` 驱动堆垛机行走机构沿轨道方向位移，`lift_pos` 驱动载货台和货叉升降，`fork_extend` 驱动货叉伸出，`fork_side` 驱动货叉侧向微调，`cargo_action/cargo` 可在预览运行态把指定货箱临时吸附到货叉上；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
-- 定位框动画连接：定位线框立方体可在右侧“动画连接”中启用数据驱动接收端，配置绑定设备、设备字段、匹配字段、X/Y/Z/朝向字段和插值时长；配置保存到 `metadata.editor.locatorAnimationConnection`，仍复用场景级 `SceneDataDrivenComponent` 连接。定位框只有显式启用且填写绑定设备后才会被预览数据驱动，默认按 `x/h/y/r` 映射到 Babylon 的 X/Y/Z/朝向；它仍是内置 primitive，不进入 `AssetRecord`、`assets/source` 或模型包链路，货物仍由用户手动摆放到框内。
+- 复制粘贴：选中模型后可通过 `Ctrl+C` 复制，再用 `Ctrl+V` 粘贴为带水平偏移的独立副本；左侧模型树或视口中右击普通模型可打开“模型阵列”，按 `X/-X/Z/-Z` 地面轴向和克隆数量批量生成真实可编辑副本，副本会按源模型当前世界 X/Z 外包络自动贴边排列且默认无间隙，`X/Z` 表示世界坐标正向，`-X/-Z` 表示世界坐标负向，克隆数量表示新增副本数；副本资产编号按源编号追加递增数字，例如 `ABC` 会生成 `ABC-1`、`ABC-2`，并自动跳过同场景中已占用的编号；属性面板输入框等文本编辑区域仍保留系统复制粘贴行为，预览模式下不会复制、粘贴或阵列场景模型
+- 属性编辑：右侧属性面板采用深色折叠分组样式，支持对象名称、显隐、位置、旋转、缩放、主体颜色、旧版 MeshVertexModifyComponent 参数、文件夹模型包解析出的动态参数和业务资产编号编辑；变换与颜色会实时驱动视口模型变化，组件参数、动态参数和资产编号会写入节点 metadata 并随场景保存恢复；普通 GLB 中带 `GT/roller/辊/滚` 命名的辊筒会按 MeshVertexModifyComponent 的“辊筒密度”显示最终数量，模型包辊道机则优先使用动态参数区的“辊筒数量”
+- 资产导入：支持从工具栏和资产面板按钮导入 `.glb`、`.gltf`、`.babylon`、`.obj`、`.stl`、常见图片贴图，以及 `.gltf/.obj` 同批依赖的 `.bin/.mtl/贴图` 文件；桌面模式支持导入包含 `meta.json`/`meta.js`、单个 TypeScript 模型脚本和主 `.glb` 的文件夹模型包，导入后会复制到项目 `assets/source/`，属性栏会优先按 `meta.json` 的 `parameterScripts[].scriptFilename` 选择参数脚本，并静态解析 `visibleAsNumber` / `visibleAsString` / `visibleAsBoolean` / `visibleAsColor3` 装饰器生成动态参数；`meta.json.parameterScripts[].fields/defaultValue/values` 会作为模型自身给出的基础参数填入右侧属性面板，`values` 优先于字段默认值并同步到 `metadata.editor.modelPackageInstance.values` 与 `metadata.scripts[].values`，旧包装参数 `{ value }`、`{ currentValue }`、`{ defaultValue }`、字符串数字和字符串布尔值会在写回前自动归一化为裸值；长度、宽度、高度、深度、半径、间距和位置类数字参数会在右侧属性面板按 `m` 展示，并把 `unit: "m"` 同步到 `metadata.scripts[].fields` 供运行脚本按米制场景尺寸消费；同一个 `.model.ts` 可以同时声明 `ParametricModelParamsComponent` 和 `ParametricModelRuntimeComponent`，`meta.json` 保留不同 `className` 供兼容运行环境识别；模型包实例化后会在 Electron renderer 中执行项目内已复制的本地运行脚本，属性栏参数会同步到 `metadata.scripts[].values` 并实时触发 `ParametricModelRuntimeComponent` 驱动几何、阵列和显隐变化，脚本执行时会临时把模型根节点归一到局部基准坐标系，结束后恢复用户设置的位置和旋转，并把用户缩放与 `metadata.editor.modelPackageRuntime.parametricRootScaling` 中记录的参数化根缩放相乘，避免长度、宽度和高度等根节点参数化缩放被编辑器恢复逻辑抵消；脚本异常会降级为属性栏告警且不阻断参数保存；再次导入同源目录或资产库中唯一同名目录的模型包会复用原资产并完整替换项目内包文件，主进程会先复制到临时包目录，渲染端确认新 GLB、脚本和 meta 可加载后才切换正式目录，替换失败会回滚旧包；当前场景内同包实例会按新 GLB、脚本和 meta 重新加载，同时保留根节点位置、旋转、缩放、显隐、锁定、资产编号和已有动态参数，预览模式下会要求先退出预览再替换；项目模式下导入的源文件会复制到项目 `assets/source/`，模型和场景文件会先进入资产浏览器，不立即写入当前场景，重新打开项目后资产卡片会按需读取项目内源文件和同批依赖继续拖入使用；模型包从资产库拖入场景且源文件可用时会重新读取项目内 GLB 创建干净实例，只有旧项目缺少源文件副本时才从当前场景内同源模型克隆兜底；模型实例化到场景后，带子节点的模型在层级面板只展示主模型，保持列表简洁
+- 模型包 runtime 保护：执行 `ParametricModelRuntimeComponent` 生命周期时，编辑器会临时标记 0 顶点 GLB 包装 mesh，让模型包脚本按既有 `generatedByParametricRuntime` 规则跳过这些不可渲染节点；执行结束后立即恢复原 metadata，避免辊道机这类原始坐标远离原点的 GLB 被脚本误算包围盒并缩放到不可见，同时不把临时标记写入场景文件。
+- Shelf 参数形态：`shelf.model.ts` 的“货格宽度”按整体货格外包络处理，宽度变化时以原始包围盒中心为锚点重排左右立柱、侧梁和脚杯位置，只有横向跨宽横梁拉伸，避免只拉长红框横梁或把立柱截面放大；层数、列数和双深复制会继承重排后的模板节点变换。
+- 辊道机参数形态：当前 opaque 命名的辊道机模型包不再把 `length/width/height` 作为根节点整体缩放保存；编辑器会在运行脚本前记录原始节点基线，参数变化时恢复基线后按部件级规则处理宽高、支架显隐和辊筒数量。基线只允许来自 GLB 原始节点，刷新参数化配置或替换模型包时不会继承旧 `opaqueRollerConveyorBaseline`，历史场景中混入的 `*_mesh_vertex_*`、`*_roller_*` 运行态辊筒克隆会被过滤并重新写回干净基线。`length` 按现场图片分成三段：左侧黄色固定区 `A16/A17/A7/A5/A3/A9/A13` 的右边界作为起点；红框内 `A10/A11` 两根长梁只在该起点右侧做顶点延伸或缩短，长梁节点自身不会再按延伸后的包围盒中心做 X 轴平移；右侧黄色尾端组件 `A18/A19/A4/A2/A6/A12/A14` 按 `lengthDelta` 跟随长梁尾端。电机、左端结构和 `GT` 辊筒数量/位置不因长度参数整体平移，`rollerDensity` 保持为独立辊筒数量参数。初始化未手动设置 `rollerDensity` 时只显示第一根辊筒，并把面板参数同步为 `1`；用户修改 `rollerDensity` 后，辊筒从 `A10/A11` 当前共同覆盖区中远离真实尾端的一侧开始，按原始 GT 中心距朝当前尾端方向追加，辊筒入口不再复用左侧固定区的 `length` 拉伸锚点，首根中心只在长梁入口内缩半个辊筒厚度，超过长梁安全范围的数量不会生成或显示。`width` 按整机目标外包络宽度处理，两侧零件贴齐新的外边界，横向贯穿件只在 Z 轴局部变宽；未手动修改 `rollerWidth` 时，辊筒宽度会改用 `A10/A11` 当前内侧间距自动计算，并放在两侧长梁内侧中线，避免整机变宽后辊筒端部和长梁之间出现缝隙；用户单独修改后则保持手动值。`height` 以底部脚杯为锚点，只让 `A4/A5/A6/A7` 四根角立柱承担高度增量，顶部框架、辊筒和驱动附件作为刚体上移；最终根节点只保留用户手动缩放，避免参数化后整机被拉伸变形。
+- 辊道机辊筒定位：opaque 辊道机在首次导入、从资产库拖入、从场景模板克隆、复制、粘贴或阵列实例时都会执行同一套兜底布局；第一根辊筒中心取 `A10/A11` 当前共同覆盖区的红框入口并向内缩半个辊筒厚度，原始 GT 中心点只用于计算固定间距；设置数量后朝当前长梁尾端方向追加，超过长梁安全范围的辊筒不会生成或显示。
+- 数据驱动：右侧场景属性和顶部工具栏“统一数据源配置”共用同一份 `SceneDataDrivenComponent`，支持配置 WebSocket 数据源，MQTT over WebSocket 模式只需填写 Broker IP/域名和 WebSocket 端口，系统会补齐默认 Topic、设备字段、匹配字段、payload 路径和插值时长；开启预览后引擎会订阅数据并按设备号匹配场景模型，默认用对象“资产编号”匹配，也会兜底匹配模型包参数中的 `modelKey`、源文件名和节点名。模型包脚本可导出 `dataDriven` 声明设备类型、默认编号、payload 字段、运动轴向、参与节点、固定节点、本地模拟范围和货箱吸附语义，场景文件仍只保存连接配置。以 Stacker 模型包为例，上下轨道保持固定，整机生成/位姿走 `twinspawn`，内部动作走 `twindatadriven/joint` 的 `{e,p,v}` 点位格式；新模型包默认使用 `movement_x/movement_y/front_movement_z/back_movement_z` 动作枚举持续驱动，`v=1` 正向、`v=2` 反向、`v=0` 停止保持当前位置，`cargo_action/cargo` 可在预览运行态把指定货箱临时吸附到货叉上，`drop` 携带 `target` 时可把货箱底面中心放入指定定位线框底面中心；退出预览会断开连接并恢复进入预览前的姿态，避免实时数据中间帧写入场景文件。
+- 定位框动画连接：定位线框立方体可在右侧“资产信息”中填写资产编号，供 Stacker `drop target=定位框资产编号` 放货匹配；也可在“动画连接”中启用数据驱动接收端，配置绑定设备、设备字段、匹配字段、X/Y/Z/朝向字段和插值时长。动画连接配置保存到 `metadata.editor.locatorAnimationConnection`，仍复用场景级 `SceneDataDrivenComponent` 连接。定位框只有显式启用且填写绑定设备后才会被预览数据驱动，默认按 `x/h/y/r` 映射到 Babylon 的 X/Y/Z/朝向；它仍是内置 primitive，不进入 `AssetRecord`、`assets/source` 或模型包链路，编辑态可手动摆放货物，预览态也可通过 Stacker `drop target=定位框资产编号` 把已吸附货物放入框内。
 - CAD 图纸导入：工具栏提供独立的“导入 CAD 图纸”按钮，当前支持 `.dxf` 文本图纸；导入目标收敛为“所有可解析矢量线”，会把 LINE、LWPOLYLINE、POLYLINE/VERTEX、CIRCLE、ARC、ELLIPSE、SPLINE、SOLID/TRACE/3DFACE 外轮廓、LEADER/MLINE/MLEADER/MULTILEADER、RAY/XLINE 有限参考线、DIMENSION 块或 fallback 线以及 BLOCK/INSERT 嵌套内容解析为贴到 XZ 工作网格的米制线段；非线内容如文字、图片、填充面、遮罩和点不作为本次 CAD 导入目标，避免非线内容污染图纸 bounds 并产生放射状乱线。解析器优先导入模型空间线，模型空间没有可绘制线时才兜底导入布局/图纸空间并提示；若 DXF 的二维内容来自三维/剖面导出并落在 XZ 或 YZ 平面，导入器会读取实体 Z、高程和 OCS 挤出方向后自动选择面积最大的二维平面投影，避免只读 XY 导致所有线段压扁重叠；优先读取 DXF `$INSUNITS` 单位声明并换算到项目米制尺寸，未声明单位且原始尺寸明显过大时会推断为毫米；DXF 文件大小和线段数量不做截断，CAD 解析在 Worker 中输出二进制 typed-array chunk，Babylon 端直接用 `LinesMesh + VertexData` 分块渲染。项目模式会把多个线段 chunk 合并保存为约 16-24MB 的 `*.cadlines.pack.bin` 侧车包，场景 JSON 只保留 CAD 根节点 metadata、bounds、单位和 chunk manifest；旧项目中的单 chunk `*.cadlines.bin` 侧车仍可兼容恢复。图纸按包围盒中心平移到世界原点并在导入后自动取景，导入结果作为可选中、可删除、可随场景保存恢复的 CAD 根节点；选中 CAD 根节点后可在右侧“CAD 显示”中调整整张图纸透明度，不改变原始线色和几何数据。DWG 需先转换为 DXF 后导入。
 - CAD 导入与恢复进度：导入 DXF 时项目条会显示专用进度条，按读取文件、测量图纸、输出线段、创建网格和保存侧车包等阶段更新；能拿到总量的阶段显示百分比，测量等未知总量阶段显示不确定进度。重新打开项目时普通场景会先完成加载并可操作，CAD 侧车线段在后台渐进恢复，顶部显示“CAD 恢复中”的 chunk/mesh 进度；恢复完成前会暂时禁用保存，避免把未恢复完整的 CAD 状态写回场景文件。导入中和恢复中的状态不会再占用错误提示。
 - POI 库：底部资源区按“模型库、POI库、主题库、图表库、组合库、图片库、环境库”分组展示；本轮 POI库已补齐事件触发器、发送器、回收器、图表立标、图表面板、手动漫游、报警管理器、模型产生器、群组事件绑定、自动巡检和路径 11 类业务组件，支持按 POI 名称、描述和关键字搜索，拖入视口后会生成真实 Babylon 可编辑节点，支持选择、Gizmo 变换、层级展示、复制、删除、显隐、锁定和场景保存。旧版标记点、信息点、告警点、摄像头、设备点和文本标签会在加载时映射到最接近的新 POI 类型。
 - 资源库高度：底部资源区上边缘支持鼠标拖拽调整高度，默认高度提升到可完整显示 POI 搜索栏和一排业务卡片；调整后的高度会保存到浏览器本地存储，下次打开编辑器继续使用，不写入项目或场景文件。
 - POI 运行态：POI 作为内置轻量场景节点保存，不进入 `AssetRecord` 文件资产链路；可持久化配置写入 `metadata.editor.poiConfig`，顶层 `metadata.poi` 继续保留用于旧场景识别。编辑态和预览态都会启用 `SceneBusinessRuntime`，运行中间态、最新 payload、运行计数、临时图表面板、路径线、占位生成模型、WebSocket/MQTT 句柄都只放在内存或 `doNotSerialize` 临时节点上，保存、删除、清场、退出预览和 dispose 时统一清理，不写入 `.babylon` 文件。
 - POI 数据源与发送器：POI 运行态复用场景级 `SceneDataDrivenComponent` 的 WebSocket/MQTT over WebSocket 数据源接收外部数据；发送器支持内部事件、WebSocket JSON 外发和 MQTT publish 三种输出，默认输出为内部事件。WebSocket/MQTT 外发需要在发送器配置中显式填写连接地址和 Topic，运行态继续保留消息大小、帧数、重连和 topic 保护。
-- 拖拽操作：资产面板基础对象、定位线框立方体和导入模型都以统一资产卡片展示，拖到视口创建或实例化；定位线框立方体是可保存、可选中和可变换的 1.5m 线框参考对象，用于把货物手动摆入框内，本身不会自动吸附、约束或归组货物；Stacker 的货箱取放吸附由预览态数据驱动独立处理，只按货箱资产编号临时跟随货叉；同一模型资产可以像内置 Cube/Sphere 一样反复拖入生成多个实例；外部模型文件直接拖到视口仍按落点导入并同步登记为可复用资产，拖入后的模型保持选中但不自动改变当前相机视角，拖放落点通过透明地面和相机射线兜底计算，避免网格不可见时回退到原点
+- 拖拽操作：资产面板基础对象、定位线框立方体和导入模型都以统一资产卡片展示，拖到视口创建或实例化；定位线框立方体是可保存、可选中和可变换的 1.5m 线框参考对象，本身不会自动吸附、约束或归组货物；Stacker 的货箱取放吸附由预览态数据驱动独立处理，只按货箱资产编号临时跟随货叉，`drop target` 可把货物放到指定定位框底面中心；同一模型资产可以像内置 Cube/Sphere 一样反复拖入生成多个实例；外部模型文件直接拖到视口仍按落点导入并同步登记为可复用资产，拖入后的模型保持选中并自动显示移动轴但不自动改变当前相机视角，拖放落点通过透明地面和相机射线兜底计算，避免网格不可见时回退到原点
 - 场景保存：非项目模式导出 `.babylon` 文件时保持自包含，并附带编辑器资产元数据、场景环境背景色和 `metadata.editor.sceneDataDriven` 场景数据驱动配置；项目模式保存会把运行时大贴图写入 `assets/source/editor-scene-textures-<sceneId>/` 侧车文件，场景 JSON 只保留 `metadata.editor.projectExternalTextures` 清单和 `file:<name>` 轻量引用，避免 GLB 内嵌贴图以大段 `base64String` 进入 `*.scene.json`；项目内重新打开场景时会注册 Babylon 序列化场景加载器，读回 CAD/贴图侧车文件，并清洗相机、选中高亮、数据连接和预览态等编辑器运行时数据，避免保存后重新打开模型消失或保留实时数据中间帧
 - 默认高清渲染：视口会按 3840x2160 目标像素量自动设置 Babylon 后备缓冲，低于 4K 的窗口自动超采样，避免高 DPI/大屏下画面发糊或出现马赛克；工具栏状态栏可悬停查看真实渲染分辨率、硬件缩放和 GPU renderer。
 - 性能预览：仅在用户手动打开时降低渲染分辨率并关闭指针移动拾取，便于大场景快速预览；关闭后会自动恢复默认 4K 高清策略。
@@ -88,54 +93,63 @@ set ELECTRON_DEV_SMOKE_EXIT_MS=3000&& npm run electron:dev
 
 顶部工具栏的“统一数据源配置”、场景属性面板的 `SceneDataDrivenComponent` 和对象属性面板的“数据驱动”分区复用同一份场景级非敏感连接配置，并保存到 `metadata.editor.sceneDataDriven`；选中模型后的“绑定设备”仍写入对象资产编号。MQTT 需要 broker 开启 WebSocket 端口，界面只需要填写 Broker IP/域名和 WebSocket 端口，系统会自动生成 `ws://<IP>:<端口>/mqtt`，并补齐默认订阅 `dt/factory/logistics/+/+/twinspawn` 与 `dt/factory/logistics/+/+/twindatadriven/#`、设备字段 `e`、匹配字段 `assetCode` 和 200ms 插值；不要填写 `1883` 普通 TCP 端口。普通 WebSocket 会在连接成功后发送 `{"type":"subscribe","channel":"<通道>"}` 作为轻量订阅请求。预览运行态会显示连接中、已订阅、重连、最近消息时间和错误信息；真实连接超过 5 秒没有收到数据时会标记为离线但保持最后姿态，不把实时中间帧写入场景文件。
 
-MQTT Topic 按 `dt/factory/logistics/{devType}/{deviceId}/{msgFlag}/{subRes}` 组织：整机生成/位姿使用 `twinspawn`，内部物理动作使用 `twindatadriven/joint`，负载、状态、告警分别使用 `twindatadriven/payload`、`twindatadriven/status`、`twindatadriven/alarm`。payload 建议携带设备字段（默认 `e`）；如果 MQTT topic 符合规范且 payload 缺少 `e`，运行时会用 topic 中的 `{deviceId}` 兜底匹配模型。动画 payload 应表达业务语义，例如 `travel_pos`、`lift_pos`、`roller_angle`、`chain_pos`，不要直接发送 Babylon 节点路径或材质字段；具体映射由模型包 `dataDriven.motion` 决定。状态、告警和心跳类消息保留给 POI/业务层消费，不会被当作模型运动帧。
+MQTT Topic 按 `dt/factory/logistics/{devType}/{deviceId}/{msgFlag}/{subRes}` 组织：整机生成/位姿使用 `twinspawn`，内部物理动作使用 `twindatadriven/joint`，负载、状态、告警分别使用 `twindatadriven/payload`、`twindatadriven/status`、`twindatadriven/alarm`。payload 建议携带设备字段（默认 `e`，也兼容 Excel 常用 `deviceCode`）；如果 MQTT topic 符合规范且 payload 缺少设备字段，运行时会用 topic 中的 `{deviceId}` 兜底匹配模型。动作 payload 应表达业务语义，例如 `movement_x`、`movement_y`、`front_movement_z`、`rotation`，不要直接发送 Babylon 节点路径或材质字段；具体映射由模型包 `dataDriven.motion` 决定。状态、告警和心跳类消息保留给 POI/业务层消费，不会被当作模型运动帧。
 
-模型包脚本可以导出 `dataDriven` 对象，把运动语义放回模型资产自身，例如 Stacker 在 `stacker.model.ts` 中声明 `device.devType = "stacker"`、`device.defaultAssetCode = "Stacker01"`、`device.deviceIdField = "e"`、`motion.travel/lift/fork/forkSide` 的 MQTT 文档点位字段、轴向和节点列表，以及 `fixedNodes`、`simulation` 范围和货箱吸附语义。`motion.*.kind` 可选 `translate` 或 `rotate`，缺省按 `translate` 兼容旧模型；`translate` 的 `v` 表示米制目标位移，`rotate` 的 `v` 表示相对进入预览基线姿态的角度目标值（单位：度）。`v` 仍是目标值不是速度；速度由模型脚本的 `motion.*.speed` 定义，`translate` 单位为 `m/s`，`rotate` 单位为 `deg/s`，运行时按当前已渲染值到新目标值的变化量自动计算插值时长，同一帧多个运动组取最长时长同步到达，且不会短于设备或场景插值时长；未配置速度时继续使用设备或场景插值时长。位移动作的 `motion.*.axis` 表示模型根节点的局部轴，不是世界坐标轴；运行时会先把该局部轴转换为世界方向，再写入运动部件的父级局部坐标，所以模型根节点在场景中旋转后，行走、升降和货叉伸缩方向会跟随模型自身朝向。`motion.*.limits` 可声明 `min/max` 行程，或用 `blockerNodes/blockerFallbackPattern/clearance` 指定两端防撞物体；运行时会沿运动轴投影移动部件和防撞物体包围盒，把 `travel_pos` 等位移目标截断在两端内侧面之间，真实 MQTT/WebSocket 数据和本地模拟都走同一保护。旧 Stacker 没有显式 `limits` 时会尝试用固定轨道节点推导行走范围，推导失败则不启用限制，避免误伤其他模型。旋转动作按参与节点自身局部轴旋转，适合辊筒、移载辊等内部机构。编辑器导入时只静态解析普通对象字面量，不执行脚本来读取配置；旧模型包没有该字段时继续使用内置 Stacker 兜底规则。
+模型包脚本可以导出 `dataDriven` 对象，把运动语义放回模型资产自身。`motion.*.valueMode` 缺省为 `"target"` 以兼容旧场景，表示 payload 的 `v` 是相对进入预览基线姿态的目标值；新模型包使用 `valueMode:"action"`，表示 payload 的 `v` 是动作枚举，运行时按 `direction * speed * deltaSeconds` 持续积分。`translate` 的速度单位为 `m/s`，`rotate` 的速度单位为 `deg/s`；动作值为 `0` 时停止并保持当前位置，真实连接超过 5 秒无新消息时也会自动停住。`actionMap` 用来把协议枚举映射成方向：通用 `0=0, 1=+1, 2=-1`；货叉 `1/3=+1` 表示伸出，`2/4=-1` 表示缩回；输送线/辊筒 `1=+1, 2=-1` 表示正反转。`target:"root"` 可让 RGV/AGV/四向车这类整车按本地轴持续移动，缺省 `target:"nodes"` 驱动内部节点。`motion.*.limits` 仍可声明 `min/max` 或防撞物体推导边界，动作积分和旧 target 目标都会被截断在安全范围内。`distance_x/distance_y/distance_z` 与 `rpm_*` 本轮只作为协议遥测字段保留，不直接换算位移或转速；整机绝对位姿仍使用 `twinspawn` 的 `x/y/h/r`。
 
 Stacker 按 MQTT 文档中的数字孪生主题接入：整机生成/位姿使用 `dt/factory/logistics/stacker/Stacker01/twinspawn`，内部机构动作使用 `dt/factory/logistics/stacker/Stacker01/twindatadriven/joint`。文档坐标中 `x/y/h/r` 分别表示 X 坐标、Y 坐标、Z 高度和旋转角度；运行时会映射到 Babylon 场景的 `x/z/y/rotationY`，也就是文档平面 Y 落到编辑器地面 Z 轴，文档高度 H 落到编辑器垂直 Y 轴。`twindatadriven/joint` 中的 `{e,p,v}` 会在运行时归一为 `{e,[p]:v}` 后再驱动模型内部运动。
 
 推荐 Stacker 整机位姿帧：
 
 ```json
-{"s":"spawn01","e":"Stacker01","x":12.5,"y":8.3,"h":0,"r":90,"ts":1746991234567}
+{"s":"spawn01","deviceCode":"Stacker01","x":12.5,"y":8.3,"h":0,"r":90,"ts":1746991234567}
 ```
 
 推荐 Stacker 内部动作点位帧：
 
 ```json
 [
-  {"e":"Stacker01","p":"travel_pos","v":2.4,"ts":1746991234567},
-  {"e":"Stacker01","p":"lift_pos","v":1.2,"ts":1746991234567},
-  {"e":"Stacker01","p":"fork_extend","v":0.6,"ts":1746991234567},
-  {"e":"Stacker01","p":"fork_side","v":0.1,"ts":1746991234567},
-  {"e":"Stacker01","p":"cargo_action","v":"pickup","ts":1746991234567},
-  {"e":"Stacker01","p":"cargo","v":"Box01","ts":1746991234567}
+  {"deviceCode":"Stacker01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"movement_y","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"front_movement_z","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"back_movement_z","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"cargo_action","v":"pickup","ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"cargo","v":"Box01","ts":1746991234567}
 ]
 ```
 
-`e` 会按模型包默认设备字段读取；规范 MQTT topic 也会提供 `{deviceId}` 兜底。模型侧默认先匹配对象属性里的“资产编号”，匹配不到时会继续匹配模型包动态参数 `modelKey`、源文件名和根节点名称。内部动作点位的数值表示相对进入预览基线姿态的目标值，不表示世界坐标点，数据服务不需要因为场景里旋转了模型而改变 payload 格式。`cargo_action=pickup/drop` 配合 `cargo=货箱资产编号` 使用，运行态会在货叉伸出量和距离满足保护阈值时把货箱临时吸附到货叉吸附点，`drop` 会解除吸附并保持货箱当前位置；规范 `twindatadriven/payload` 的 `{p:"payload",v:"Box01"}` 会归一为货箱字段，用于同步载体与负载关系。若数据服务外层包了一层 `data` 或 `payload`，可以把“数据路径”设置为对应点路径；运行时也会递归归一化包装内的 `{e,p,v}` joint 数组。数组 payload 会按设备合并处理但单条消息最多消费 200 帧，避免高频大包造成内存压力。
+动作枚举含义：`movement_x: 1` 前进、`2` 后退、`0` 静止；`movement_y: 1` 上升、`2` 下降；货叉 `front_movement_z/back_movement_z/forkState: 1/3` 伸出、`2/4` 缩回。`e` 和 `deviceCode` 都可匹配设备；规范 MQTT topic 也会提供 `{deviceId}` 兜底。`cargo_action=pickup/drop` 配合 `cargo=货箱资产编号` 使用，运行态会在货叉伸出量和距离满足保护阈值时把货箱临时吸附到货叉吸附点；`drop` 不带 `target` 时解除吸附并保持货箱当前位置，带 `target=定位框资产编号` 时会把已吸附货物底面中心放入对应定位线框底面中心，定位框只需在“资产信息”中填写资产编号，不必启用动画连接。规范 `twindatadriven/payload` 的 `{p:"payload",v:"Box01"}` 会归一为货箱字段，用于同步载体与负载关系。若数据服务外层包了一层 `data` 或 `payload`，可以把“数据路径”设置为对应点路径；运行时也会递归归一化包装内的 `{e,p,v}` joint 数组，并会把外层 `target/dropTarget/locator` 放货目标透传到内层业务帧。数组 payload 会按设备合并处理但单条消息最多消费 200 帧，避免高频大包造成内存压力。
 
-Stacker 的 `travel_pos` 会在进入运动缓存前应用行走防越界限制。模型包显式声明 `motion.travel.limits.min/max` 时按该数值截断；未声明数值但提供两端 `blockerNodes` 时，运行时会读取防撞物体几何包围盒的内侧面，保证行走机构整体不会越过两端防撞物体。超范围 payload 只会被截断，不会报错或断开预览。
+Stacker 放入指定定位线框的 joint payload 示例：
 
-Stacker 模型脚本已声明物理速度：`travel.speed=0.8m/s`、`lift.speed=0.3m/s`、`fork.speed=0.25m/s`、`forkSide.speed=0.15m/s`。例如 `lift_pos` 从 `0` 到 `1.2` 时，载货台会按 `0.3m/s` 约 4 秒完成；payload 仍只发送 `{p:"lift_pos",v:1.2}`，不需要额外携带速度字段。
+```json
+[
+  {"deviceCode":"Stacker01","p":"cargo_action","v":"drop","ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"cargo","v":"Box01","ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"target","v":"1-1-1","ts":1746991234567}
+]
+```
 
-除 Stacker 外，`E:\公司文件\数字孪生\模型文件\models` 下已补充以下物理动作语义：多穿小车 `Shuttle01` 使用 `fork_extend/fork_side` 驱动货叉伸缩和侧向微调；RGV `RGV01` 只声明设备匹配，整车运动走 `twinspawn`；辊道机 `RollerConveyor01`、有电机辊道 `MotorConveyor01` 和弯道输送机 `WLTS01` 使用 `roller_angle` 驱动辊筒旋转；链条机 `ChainConveyor01` 使用 `chain_pos` 驱动链条轨道位移；一体式顶升移载 `YZJ01` 使用 `lift_pos` 和 `roller_angle` 驱动顶升与移载辊；换层提升机 `HCTS01` 使用 `lift_pos` 只驱动精确识别的轿厢/平台节点，不配置名称兜底匹配。Shelf 是静态货架，LED 属于状态灯颜色语义，本轮不加入物理动作。
+Stacker 的行走会在进入运动缓存前应用防越界限制。模型包显式声明 `motion.*.limits.min/max` 时按该数值截断；未声明数值但提供两端 `blockerNodes` 时，运行时会读取防撞物体几何包围盒的内侧面，保证行走机构整体不会越过两端防撞物体。超范围动作只会在边界停住，不会报错或断开预览。Stacker 模型脚本已声明物理速度：`travel.speed=0.8m/s`、`lift.speed=0.3m/s`、`fork.speed=0.25m/s`。
+
+除 Stacker 外，`E:\公司文件\数字孪生\模型文件\models` 下已补充以下物理动作语义：多穿小车 `Shuttle01` 使用 `front_movement_z/back_movement_z/forkState` 驱动货叉伸缩；RGV `RGV01` 使用 `movement_x/movement_y` 按根节点本地轴持续移动；辊道机 `RollerConveyor01`、有电机辊道 `MotorConveyor01` 和弯道输送机 `WLTS01` 使用 `movement_x` 或 `rotation` 驱动辊筒正反转；链条机 `ChainConveyor01` 使用 `movement_x` 驱动链条轨道正反向运动；一体式顶升移载 `YZJ01` 使用 `movement_y` 顶升、`movement_x/rotation` 驱动移载辊；换层提升机 `HCTS01` 使用 `movement_y` 驱动轿厢/平台升降。Shelf 是静态货架，LED 属于状态灯颜色语义，本轮不加入物理动作。
 
 推荐其它设备 payload 示例：
 
 ```json
-{"s":"spawn-rgv","e":"RGV01","x":6.2,"y":1.4,"h":0,"r":0,"ts":1746991234567}
+{"s":"spawn-rgv","deviceCode":"RGV01","x":6.2,"y":1.4,"h":0,"r":0,"ts":1746991234567}
 ```
 
 ```json
 [
-  {"e":"RollerConveyor01","p":"roller_angle","v":180,"ts":1746991234567},
-  {"e":"MotorConveyor01","p":"roller_angle","v":180,"ts":1746991234567},
-  {"e":"WLTS01","p":"roller_angle","v":90,"ts":1746991234567},
-  {"e":"ChainConveyor01","p":"chain_pos","v":0.35,"ts":1746991234567},
-  {"e":"YZJ01","p":"lift_pos","v":0.45,"ts":1746991234567},
-  {"e":"YZJ01","p":"roller_angle","v":120,"ts":1746991234567},
-  {"e":"HCTS01","p":"lift_pos","v":1.8,"ts":1746991234567}
+  {"deviceCode":"RGV01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"RollerConveyor01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"MotorConveyor01","p":"movement_x","v":2,"ts":1746991234567},
+  {"deviceCode":"WLTS01","p":"rotation","v":1,"ts":1746991234567},
+  {"deviceCode":"ChainConveyor01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"YZJ01","p":"movement_y","v":1,"ts":1746991234567},
+  {"deviceCode":"YZJ01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"HCTS01","p":"movement_y","v":1,"ts":1746991234567}
 ]
 ```
 
@@ -169,13 +183,15 @@ node scripts/stacker-mqtt-demo-bridge.mjs
 
 如需换 broker、Topic、本地 WebSocket 端口或演示货箱编号，可通过 `STACKER_DEMO_MQTT_HOST`、`STACKER_DEMO_MQTT_PORT`、`STACKER_DEMO_TOPIC`、`STACKER_DEMO_WS_PORT`、`STACKER_DEMO_CARGO_ID` 等环境变量覆盖；换机器演示时，Stacker 模型路径也需要替换为本机实际模型包目录。
 
-桥接演示步骤：先启动脚本，再拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker` 和资产编号为 `Box01` 的货箱，选中 Stacker，在右侧“数据驱动”中点击“填入 Stacker Demo”，然后进入预览模式。按钮会把绑定设备写为 `Stacker01`，并把场景级数据源设置为本地 WebSocket demo；脚本会持续发送 `travel_pos/lift_pos/fork_extend/fork_side` 往返变化的数据，并在伸叉端点发送 `cargo_action/cargo` 取放事件，便于确认上下轨道固定、行走机构沿轨道移动、载货台升降、货叉伸缩和货箱跟随。
+桥接演示步骤：先启动脚本，再拖入 `E:\公司文件\数字孪生\模型文件\models\Stacker` 和资产编号为 `Box01` 的货箱，选中 Stacker，在右侧“数据驱动”中点击“填入 Stacker Demo”，然后进入预览模式。按钮会把绑定设备写为 `Stacker01`，并把场景级数据源设置为本地 WebSocket demo；脚本会持续发送 `movement_x/movement_y/front_movement_z/back_movement_z` 动作枚举，并在伸叉端点发送 `cargo_action/cargo` 取放事件，便于确认上下轨道固定、行走机构沿轨道移动、载货台升降、货叉伸缩和货箱跟随。
 
 ## 构建方式
 
 ```bash
 npm run build
 ```
+
+编辑器主界面工具栏提供“发布场景”按钮，桌面模式下会执行同一条 `npm run build`，构建成功后自动打开项目根目录的 `dist/` 文件夹。发布期间会禁用重复发布；预览播放、场景读取失败、CAD 导入或 CAD 恢复期间会阻止发布，避免生成半成品状态。
 
 生成未安装版应用目录：
 
@@ -296,7 +312,7 @@ release/Babylon 3D Editor-0.1.0-Setup.exe
 
 桌面应用启动后会先进入项目启动页，展示最近打开过的项目。用户可以直接打开最近项目，也可以选择已有目录作为项目，或者在指定父目录中新建一个项目。
 
-项目创建时会自动生成默认场景。进入编辑器后，顶部项目条显示当前项目、项目路径和场景选择器；点击“新建场景”可以在同一项目内创建更多场景。保存按钮在项目模式下会把当前 Babylon 场景序列化写入当前场景文件；重新打开最近项目或切换场景时，会通过 Babylon.js 的场景加载能力恢复已保存的场景内容。若未处于项目模式，则继续使用原有的 `.babylon` 文件下载逻辑。
+项目创建时会自动生成默认场景。进入编辑器后，顶部项目条显示当前项目、项目路径和场景选择器；点击“新建场景”可以在同一项目内创建更多场景。保存按钮在项目模式下会把当前 Babylon 场景序列化写入当前场景文件；发布按钮会通过 Electron 主进程执行固定的 `npm run build` 并在成功后打开 `dist/` 文件夹。重新打开最近项目或切换场景时，会通过 Babylon.js 的场景加载能力恢复已保存的场景内容。若未处于项目模式，则继续使用原有的 `.babylon` 文件下载逻辑。
 
 项目数据采用本地文件优先的格式，便于后续接入版本管理、资源管线和多人协作：
 
@@ -374,6 +390,40 @@ tsconfig.electron.json
 
 ## 任务记录
 
+- 2026-06-15：模型阵列改为自动贴边排列；弹窗移除“间距 m”输入，创建时按源模型当前世界 X/Z 外包络计算步长，默认相邻无间隙，目标无可渲染包围盒或轴向尺寸过小时会提示失败而不是生成重叠副本。
+- 2026-06-15：修复右键菜单中“模型阵列”不易发现的问题；阵列入口从菜单底部移到“复制/粘贴”旁，并复用 Babylon 引擎的可阵列目标判断，避免 UI 判断和实际创建规则不一致导致普通模型右键看不到入口。
+- 2026-06-15：修复 Shelf 模型包“货格宽度”只让红框横梁变宽的问题；`shelf.model.ts` 不再把编辑器临时标记的原始 GLB 包装层误排除为运行态克隆，并改为按原始 X 向包围盒中心整体重排模板节点，立柱和侧向部件随宽度外移，横向跨宽横梁才按 X 轴拉伸。
+- 2026-06-15：修复辊道机变宽后辊筒端部与长梁之间出现缝隙的问题；自动 `rollerWidth` 不再按整机外宽比例放大，而是按 `A10/A11` 当前内侧间距计算，并把辊筒 Z 中心对齐到两侧长梁内侧中线。
+- 2026-06-15：修复模型包辊道机从资产库拖入场景后部件散开的问题；模型包资产在源文件可用时不再优先克隆场景模板，而是从项目内 GLB 重新实例化并运行参数化兜底，缺源文件的模板兜底路径也改为先按停止态模板准备克隆元数据，再恢复源模板运行态。
+- 2026-06-15：修复辊筒入口误用 `length` 固定区右边界的问题；`rollerDensity` 现在以 `A10/A11` 当前共同覆盖区的红框入口作为轨道起点，第一根中心仅内缩半个辊筒厚度，后续辊筒按原始间距朝当前尾端追加。
+- 2026-06-15：修复辊筒数量调整后整组仍落在红框左侧外部的问题；辊筒轨道现在优先使用 `A10/A11` 拉伸后的真实包围盒，并从红框入口到当前尾端的有效段排布，第一根辊筒会落在红框对应位置后再朝尾端方向追加。
+- 2026-06-15：修复修改辊筒数量后新增辊筒向左侧生成的问题；`rollerDensity` 的中心点生成现在复用长梁真实尾端参考点，从远离尾端的一侧向当前长梁尾端逐个追加，不再固定按根节点 X 递增方向排布。
+- 2026-06-15：修复辊道机右侧尾端支腿在修改 `length` 后跟随方向反的问题；编辑器现在会先应用 `A10/A11` 长梁顶点拉伸，再读取长梁当前真实尾端 X 坐标，右侧尾端组件按其相对长梁尾端的原始偏移重新定位，不再单纯使用 `center + lengthDelta`，避免场景轴向或模型包装层导致支腿向左偏移。
+- 2026-06-15：按现场标注图明确辊道机 `length` 三段式规则；左侧黄色固定区 `A16/A17/A7/A5/A3/A9/A13` 作为起点不动，红框 `A10/A11` 长梁向右延伸，右侧黄色尾端组件 `A18/A19/A4/A2/A6/A12/A14` 随 `lengthDelta` 向右跟随。
+- 2026-06-15：修正辊道机长度拉伸后电机/传动组件被误带到尾端导致模型移位的问题；`A8/A15/A20/A21/A22/A1` 保持左端固定区基线 X 位置，不再随 `lengthDelta` 平移，避免改变长梁长度后电机组与机架分离。
+- 2026-06-15：修复辊道机长度拉伸后右端短横件仍停留在旧位置的问题；`A12/A14` 现在作为长度尾端跟随节点随 `lengthDelta` 平移到长梁新尾端，避免右端细件留在红框旧端点，且不改变 `showRearSupport` 仅控制后支架节点 `A18/A19/A4/A2/A6` 的显隐语义。
+- 2026-06-15：修复辊道机辊筒被移动到机架外侧的问题；`moveNodeCenterOnRootAxis` 现在会先把编辑根节点本地轴向位移转换为世界位移，再转换到节点父级局部坐标后写入 `position`，避免外层编辑根、单位归一化根或 GLB 包装层导致 GT 辊筒落到绿色框外部；完整 `A* + GT*` opaque 节点集合会直接走辊道机专用兜底，不再因资产文本匹配失败退回普通辊筒布局。
+- 2026-06-15：修正辊道机 `length` 行为为“红框长梁延伸，尾部支撑脚跟随尾端”；`A10/A11` 长梁仍只从左端蓝框锚点向右做顶点延伸并跳过 X 轴包围盒中心重对齐，尾部支撑脚组 `A18/A19/A4/A2/A6` 按 `lengthDelta` 平移，`GT` 辊筒数量和位置继续不随长度自动变化。
+- 2026-06-15：修正辊道机 `rollerDensity` 数量重排边界；opaque 辊道机现在以 `A10/A11` 两根长梁共同覆盖且位于左端固定锚点之后的 X 区间作为辊筒轨道，设置辊筒数量时按当前 `length` 计算长梁尾端并扣除半个辊筒长度，所有目标中心都会被夹在安全区间内，避免新增或重排辊筒出现在长梁外面。
+- 2026-06-15：继续收紧辊筒安全区间；`A10/A11` 共同覆盖区间无效时不再回退到两根长梁并集，避免把辊筒排到只有单侧长梁覆盖的区域。
+- 2026-06-15：修复设置辊筒数量时整组辊筒跑到模型外的问题；数量重排改为使用 `lengthAnchorX` 到 `baseline.minimum.x + targetLength` 的整机当前目标尾端作为可见输送段，再扣除半个辊筒长度后等距分布，彻底移除原始 GT 区间和 A10/A11 历史包围盒尾端回退。
+- 2026-06-15：调整 opaque 辊道机初始化和数量递增语义；未手动设置 `rollerDensity` 时默认只显示左侧第一根辊筒，用户设置数量后从第一根中心按原始 GT 中心距向右追加，超过长梁安全范围的目标数量会被裁剪隐藏。
+- 2026-06-15：补齐辊筒数量初始化同步；未手动接管时会把 `rollerDensity` 参数值写回为 `1`，并在数量递增轨道上叠加 `A10/A11` 当前长梁共同覆盖范围，防止面板数值和视图不一致或辊筒超过长梁。
+- 2026-06-14：按现场红框和蓝框要求收敛辊道机 `length` 行为；长度变化以左端蓝框支架右边界为起点拉伸 `A10/A11` 两根长梁，并保留尾部支撑脚组随长梁末端移动；不会按长度自动改 `rollerDensity` 或重排 `GT` 辊筒，辊筒数量仍由 `rollerDensity` 独立控制。
+- 2026-06-14：修复辊道机模型包拖入场景后不可见和参数变化无效的问题；根因是外部 runtime 将 GLB 的 0 顶点 `__root__` 包装 mesh 纳入包围盒计算，误把模型基线尺寸算成几千米级并生成极小根缩放。编辑器现在只在模型包生命周期调用期间临时标记这类不可渲染包装节点，让脚本按已有 `generatedByParametricRuntime` 规则跳过，调用结束立即恢复 metadata；同时保留用户缩放与 `parametricRootScaling` 分离保存、辊筒数量和 opaque 支架显隐兜底。
+- 2026-06-14：继续收敛辊道机机械外观规则；`length` 改为以模型左端固定，`A10/A11` 长梁按左端顶点锚定延展，尾部支撑脚组随长梁末端平移，辊筒联动保持取消；`height` 改为底部脚杯固定，仅四根角立柱按底端锚定加长，顶部框架、辊筒和驱动附件作为刚体上移，避免电机、辊筒和支架被比例拉伸后破坏正常外观。
+- 2026-06-14：调整辊道机参数化形态应用方式；`length/width/height/rollerWidth/rollerDensity/showFrontSupport/showRearSupport` 写入 metadata 后仍实时刷新，但 opaque 辊道机不再保留 runtime 根节点整体缩放，改为恢复原始节点基线后按部件级规则处理长梁、宽高、支架显隐和辊筒数量，避免整机随参数被整体拉伸变形。
+- 2026-06-14：修正辊道机 `width` 参数的机械外观；宽度现在以整机外包络为目标，两侧结构贴齐目标边界，横向贯穿件局部变宽，默认辊筒宽度随整机宽度自动变化，单独修改 `rollerWidth` 后不再被宽度输入覆盖。
+- 2026-06-14：细化辊道机 `length` 的固定起点；长度现在以左端支架组右边界为伸长起点，蓝框固定区、电机、左端附件和右端端架保持原位，只延展 `A10/A11` 长梁右侧顶点，辊筒不再随长度自动补齐。
+- 2026-06-14：修复刷新或修改辊道机参数化配置后运行态辊筒克隆混入原始基线的问题；编辑器在捕获 opaque 辊道机基线前会先清理 runtime 克隆，捕获和读取时排除 `generatedByParametricRuntime`、`generatedByMeshVertexModifyRuntime` 与历史克隆名，模型包替换也不再继承旧 opaque 基线，避免机架和辊筒分离。
+- 2026-06-13：工作网格升级为同步呼吸闪烁和专用 GlowLayer 光晕；光晕只 include 网格闪光主线、坐标轴和定位线，仍保持 helper 不参与拾取、层级树和场景序列化，性能预览模式会关闭光晕后处理并保留基础线段呼吸。
+- 2026-06-13：放开编辑视口 `ArcRotateCamera` 的最近半径限制；鼠标滚轮可继续贴近并穿过模型目标点，便于检查模型内部结构，预览相机快照继续按原逻辑保存和恢复该状态。
+- 2026-06-13：Stacker 货箱放货新增 `target` 定位框目标；`cargo_action=drop` 携带 `target/dropTarget/locator` 等字段时，会把已吸附货物底面中心对齐到指定定位线框底面中心，定位框只需在“资产信息”中填写资产编号，不要求启用动画连接。
+- 2026-06-13：定位线框立方体属性面板新增独立“资产信息/资产编号”，Stacker `drop target` 优先匹配该编号；旧场景若只在“动画连接/绑定设备”填写过编号，运行时仍兜底兼容。
+- 2026-06-13：修复中文或特殊字符模型包文件夹导入失败的问题；主进程生成 `packageId` 时会把目录名收敛为安全 ASCII 片段，继续保留 `assets/source/<packageId>` 的目录穿越防护。
+- 2026-06-13：修复辊道机放入场景后的移动轴体验和辊筒数量参数；导入时会为几何原点明显偏离模型的资源创建外层编辑根节点，让移动轴出现在模型底面中心。`E:\公司文件\数字孪生\模型文件\models\辊道机` 中 `rollerDensity` 仍作为参数键保存，但界面语义改为最终辊筒数量；编辑器在导入、刷新、打开场景和属性面板实时修改 `rollerDensity` 时都会执行引擎层兜底重排，避免旧模型包脚本或旧运行状态导致辊筒不显示，当前规则会从左侧第一根向右追加并裁剪超出长梁安全范围的数量，长度变化不再触发辊筒重排；当前辊道机 GLB 的支架节点只有 `A*` 不透明命名，编辑器在识别到完整 `GT1..GT10` 与已验证支架节点组时，会用 `showFrontSupport/showRearSupport` 切换 `A16/A7/A3/A5/A17` 和 `A18/A19/A4/A2/A6`；普通 GLB 旧面板的“辊筒密度”也会驱动 `GT/roller/辊/滚` 辊筒数量。
+- 2026-06-12：修复 Windows/Node 22 环境点击发布时报 `spawn EINVAL` 的问题；发布构建在 Windows 下改为固定通过 `cmd.exe /d /s /c npm.cmd run build` 启动，仍由主进程控制命令、参数和工作目录。
+- 2026-06-12：工具栏新增发布按钮；桌面模式下通过受控 Electron IPC 执行固定 `npm run build`，成功后打开根目录 `dist/`，并通过发布中单飞锁、构建失败日志尾部和产物目录校验避免重复发布或误打开旧产物。
 - 2026-06-08：针对大模型场景黑屏和 GPU 占用偏低问题，Electron 启动阶段会向 Chromium 请求高性能 GPU、启用 GPU rasterization 并忽略 GPU blocklist；Babylon WebGL 引擎请求 `high-performance`，常态关闭 `preserveDrawingBuffer` 和 `stencil`，减少后备缓冲显存压力。
 - 2026-06-08：视口状态栏增加 DrawCall、硬件缩放、WebGL renderer/vendor 和上下文状态提示；如果 WebGL context lost，会直接显示“WebGL 丢失”，便于区分 GPU 上下文丢失和普通场景不可见。
 - 2026-06-08：资产区重复拖入同一模型时，优先复用场景中已有同源模板克隆新实例，避免每次重新 `ImportMeshAsync` 解码并上传同一份几何、材质和贴图；克隆实例仍走编辑器复制准备流程，保留独立材质，避免属性面板改色串到其它实例。
@@ -386,6 +436,9 @@ tsconfig.electron.json
 - 2026-06-11：简化 MQTT 数据源配置；MQTT 模式下属性面板和统一数据源弹窗只填写 Broker IP/域名与 WebSocket 端口，系统继续写回完整 `dataEndpoint` 和默认 `dataChannel`，并保留旧场景自定义 WebSocket path 与 Topic。
 - 2026-06-11：按中鼎 MQTT 规范补齐默认订阅与解析；MQTT 默认订阅 `twinspawn` 和 `twindatadriven/#`，PUBLISH topic 会透传到运行时，payload 缺少 `e` 时用规范 topic 的 `{devId}` 兜底，订阅请求改为 QoS1，状态/告警/负载帧进入 POI/业务语义而不误驱动模型。
 - 2026-06-11：模型脚本 `dataDriven.motion.*.speed` 支持按物理速度计算数据驱动插值时长；`translate` 使用 `m/s`，`rotate` 使用 `deg/s`，同一帧多个运动组取最长时长同步到达，未配置速度的模型继续使用原插值配置。Stacker 脚本已补 `travel/lift/fork/forkSide` 速度。
+- 2026-06-11：按接口定义 V4.6 调整 MQTT 数据驱动动作语义；新模型包默认使用 `movement_x/movement_y/front_movement_z/back_movement_z` 等动作枚举持续驱动，旧 `target` 数值目标模式保留兼容，`deviceCode` 纳入设备匹配兜底，Stacker demo 和外部模型包脚本同步切换到动作模式。
+- 2026-06-13：修复 Stacker 主体高度与顶部长轨联动；`bodyHeight` 只拉伸立柱，顶部上轨、顶部滑轨和横杆按世界坐标整体随立柱上移，兼容 GLB `__root__` 的缩放和翻转，底部行走轨保持基准不动。属性面板模型包参数区新增“刷新模型包”，旧实例可从源模型包目录刷新 `.ts` 和 `meta` 文本并立即重跑脚本，不替换已导入 GLB 几何。
+- 2026-06-13：模型包导入新增同包替换语义；重复导入同源目录会优先按 `sourceRoot` 命中原资产，目录移动时仅在资产库存在唯一同名模型包目录时兜底，主进程会先复制到 staging 目录，渲染端读取 staging 文件完成 manifest 和 GLB 替换验证后再激活正式目录，失败时通过 pending token 回滚旧包，预览模式下禁止导入或替换。替换成功后资产库不新增重复卡片，当前场景内同包实例会用新 GLB 模板重建，并保留根节点编辑状态、业务资产编号和兼容动态参数。
 
 ## 后续演进
 

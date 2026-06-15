@@ -13,6 +13,7 @@ import {
   Package,
   Play,
   RadioTower,
+  Rocket,
   Rotate3D,
   Save,
   Scaling,
@@ -39,6 +40,9 @@ interface ToolbarProps {
   onSave: () => void;
   saveDisabled?: boolean;
   saveDisabledReason?: string;
+  onPublish: () => void;
+  publishDisabled?: boolean;
+  publishDisabledReason?: string;
   cadImportDisabled?: boolean;
   cadImportDisabledReason?: string;
   onToggleInspector: () => void;
@@ -108,6 +112,9 @@ export function Toolbar({
   onSave,
   saveDisabled = false,
   saveDisabledReason,
+  onPublish,
+  publishDisabled = false,
+  publishDisabledReason,
   cadImportDisabled = false,
   cadImportDisabledReason,
   onToggleInspector,
@@ -206,6 +213,16 @@ export function Toolbar({
           onClick={onSave}
         >
           <Save size={18} />
+        </button>
+        <button
+          className="icon-button"
+          aria-label="发布场景"
+          title={publishDisabled ? publishDisabledReason ?? "当前状态下不能发布场景" : "发布场景"}
+          type="button"
+          disabled={publishDisabled}
+          onClick={onPublish}
+        >
+          <Rocket size={18} />
         </button>
         <button
           className="icon-button"

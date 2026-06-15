@@ -7,6 +7,8 @@ import type {
   ModelDataDrivenMotionGroupDefinition,
   ModelDataDrivenMotionLimitDefinition,
   ModelDataDrivenMotionKind,
+  ModelDataDrivenMotionTarget,
+  ModelDataDrivenMotionValueMode,
   ModelDataDrivenSimulationDefinition
 } from "../types/editor";
 
@@ -247,7 +249,9 @@ function normalizeMotionDefinitions(
     const axis = readAxis(groupRecord.axis);
     const fields = readStringArray(groupRecord.fields);
     const nodes = readStringArray(groupRecord.nodes);
-    if (!axis || fields.length === 0 || nodes.length === 0) {
+    const targetMode = readMotionTarget(groupRecord.target);
+    const target = targetMode ?? "nodes";
+    if (!axis || fields.length === 0 || (target === "nodes" && nodes.length === 0)) {
       warnings.push(`${sourceFile} 中 dataDriven.motion.${groupName} 缺少有效 fields、axis 或 nodes，已忽略该运动组。`);
       return;
     }
@@ -256,6 +260,17 @@ function normalizeMotionDefinitions(
     const kind = readMotionKind(groupRecord.kind);
     if (kind) {
       group.kind = kind;
+    }
+    const valueMode = readMotionValueMode(groupRecord.valueMode);
+    if (valueMode) {
+      group.valueMode = valueMode;
+    }
+    const actionMap = normalizeActionMap(asLiteralRecord(groupRecord.actionMap));
+    if (actionMap) {
+      group.actionMap = actionMap;
+    }
+    if (targetMode) {
+      group.target = targetMode;
     }
     const fallbackPattern = readString(groupRecord.fallbackPattern);
     if (fallbackPattern) {
@@ -348,6 +363,7 @@ function normalizeCargoHandlingDefinition(record: Record<string, LiteralValue> |
   const cargoHandling: ModelDataDrivenCargoHandlingDefinition = {};
   const actionFields = readStringArray(record.actionFields);
   const cargoFields = readStringArray(record.cargoFields);
+  const targetFields = readStringArray(record.targetFields);
   const pickupValues = readStringArray(record.pickupValues);
   const dropValues = readStringArray(record.dropValues);
   const pickupMinForkExtension = readNonNegativeNumber(record.pickupMinForkExtension);
@@ -360,6 +376,9 @@ function normalizeCargoHandlingDefinition(record: Record<string, LiteralValue> |
   }
   if (cargoFields.length > 0) {
     cargoHandling.cargoFields = cargoFields;
+  }
+  if (targetFields.length > 0) {
+    cargoHandling.targetFields = targetFields;
   }
   if (pickupValues.length > 0) {
     cargoHandling.pickupValues = pickupValues;
@@ -416,6 +435,34 @@ function readAxis(value: LiteralValue | undefined): ModelDataDrivenAxis | undefi
 function readMotionKind(value: LiteralValue | undefined): ModelDataDrivenMotionKind | undefined {
   const kind = readString(value);
   return kind === "translate" || kind === "rotate" ? kind : undefined;
+}
+
+/** 读取运动值语义，未声明时由运行时按旧 target 模式兼容处理。 */
+function readMotionValueMode(value: LiteralValue | undefined): ModelDataDrivenMotionValueMode | undefined {
+  const mode = readString(value);
+  return mode === "target" || mode === "action" ? mode : undefined;
+}
+
+/** 读取运动作用目标，root 允许整车按动作枚举持续移动。 */
+function readMotionTarget(value: LiteralValue | undefined): ModelDataDrivenMotionTarget | undefined {
+  const target = readString(value);
+  return target === "nodes" || target === "root" ? target : undefined;
+}
+
+/** 读取动作枚举到方向的映射，只保留有限数字，避免脚本表达式进入运行时。 */
+function normalizeActionMap(record: Record<string, LiteralValue> | undefined): Record<string, number> | undefined {
+  if (!record) {
+    return undefined;
+  }
+
+  const map: Record<string, number> = {};
+  Object.entries(record).forEach(([key, value]) => {
+    const direction = readNumber(value);
+    if (direction !== undefined) {
+      map[key] = direction;
+    }
+  });
+  return Object.keys(map).length > 0 ? map : undefined;
 }
 
 /** 读取非空字符串。 */

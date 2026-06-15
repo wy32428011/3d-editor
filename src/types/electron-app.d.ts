@@ -61,21 +61,66 @@ declare global {
   interface DesktopModelPackageProjectFile {
     relativePath: string;
     projectFile: string;
+    stagingProjectFile?: string;
     role: "primaryModel" | "modelDependency" | "script" | "meta" | "texture" | "other";
     size: number;
     lastModified?: number;
+  }
+
+  interface DesktopKnownModelPackage {
+    assetId: string;
+    packageId: string;
+    sourceRoot?: string;
+    rootDirectoryName: string;
+  }
+
+  interface DesktopModelPackageImportRequest {
+    knownPackages: DesktopKnownModelPackage[];
+  }
+
+  interface DesktopModelPackageReplacementResult {
+    assetId: string;
+    packageId: string;
+    matchRule: "sourceRoot" | "rootDirectoryName";
+    pendingToken?: string;
+  }
+
+  interface DesktopModelPackageReplacementCommitRequest {
+    packageId: string;
+    pendingToken: string;
   }
 
   interface DesktopModelPackageImportResult {
     packageId: string;
     displayName: string;
     rootDirectoryName: string;
+    sourceRoot: string;
     primaryModelFile: string;
     scriptFile?: string;
     metaFile?: string;
     projectFiles: DesktopModelPackageProjectFile[];
     textFiles: Record<string, string>;
     warnings: string[];
+    replacement?: DesktopModelPackageReplacementResult;
+  }
+
+  interface DesktopModelPackageRefreshRequest {
+    packageId: string;
+    sourceRoot?: string;
+  }
+
+  interface DesktopModelPackageRefreshResult {
+    packageId: string;
+    rootDirectoryName: string;
+    sourceRoot: string;
+    metaFile?: string;
+    projectFiles: DesktopModelPackageProjectFile[];
+    textFiles: Record<string, string>;
+    warnings: string[];
+  }
+
+  interface DesktopPublishResult {
+    distPath: string;
   }
 
   interface Window {
@@ -103,7 +148,29 @@ declare global {
           projectPath: string,
           requests: DesktopProjectAssetBatchRequest[]
         ) => Promise<DesktopProjectAssetBatchResult[]>;
-        importModelPackage?: (projectPath: string) => Promise<DesktopModelPackageImportResult | null>;
+        importModelPackage?: (
+          projectPath: string,
+          request: DesktopModelPackageImportRequest
+        ) => Promise<DesktopModelPackageImportResult | null>;
+        activateModelPackageReplacement?: (
+          projectPath: string,
+          request: DesktopModelPackageReplacementCommitRequest
+        ) => Promise<void>;
+        finalizeModelPackageReplacement?: (
+          projectPath: string,
+          request: DesktopModelPackageReplacementCommitRequest
+        ) => Promise<void>;
+        rollbackModelPackageReplacement?: (
+          projectPath: string,
+          request: DesktopModelPackageReplacementCommitRequest
+        ) => Promise<void>;
+        refreshModelPackage?: (
+          projectPath: string,
+          request: DesktopModelPackageRefreshRequest
+        ) => Promise<DesktopModelPackageRefreshResult | null>;
+      };
+      publish?: {
+        buildAndOpenDist: () => Promise<DesktopPublishResult>;
       };
       files?: {
         getPath: (file: File) => string;

@@ -8,6 +8,8 @@ import type {
   ModelDataDrivenDefinition,
   ModelDataDrivenMotionGroupDefinition,
   ModelDataDrivenMotionKind,
+  ModelDataDrivenMotionTarget,
+  ModelDataDrivenMotionValueMode,
   ModelDataDrivenSimulationDefinition,
   SceneDataConnectionStatusSnapshot,
   SceneDataDrivenSnapshot
@@ -31,6 +33,7 @@ const STACKER_FORK_FIELDS = ["fork_extend", "forkExtend", "forkX", "fork.x", "fo
 const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
 const CARGO_ACTION_FIELDS = ["cargo_action", "cargoAction", "cargo.action", "action"];
 const CARGO_TARGET_FIELDS = ["cargo", "cargoId", "cargoCode", "box", "boxId", "boxCode", "targetCargo"];
+const CARGO_DROP_TARGET_FIELDS = ["target", "dropTarget", "targetLocator", "locator", "locatorAssetCode", "slot"];
 const CARGO_PICKUP_VALUES = ["pickup", "pick", "attach", "load", "carry", "take", "取货", "吸附", "装载"];
 const CARGO_DROP_VALUES = ["drop", "detach", "unload", "release", "put", "放货", "释放", "卸载"];
 const DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION = 0.45;
@@ -56,6 +59,8 @@ const STACKER_TRAVEL_FALLBACK_PATTERN = /dingbu|dibu|lizhu|dianji|caozuotai|xian
 const STACKER_LIFT_FALLBACK_PATTERN = /platform|cargo|bay|xiang|台|仓|fork|叉|huocha|cha\d*/i;
 const STACKER_FORK_FALLBACK_PATTERN = /fork|叉|huocha|cha\d*/i;
 const MAX_CONFIGURED_FALLBACK_PATTERN_LENGTH = 160;
+const MAX_ACTION_DELTA_SECONDS = 1;
+const DEFAULT_ACTION_MAP_ENTRIES: Array<[string, number]> = [["0", 0], ["1", 1], ["2", -1]];
 
 type StackerMotionGroupKey = "travel" | "lift" | "fork" | "forkSide";
 
@@ -66,6 +71,9 @@ interface RuntimeMotionGroup {
   fields: string[];
   axis: ModelDataDrivenAxis;
   nodes: TransformNode[];
+  valueMode: ModelDataDrivenMotionValueMode;
+  actionMap: Map<string, number>;
+  target: ModelDataDrivenMotionTarget;
   speed?: number;
   limits?: RuntimeMotionLimit;
 }
@@ -82,6 +90,12 @@ interface RuntimeMotionLimit {
 interface ProjectedBounds {
   min: number;
   max: number;
+}
+
+/** 节点世界包围盒，用于把货物底部中心对齐到定位框底面中心。 */
+interface NodeWorldBounds {
+  minimum: Vector3;
+  maximum: Vector3;
 }
 
 /** 旧 Stacker 兜底规则生成的四类运动组。 */
@@ -108,6 +122,7 @@ interface StackerSimulationSettings {
 interface RuntimeCargoHandlingConfig {
   actionFields: string[];
   cargoFields: string[];
+  targetFields: string[];
   pickupValues: Set<string>;
   dropValues: Set<string>;
   pickupMinForkExtension: number;
@@ -153,11 +168,18 @@ export interface SceneDataDrivenTarget {
   requiresDeviceMatch?: boolean;
 }
 
+/** 可作为 Stacker 放货目标的定位线框锚点。 */
+export interface SceneDataDrivenDropTarget {
+  root: TransformNode;
+  matchFields: Record<string, string>;
+}
+
 /** 场景数据驱动运行时的宿主能力，由 Babylon 引擎提供。 */
 interface SceneDataDrivenRuntimeOptions {
   scene: Scene;
   getConfig: () => SceneDataDrivenSnapshot;
   getTargets: () => SceneDataDrivenTarget[];
+  getDropTargets: () => SceneDataDrivenDropTarget[];
   onTargetsChanged: (roots: TransformNode[], now: number) => void;
   onConnectionStatusChanged?: (status: SceneDataConnectionStatusSnapshot) => void;
 }
@@ -183,9 +205,11 @@ interface DataDrivenTargetState {
   motionTargetRotations: Map<number, MotionRotationSnapshot>;
   motionStartValues: Map<string, number>;
   motionValues: Map<string, number>;
+  motionActionDirections: Map<string, number>;
   cargoHandling: RuntimeCargoHandlingConfig | null;
   motionStartedAt: number;
   motionDurationMs: number;
+  motionActionUpdatedAt: number;
 }
 
 /** 场景数据连接的最小生命周期。 */
@@ -322,9 +346,12 @@ export class SceneDataDrivenRuntime {
     }
 
     this.updateStaleConnectionStatus();
+    const actionFramesAreStale = this.areActionFramesStale();
     const changedRoots: TransformNode[] = [];
     this.targetStates.forEach((state) => {
-      if (this.applyInterpolatedState(state, now)) {
+      const interpolatedChanged = this.applyInterpolatedState(state, now);
+      const actionChanged = this.applyActionState(state, now, actionFramesAreStale);
+      if (interpolatedChanged || actionChanged) {
         changedRoots.push(state.target.root);
       }
       changedRoots.push(...this.updateCargoAttachmentsForState(state, now));
@@ -425,6 +452,11 @@ export class SceneDataDrivenRuntime {
     });
   }
 
+  /** 判断 action 模式是否因长时间无新帧而需要自动停住。 */
+  private areActionFramesStale(): boolean {
+    return !this.simulationConfig && this.lastMessageAt > 0 && Date.now() - this.lastMessageAt >= DATA_CONNECTION_STALE_MS;
+  }
+
   /** 上报运行态连接状态，调用方只用于界面提示。 */
   private emitConnectionStatus(status: SceneDataConnectionStatusSnapshot): void {
     this.options.onConnectionStatusChanged?.(status);
@@ -471,9 +503,11 @@ export class SceneDataDrivenRuntime {
       motionTargetRotations: this.cloneNodeRotationSnapshots(motionBaseRotations),
       motionStartValues: new Map(initialMotionValues),
       motionValues: initialMotionValues,
+      motionActionDirections: this.createInitialMotionActionDirections(motionGroups),
       cargoHandling: this.createCargoHandlingConfig(target, isStacker, motionGroups),
       motionStartedAt: now,
-      motionDurationMs: 0
+      motionDurationMs: 0,
+      motionActionUpdatedAt: now
     };
     this.targetStates.set(target.root.uniqueId, state);
     return state;
@@ -571,7 +605,9 @@ export class SceneDataDrivenRuntime {
     const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const fallbackDuration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
     const nextMotionValues = this.readMotionGroupValues(frame, state.motionGroups);
+    const nextActionDirections = this.readMotionGroupActionDirections(frame, state.motionGroups);
     this.applyInterpolatedState(state, now);
+    this.applyActionState(state, now, false);
     const currentMotionValues = this.createCurrentMotionValues(state, now);
     const speedDuration = this.createSpeedDrivenMotionDuration(currentMotionValues, nextMotionValues, state.motionGroups);
     const duration = speedDuration !== undefined ? Math.max(speedDuration, fallbackDuration) : fallbackDuration;
@@ -587,6 +623,10 @@ export class SceneDataDrivenRuntime {
     if (nextMotionValues.size > 0) {
       this.updateMotionValues(state.motionValues, nextMotionValues, state.motionGroups);
     }
+    if (nextActionDirections.size > 0) {
+      this.updateMotionActionDirections(state.motionActionDirections, nextActionDirections);
+      state.motionActionUpdatedAt = now;
+    }
     state.motionStartPositions = this.captureNodePositions(state.motionNodes);
     state.motionTargetPositions = this.createMotionTargetPositions(state);
     state.motionStartRotations = this.captureNodeRotations(state.motionNodes);
@@ -595,7 +635,10 @@ export class SceneDataDrivenRuntime {
     if (duration === 0) {
       this.applyInterpolatedState(state, now + 1);
     }
-    this.applyCargoActionFrame(state, frame, now);
+    const changedCargoRoots = this.applyCargoActionFrame(state, frame, now);
+    if (changedCargoRoots.length > 0) {
+      this.options.onTargetsChanged(changedCargoRoots, now);
+    }
   }
 
   /** 根据数据帧创建整机根节点目标位置，文档坐标的 X/Y/H 对应 Babylon 的 X/Z/Y。 */
@@ -655,7 +698,7 @@ export class SceneDataDrivenRuntime {
         const position = base.clone();
         const worldDelta = Vector3.Zero();
         state.motionGroups
-          .filter((group) => group.kind === "translate")
+          .filter((group) => group.kind === "translate" && group.target === "nodes")
           .forEach((group) => this.addMotionGroupDelta(node, state.target.root, group, state.motionValues.get(group.key) ?? 0, worldDelta));
         position.addInPlace(this.worldDeltaToParentLocalDelta(node, worldDelta));
         return [node.uniqueId, position];
@@ -670,7 +713,7 @@ export class SceneDataDrivenRuntime {
         const base = state.motionBaseRotations.get(node.uniqueId) ?? this.captureNodeRotation(node);
         let rotation = this.cloneRotationSnapshot(base);
         state.motionGroups
-          .filter((group) => group.kind === "rotate")
+          .filter((group) => group.kind === "rotate" && group.target === "nodes")
           .forEach((group) => {
             rotation = this.addMotionGroupRotation(node, group, state.motionValues.get(group.key) ?? 0, rotation);
           });
@@ -702,6 +745,88 @@ export class SceneDataDrivenRuntime {
       this.applyInterpolatedNodeRotations(state.motionNodes, state.motionStartRotations, state.motionTargetRotations, easedProgress) ||
       changed;
     return changed;
+  }
+
+  /** 按动作枚举持续积分运动，断流时自动把方向视为停止。 */
+  private applyActionState(state: DataDrivenTargetState, now: number, stale: boolean): boolean {
+    const elapsedSeconds = Math.min(MAX_ACTION_DELTA_SECONDS, Math.max(0, (now - state.motionActionUpdatedAt) / 1000));
+    state.motionActionUpdatedAt = now;
+    if (elapsedSeconds <= 0) {
+      return false;
+    }
+
+    let changed = false;
+    let nodeMotionChanged = false;
+    state.motionGroups.forEach((group) => {
+      if (group.valueMode !== "action" || !group.speed || group.speed <= 0) {
+        return;
+      }
+
+      const direction = stale ? 0 : state.motionActionDirections.get(group.key) ?? 0;
+      if (!Number.isFinite(direction) || direction === 0) {
+        return;
+      }
+
+      const currentValue = state.motionValues.get(group.key) ?? 0;
+      const nextValue = this.clampMotionGroupValue(currentValue + direction * group.speed * elapsedSeconds, group);
+      const appliedDelta = nextValue - currentValue;
+      if (Math.abs(appliedDelta) <= 1e-9) {
+        return;
+      }
+
+      state.motionValues.set(group.key, nextValue);
+      if (group.target === "root") {
+        changed = this.applyRootMotionActionDelta(state.target.root, group, appliedDelta) || changed;
+        return;
+      }
+
+      nodeMotionChanged = true;
+    });
+
+    if (nodeMotionChanged) {
+      state.motionStartPositions = this.captureNodePositions(state.motionNodes);
+      state.motionTargetPositions = this.createMotionTargetPositions(state);
+      state.motionStartRotations = this.captureNodeRotations(state.motionNodes);
+      state.motionTargetRotations = this.createMotionTargetRotations(state);
+      changed = this.applyInterpolatedNodePositions(state.motionNodes, state.motionStartPositions, state.motionTargetPositions, 1) || changed;
+      changed = this.applyInterpolatedNodeRotations(state.motionNodes, state.motionStartRotations, state.motionTargetRotations, 1) || changed;
+    }
+    if (changed) {
+      state.rootStartPosition = state.target.root.position.clone();
+      state.rootTargetPosition = state.target.root.position.clone();
+      if (state.rootBaseRotationY !== undefined && !state.target.root.rotationQuaternion) {
+        state.rootStartRotationY = state.target.root.rotation.y;
+        state.rootTargetRotationY = state.target.root.rotation.y;
+      }
+    }
+    return changed;
+  }
+
+  /** 将 root 级动作增量写入整车根节点，适用于 RGV/AGV/四向车等整车动作。 */
+  private applyRootMotionActionDelta(root: TransformNode, group: RuntimeMotionGroup, delta: number): boolean {
+    if (group.kind === "rotate") {
+      const radians = (delta * Math.PI) / 180;
+      if (root.rotationQuaternion) {
+        root.rotationQuaternion = root.rotationQuaternion.multiply(Quaternion.RotationAxis(this.getLocalAxisVector(group.axis), radians));
+      } else if (group.axis === "x") {
+        root.rotation.x += radians;
+      } else if (group.axis === "y") {
+        root.rotation.y += radians;
+      } else {
+        root.rotation.z += radians;
+      }
+      return true;
+    }
+
+    const worldDelta = Vector3.Zero();
+    this.addModelLocalAxisDelta(worldDelta, root, group.axis, delta);
+    const localDelta = this.worldDeltaToParentLocalDelta(root, worldDelta);
+    if (localDelta.lengthSquared() <= 1e-12) {
+      return false;
+    }
+
+    root.position.addInPlace(localDelta);
+    return true;
   }
 
   /** 计算当前插值进度，集中处理 0ms 跳转和异常时间值。 */
@@ -749,10 +874,10 @@ export class SceneDataDrivenRuntime {
   }
 
   /** 根据货箱动作字段处理取货和放货命令。 */
-  private applyCargoActionFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
+  private applyCargoActionFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): TransformNode[] {
     const cargoConfig = state.cargoHandling;
     if (!cargoConfig) {
-      return;
+      return [];
     }
 
     const action = this.readString(frame, cargoConfig.actionFields);
@@ -761,7 +886,7 @@ export class SceneDataDrivenRuntime {
       if (cargoCode && this.isPayloadBindingFrame(frame)) {
         this.attachCargoToFork(state, cargoConfig, cargoCode, now, false);
       }
-      return;
+      return [];
     }
 
     const normalizedAction = this.normalizeMatchValue(action);
@@ -769,12 +894,15 @@ export class SceneDataDrivenRuntime {
       if (cargoCode) {
         this.attachCargoToFork(state, cargoConfig, cargoCode, now, true);
       }
-      return;
+      return [];
     }
 
     if (cargoConfig.dropValues.has(normalizedAction)) {
-      this.dropCargoFromFork(state, cargoCode);
+      const dropTargetCode = this.readString(frame, cargoConfig.targetFields);
+      return this.dropCargoFromFork(state, cargoCode, dropTargetCode);
     }
+
+    return [];
   }
 
   /** 尝试把指定货箱吸附到当前 Stacker 货叉吸附点。 */
@@ -822,9 +950,16 @@ export class SceneDataDrivenRuntime {
     return this.readString(frame, ["p"]) === "payload" || frame.payload !== undefined;
   }
 
-  /** 解除指定货箱或当前 Stacker 所有货箱的运行态吸附关系。 */
-  private dropCargoFromFork(state: DataDrivenTargetState, cargoCode: string | undefined): void {
+  /** 解除指定货箱或当前 Stacker 所有货箱的运行态吸附关系，带 target 时先放入定位框。 */
+  private dropCargoFromFork(state: DataDrivenTargetState, cargoCode: string | undefined, dropTargetCode: string | undefined): TransformNode[] {
     const normalizedCargoCode = cargoCode ? this.normalizeMatchValue(cargoCode) : undefined;
+    const dropTarget = dropTargetCode ? this.findCargoDropTarget(dropTargetCode) : null;
+    if (dropTargetCode && !dropTarget) {
+      console.warn(`未找到资产编号为 ${dropTargetCode} 的定位线框，已保持货物吸附状态。`);
+      return [];
+    }
+
+    const changedCargoRoots: TransformNode[] = [];
     [...this.cargoAttachments.entries()].forEach(([nodeId, attachment]) => {
       if (attachment.carrierRootId !== state.target.root.uniqueId) {
         return;
@@ -832,8 +967,13 @@ export class SceneDataDrivenRuntime {
       if (normalizedCargoCode && attachment.cargoCode !== normalizedCargoCode) {
         return;
       }
+      if (dropTarget) {
+        this.moveCargoToDropTarget(attachment.cargoRoot, dropTarget.root);
+        changedCargoRoots.push(attachment.cargoRoot);
+      }
       this.cargoAttachments.delete(nodeId);
     });
+    return changedCargoRoots;
   }
 
   /** Stacker 位姿插值后推进已吸附货箱，让货箱持续停在货叉吸附点。 */
@@ -901,6 +1041,77 @@ export class SceneDataDrivenRuntime {
       target.matchFields.name,
       ...Object.values(target.matchFields)
     ]);
+  }
+
+  /** 按 target 字段查找定位线框放货目标，定位框无需启用动画接收。 */
+  private findCargoDropTarget(dropTargetCode: string): SceneDataDrivenDropTarget | null {
+    const normalizedTargetCode = this.normalizeMatchValue(dropTargetCode);
+    return (
+      this.options.getDropTargets().find((target) =>
+        this.getDropTargetMatchValues(target).some((value) => this.normalizeMatchValue(value) === normalizedTargetCode)
+      ) ?? null
+    );
+  }
+
+  /** 生成定位框可匹配值，优先使用定位框资产编号，也兼容名称和 uniqueId。 */
+  private getDropTargetMatchValues(target: SceneDataDrivenDropTarget): string[] {
+    return this.dedupeStrings([
+      target.matchFields.locatorAssetCode,
+      target.matchFields.assetCode,
+      target.matchFields.uniqueId,
+      target.matchFields.name,
+      ...Object.values(target.matchFields)
+    ]);
+  }
+
+  /** 把货物底部中心对齐到定位线框底面中心，保留货物自身父级关系。 */
+  private moveCargoToDropTarget(cargoRoot: TransformNode, dropTargetRoot: TransformNode): boolean {
+    if (cargoRoot.isDisposed() || dropTargetRoot.isDisposed()) {
+      return false;
+    }
+
+    const dropPosition = dropTargetRoot.getAbsolutePosition();
+    const cargoRootPosition = cargoRoot.getAbsolutePosition();
+    const cargoBottomCenter = this.getNodeWorldBottomCenter(cargoRoot) ?? cargoRootPosition;
+    const rootOffsetFromBottomCenter = cargoRootPosition.subtract(cargoBottomCenter);
+    return this.setNodeAbsolutePosition(cargoRoot, dropPosition.add(rootOffsetFromBottomCenter));
+  }
+
+  /** 读取节点世界包围盒底面中心；无几何时让调用方回退到根节点位置。 */
+  private getNodeWorldBottomCenter(node: TransformNode): Vector3 | null {
+    const bounds = this.getNodeWorldBounds(node);
+    if (!bounds) {
+      return null;
+    }
+
+    return new Vector3(
+      (bounds.minimum.x + bounds.maximum.x) / 2,
+      bounds.minimum.y,
+      (bounds.minimum.z + bounds.maximum.z) / 2
+    );
+  }
+
+  /** 计算节点真实几何的世界包围盒，过滤无顶点或已禁用的网格。 */
+  private getNodeWorldBounds(node: TransformNode): NodeWorldBounds | null {
+    const meshes = this.getMotionLimitMeshes([node]);
+    if (meshes.length === 0) {
+      return null;
+    }
+
+    const minimum = new Vector3(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    const maximum = new Vector3(Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY);
+    meshes.forEach((mesh) => {
+      mesh.computeWorldMatrix(true);
+      const box = mesh.getBoundingInfo().boundingBox;
+      minimum.x = Math.min(minimum.x, box.minimumWorld.x);
+      minimum.y = Math.min(minimum.y, box.minimumWorld.y);
+      minimum.z = Math.min(minimum.z, box.minimumWorld.z);
+      maximum.x = Math.max(maximum.x, box.maximumWorld.x);
+      maximum.y = Math.max(maximum.y, box.maximumWorld.y);
+      maximum.z = Math.max(maximum.z, box.maximumWorld.z);
+    });
+
+    return [minimum.x, minimum.y, minimum.z, maximum.x, maximum.y, maximum.z].every(Number.isFinite) ? { minimum, maximum } : null;
   }
 
   /** 计算货叉吸附点的世界坐标，默认取货叉节点中心并加一个竖向承载偏移。 */
@@ -1130,14 +1341,16 @@ export class SceneDataDrivenRuntime {
     return Boolean(this.readJointPointName(value) && value.v !== undefined);
   }
 
-  /** 读取文档 joint 消息中的设备编号，支持字符串和数字编号。 */
+  /** 读取文档 joint 消息中的设备编号，兼容 Excel 常用 deviceCode 和旧 e 字段。 */
   private readJointDeviceId(record: Record<string, unknown>): string | undefined {
-    const value = record.e;
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return String(value);
+    for (const key of ["e", "deviceCode", "devId", "deviceId", "deviceID", "assetCode"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return String(value);
+      }
     }
     return undefined;
   }
@@ -1223,6 +1436,17 @@ export class SceneDataDrivenRuntime {
       "position",
       "pos",
       "location",
+      "movement_x",
+      "movement_y",
+      "movement_z",
+      "front_movement_z",
+      "back_movement_z",
+      "forkState",
+      "rotation",
+      "move",
+      "folding",
+      "flip",
+      "fork",
       "travel_pos",
       "trackZ",
       "travelZ",
@@ -1262,10 +1486,12 @@ export class SceneDataDrivenRuntime {
 
   /** 汇总场景和模型脚本可能使用的设备字段名，用于包装 payload 向内层帧透传。 */
   private getCommonFrameFieldNames(config: SceneDataDrivenSnapshot): string[] {
+    const targets = this.options.getTargets();
     return this.dedupeStrings([
       config.deviceIdField,
-      ...this.options.getTargets().map((target) => target.dataDriven?.device?.deviceIdField),
+      ...targets.map((target) => target.dataDriven?.device?.deviceIdField),
       "e",
+      "deviceCode",
       "devId",
       "deviceId",
       "deviceID",
@@ -1273,7 +1499,11 @@ export class SceneDataDrivenRuntime {
       "assetCode",
       "modelKey",
       ...CARGO_ACTION_FIELDS,
-      ...CARGO_TARGET_FIELDS
+      ...CARGO_TARGET_FIELDS,
+      ...CARGO_DROP_TARGET_FIELDS,
+      ...targets.flatMap((target) => target.dataDriven?.cargoHandling?.actionFields ?? []),
+      ...targets.flatMap((target) => target.dataDriven?.cargoHandling?.cargoFields ?? []),
+      ...targets.flatMap((target) => target.dataDriven?.cargoHandling?.targetFields ?? [])
     ]);
   }
 
@@ -1324,6 +1554,7 @@ export class SceneDataDrivenRuntime {
       target.dataDriven?.device?.deviceIdField,
       config.deviceIdField,
       "e",
+      "deviceCode",
       "devId",
       "deviceId",
       "deviceID",
@@ -1348,12 +1579,45 @@ export class SceneDataDrivenRuntime {
     ]);
   }
 
-  /** 读取运动组绑定的 payload 数字值。 */
+  /** 读取 target 模式运动组绑定的 payload 数字目标值。 */
   private readMotionGroupValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
-    return group.fields.length > 0 ? this.readNumber(frame, group.fields) : undefined;
+    return group.valueMode === "target" && group.fields.length > 0 ? this.readNumber(frame, group.fields) : undefined;
   }
 
-  /** 读取本帧命中的所有运动组数值。 */
+  /** 读取 action 模式运动组绑定的原始枚举值，字符串和数字都按协议码处理。 */
+  private readMotionGroupRawActionValue(frame: DataFrame, group: RuntimeMotionGroup): unknown {
+    if (group.valueMode !== "action") {
+      return undefined;
+    }
+
+    for (const field of group.fields) {
+      const value = this.readPath(frame, field);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+    return undefined;
+  }
+
+  /** 把协议动作枚举转换为方向，未声明的枚举值不更新上一帧方向。 */
+  private readMotionGroupActionDirection(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
+    const rawValue = this.readMotionGroupRawActionValue(frame, group);
+    const key = this.createActionMapKey(rawValue);
+    return key !== undefined ? group.actionMap.get(key) : undefined;
+  }
+
+  /** 生成动作映射键，避免 1 和 "1" 被当成两种协议码。 */
+  private createActionMapKey(value: unknown): string | undefined {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+    return undefined;
+  }
+
+  /** 读取本帧命中的所有 target 模式运动组数值。 */
   private readMotionGroupValues(frame: DataFrame, groups: RuntimeMotionGroup[]): Map<string, number> {
     const values = new Map<string, number>();
     groups.forEach((group) => {
@@ -1365,9 +1629,26 @@ export class SceneDataDrivenRuntime {
     return values;
   }
 
+  /** 读取本帧命中的所有 action 模式方向，未上报字段沿用上一帧。 */
+  private readMotionGroupActionDirections(frame: DataFrame, groups: RuntimeMotionGroup[]): Map<string, number> {
+    const directions = new Map<string, number>();
+    groups.forEach((group) => {
+      const direction = this.readMotionGroupActionDirection(frame, group);
+      if (direction !== undefined && Number.isFinite(direction)) {
+        directions.set(group.key, direction);
+      }
+    });
+    return directions;
+  }
+
   /** 创建运动组目标值缓存，未上报字段按 0 解释为基线姿态。 */
   private createInitialMotionValues(groups: RuntimeMotionGroup[]): Map<string, number> {
     return new Map(groups.map((group) => [group.key, 0]));
+  }
+
+  /** 创建 action 模式方向缓存，默认停止，收到动作帧后再持续积分。 */
+  private createInitialMotionActionDirections(groups: RuntimeMotionGroup[]): Map<string, number> {
+    return new Map(groups.filter((group) => group.valueMode === "action").map((group) => [group.key, 0]));
   }
 
   /** 读取当前已经渲染到的逻辑运动值，用于新帧按真实剩余距离计算速度时长。 */
@@ -1376,6 +1657,9 @@ export class SceneDataDrivenRuntime {
     const easedProgress = this.easeOutCubic(progress);
     return new Map(
       state.motionGroups.map((group) => {
+        if (group.valueMode === "action") {
+          return [group.key, state.motionValues.get(group.key) ?? 0];
+        }
         const startValue = state.motionStartValues.get(group.key) ?? 0;
         const targetValue = state.motionValues.get(group.key) ?? startValue;
         return [group.key, this.lerp(startValue, targetValue, easedProgress)];
@@ -1389,6 +1673,11 @@ export class SceneDataDrivenRuntime {
       const group = groups.find((item) => item.key === key);
       current.set(key, this.clampMotionGroupValue(value, group));
     });
+  }
+
+  /** 更新 action 模式方向，0 表示停止并保持当前位置。 */
+  private updateMotionActionDirections(current: Map<string, number>, next: Map<string, number>): void {
+    next.forEach((direction, key) => current.set(key, direction));
   }
 
   /** 按模型脚本声明的速度计算本帧运动时长，多个运动组取最长值保证同步到达。 */
@@ -1540,6 +1829,7 @@ export class SceneDataDrivenRuntime {
     return {
       actionFields: this.dedupeStrings([...(config?.actionFields ?? []), ...CARGO_ACTION_FIELDS]),
       cargoFields: this.dedupeStrings([...(config?.cargoFields ?? []), ...CARGO_TARGET_FIELDS]),
+      targetFields: this.dedupeStrings([...(config?.targetFields ?? []), ...CARGO_DROP_TARGET_FIELDS]),
       pickupValues: new Set(this.dedupeStrings([...(config?.pickupValues ?? []), ...CARGO_PICKUP_VALUES]).map((value) => this.normalizeMatchValue(value))),
       dropValues: new Set(this.dedupeStrings([...(config?.dropValues ?? []), ...CARGO_DROP_VALUES]).map((value) => this.normalizeMatchValue(value))),
       pickupMinForkExtension: this.readOptionalNonNegativeNumber(config?.pickupMinForkExtension, DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION),
@@ -1618,10 +1908,10 @@ export class SceneDataDrivenRuntime {
             false
           )
         )
-        .filter((group) => group.fields.length > 0 && group.nodes.length > 0);
+        .filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0));
     }
 
-    return isStacker ? Object.values(legacyStackerGroups).filter((group) => group.fields.length > 0 && group.nodes.length > 0) : [];
+    return isStacker ? Object.values(legacyStackerGroups).filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0)) : [];
   }
 
   /** 根据模型脚本或旧 Stacker 兜底规则创建四类 Stacker 运动组。 */
@@ -1694,16 +1984,31 @@ export class SceneDataDrivenRuntime {
     fallbackLimitNodeNames: string[],
     useLegacyFallback: boolean
   ): RuntimeMotionGroup {
-    const nodes = this.findMotionGroupNodes(root, group, fallbackNodeNames, fallbackPattern, fixedNodeNames, useLegacyFallback);
+    const targetMode = group?.target ?? "nodes";
+    const nodes = targetMode === "root" ? [] : this.findMotionGroupNodes(root, group, fallbackNodeNames, fallbackPattern, fixedNodeNames, useLegacyFallback);
     return {
       key,
       kind: group?.kind ?? "translate",
       fields: group?.fields?.length ? group.fields : useLegacyFallback ? fallbackFields : [],
       axis: group?.axis ?? fallbackAxis,
       nodes,
+      valueMode: group?.valueMode ?? "target",
+      actionMap: this.createRuntimeActionMap(group),
+      target: targetMode,
       speed: group?.speed,
-      limits: this.createRuntimeMotionLimit(root, nodes, group?.axis ?? fallbackAxis, group, fallbackLimitNodeNames)
+      limits: this.createRuntimeMotionLimit(root, nodes, group?.axis ?? fallbackAxis, group, targetMode === "nodes" ? fallbackLimitNodeNames : [])
     };
+  }
+
+  /** 创建 action 模式的协议枚举表，模型脚本可覆盖默认 0/1/2 方向。 */
+  private createRuntimeActionMap(group: ModelDataDrivenMotionGroupDefinition | undefined): Map<string, number> {
+    const map = new Map<string, number>(DEFAULT_ACTION_MAP_ENTRIES);
+    Object.entries(group?.actionMap ?? {}).forEach(([key, value]) => {
+      if (Number.isFinite(value)) {
+        map.set(key, value);
+      }
+    });
+    return map;
   }
 
   /** 创建运动组行程限制，显式 min/max 优先，缺省端点由防撞或固定节点包围盒推导。 */
@@ -1850,7 +2155,7 @@ export class SceneDataDrivenRuntime {
 
   /** 汇总所有参与内部运动的节点并去重。 */
   private getMotionNodes(groups: RuntimeMotionGroup[]): TransformNode[] {
-    return this.dedupeTransformNodes(groups.flatMap((group) => group.nodes));
+    return this.dedupeTransformNodes(groups.filter((group) => group.target === "nodes").flatMap((group) => group.nodes));
   }
 
   /** 判断目标是否按模型内部部件驱动，避免普通模型包含 fork/platform 名称时误套 Stacker 逻辑。 */
@@ -1971,32 +2276,21 @@ class StackerDemoSimulationConnection implements DataConnection {
     this.timer = 0;
   }
 
-  /** 生成一帧 Stacker 往返运动数据，并在伸叉端点附带货箱取放事件。 */
+  /** 生成一帧 Stacker 动作数据，并在伸叉端点附带货箱取放事件。 */
   private emitFrame(): void {
     const settings = this.getSettings();
     const elapsedSeconds = (performance.now() - this.startedAt) / 1000;
     const travelPhase = elapsedSeconds * 0.55;
     const liftPhase = elapsedSeconds * 1.05;
     const cargoPhase = Math.sin(liftPhase + Math.PI / 3);
+    const forkAction = this.createMovementAction(cargoPhase);
     const deviceIdField = this.config.deviceIdField.trim() || "deviceId";
     const ts = Date.now();
     const frame: Array<Record<string, unknown>> = [
-      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "travel_pos", v: this.round(Math.sin(travelPhase) * settings.travelRange), ts },
-      {
-        e: settings.deviceId,
-        [deviceIdField]: settings.deviceId,
-        p: "lift_pos",
-        v: this.round(settings.liftBase + ((Math.sin(liftPhase) + 1) / 2) * settings.liftRange),
-        ts
-      },
-      {
-        e: settings.deviceId,
-        [deviceIdField]: settings.deviceId,
-        p: "fork_extend",
-        v: this.round(((cargoPhase + 1) / 2) * settings.forkRange),
-        ts
-      },
-      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "fork_side", v: this.round(Math.sin(travelPhase * 1.35) * settings.forkSideRange), ts }
+      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "movement_x", v: this.createMovementAction(Math.sin(travelPhase)), ts },
+      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "movement_y", v: this.createMovementAction(Math.sin(liftPhase)), ts },
+      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "front_movement_z", v: forkAction, ts },
+      { e: settings.deviceId, [deviceIdField]: settings.deviceId, p: "back_movement_z", v: forkAction, ts }
     ];
     const cargoAction = cargoPhase > 0.92 ? "pickup" : cargoPhase < -0.92 ? "drop" : "";
     if (cargoAction) {
@@ -2008,8 +2302,14 @@ class StackerDemoSimulationConnection implements DataConnection {
     this.onMessage(JSON.stringify(frame));
   }
 
-  /** 控制小数位，避免高频模拟数据产生过长字符串。 */
-  private round(value: number): number {
-    return Math.round(value * 1000) / 1000;
+  /** 把周期函数转换为协议动作枚举：1 正向，2 反向，0 静止。 */
+  private createMovementAction(value: number): number {
+    if (value > 0.2) {
+      return 1;
+    }
+    if (value < -0.2) {
+      return 2;
+    }
+    return 0;
   }
 }

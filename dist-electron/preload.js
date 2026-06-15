@@ -21,7 +21,14 @@ contextBridge.exposeInMainWorld("electronApp", {
         saveAssetFileFromPath: (projectPath, assetId, sourcePath, fileName) => ipcRenderer.invoke("projects:saveAssetFileFromPath", projectPath, assetId, sourcePath, fileName),
         loadAssetFile: (projectPath, projectFile) => ipcRenderer.invoke("projects:loadAssetFile", projectPath, projectFile),
         loadAssetFiles: (projectPath, requests) => ipcRenderer.invoke("projects:loadAssetFiles", projectPath, requests),
-        importModelPackage: (projectPath) => ipcRenderer.invoke("projects:importModelPackage", projectPath)
+        importModelPackage: (projectPath, request) => ipcRenderer.invoke("projects:importModelPackage", projectPath, request),
+        activateModelPackageReplacement: (projectPath, request) => ipcRenderer.invoke("projects:activateModelPackageReplacement", projectPath, request),
+        finalizeModelPackageReplacement: (projectPath, request) => ipcRenderer.invoke("projects:finalizeModelPackageReplacement", projectPath, request),
+        rollbackModelPackageReplacement: (projectPath, request) => ipcRenderer.invoke("projects:rollbackModelPackageReplacement", projectPath, request),
+        refreshModelPackage: (projectPath, request) => ipcRenderer.invoke("projects:refreshModelPackage", projectPath, request)
+    },
+    publish: {
+        buildAndOpenDist: () => ipcRenderer.invoke("publish:buildAndOpenDist")
     },
     files: {
         getPath: (file) => webUtils.getPathForFile(file),

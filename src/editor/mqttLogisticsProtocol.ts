@@ -61,6 +61,9 @@ export function applyLogisticsMqttFrameDefaults(frame: Record<string, unknown>, 
     if (frame.devId === undefined) {
       frame.devId = metadata.devId;
     }
+    if (frame.deviceCode === undefined) {
+      frame.deviceCode = metadata.devId;
+    }
     if (frame.devType === undefined) {
       frame.devType = metadata.devType;
     }

@@ -5,6 +5,27 @@ interface DesktopProjectAssetBatchRequest {
   expectedByteLength?: number;
 }
 
+interface DesktopKnownModelPackage {
+  assetId: string;
+  packageId: string;
+  sourceRoot?: string;
+  rootDirectoryName: string;
+}
+
+interface DesktopModelPackageImportRequest {
+  knownPackages: DesktopKnownModelPackage[];
+}
+
+interface DesktopModelPackageRefreshRequest {
+  packageId: string;
+  sourceRoot?: string;
+}
+
+interface DesktopModelPackageReplacementCommitRequest {
+  packageId: string;
+  pendingToken: string;
+}
+
 /** 暴露极小桌面端能力面，避免渲染进程直接接触 Node.js。 */
 contextBridge.exposeInMainWorld("electronApp", {
   isElectron: true,
@@ -32,7 +53,19 @@ contextBridge.exposeInMainWorld("electronApp", {
     loadAssetFile: (projectPath: string, projectFile: string) => ipcRenderer.invoke("projects:loadAssetFile", projectPath, projectFile),
     loadAssetFiles: (projectPath: string, requests: DesktopProjectAssetBatchRequest[]) =>
       ipcRenderer.invoke("projects:loadAssetFiles", projectPath, requests),
-    importModelPackage: (projectPath: string) => ipcRenderer.invoke("projects:importModelPackage", projectPath)
+    importModelPackage: (projectPath: string, request: DesktopModelPackageImportRequest) =>
+      ipcRenderer.invoke("projects:importModelPackage", projectPath, request),
+    activateModelPackageReplacement: (projectPath: string, request: DesktopModelPackageReplacementCommitRequest) =>
+      ipcRenderer.invoke("projects:activateModelPackageReplacement", projectPath, request),
+    finalizeModelPackageReplacement: (projectPath: string, request: DesktopModelPackageReplacementCommitRequest) =>
+      ipcRenderer.invoke("projects:finalizeModelPackageReplacement", projectPath, request),
+    rollbackModelPackageReplacement: (projectPath: string, request: DesktopModelPackageReplacementCommitRequest) =>
+      ipcRenderer.invoke("projects:rollbackModelPackageReplacement", projectPath, request),
+    refreshModelPackage: (projectPath: string, request: DesktopModelPackageRefreshRequest) =>
+      ipcRenderer.invoke("projects:refreshModelPackage", projectPath, request)
+  },
+  publish: {
+    buildAndOpenDist: () => ipcRenderer.invoke("publish:buildAndOpenDist")
   },
   files: {
     getPath: (file: File) => webUtils.getPathForFile(file),

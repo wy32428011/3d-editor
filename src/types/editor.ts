@@ -142,6 +142,12 @@ export type ModelDataDrivenAxis = "x" | "y" | "z";
 /** 模型脚本数据驱动运动组的物理动作类型。 */
 export type ModelDataDrivenMotionKind = "translate" | "rotate";
 
+/** 模型脚本数据驱动运动组的取值语义。 */
+export type ModelDataDrivenMotionValueMode = "target" | "action";
+
+/** 模型脚本数据驱动运动组的作用对象。 */
+export type ModelDataDrivenMotionTarget = "nodes" | "root";
+
 /** 模型脚本声明的设备匹配默认值，不包含网络连接配置。 */
 export interface ModelDataDrivenDeviceDefinition {
   devType?: string;
@@ -157,6 +163,12 @@ export interface ModelDataDrivenMotionGroupDefinition {
   kind?: ModelDataDrivenMotionKind;
   axis: ModelDataDrivenAxis;
   nodes: string[];
+  /** 值模式：target 兼容旧目标值，action 按动作枚举持续积分。 */
+  valueMode?: ModelDataDrivenMotionValueMode;
+  /** action 模式下把协议枚举映射为方向，1 表示正向，-1 表示反向，0 表示停止。 */
+  actionMap?: Record<string, number>;
+  /** 运动作用对象：nodes 驱动内部节点，root 驱动整车根节点。 */
+  target?: ModelDataDrivenMotionTarget;
   fallbackPattern?: string;
   /** 运动组物理速度；translate 为 m/s，rotate 为 deg/s。 */
   speed?: number;
@@ -186,6 +198,8 @@ export interface ModelDataDrivenSimulationDefinition {
 export interface ModelDataDrivenCargoHandlingDefinition {
   actionFields?: string[];
   cargoFields?: string[];
+  /** drop 指令中的定位框目标字段，默认兼容 target/dropTarget/locator 等业务别名。 */
+  targetFields?: string[];
   pickupValues?: string[];
   dropValues?: string[];
   pickupMinForkExtension?: number;
@@ -222,6 +236,8 @@ export interface ModelPackageManifest {
   packageId: string;
   displayName: string;
   rootDirectoryName: string;
+  /** 源模型包目录；刷新旧实例脚本时优先复用，旧场景没有该字段时可手动选择目录。 */
+  sourceRoot?: string;
   primaryModelFile: string;
   /** 用于静态解析属性栏动态参数的脚本文件。 */
   scriptFile?: string;
@@ -259,7 +275,7 @@ export interface DynamicParameterUpdate {
   value: DynamicParameterValue;
 }
 
-/** MeshVertexModifyComponent 的可编辑参数快照，当前先持久化配置，不直接修改网格顶点。 */
+/** MeshVertexModifyComponent 的可编辑参数快照，部分安全字段会同步驱动场景运行态。 */
 export interface MeshVertexModifySnapshot {
   showLegA: boolean;
   showLegB: boolean;
@@ -306,12 +322,11 @@ export type AssetLibraryFocusTarget =
   | { type: "primitive"; primitiveKind: PrimitiveKind }
   | { type: "poi"; poiKind: PoiKind };
 
-/** 创建模型阵列时由 UI 传入的参数，数量表示新增副本数。 */
+/** 创建模型阵列时由 UI 传入的参数，数量表示新增副本数，步长由引擎按目标世界包围盒自动计算。 */
 export interface ModelArrayOptions {
   targetId: number;
   axis: ModelArrayAxis;
   count: number;
-  spacing: number;
 }
 
 /** 模型阵列命令结果，失败时 message 直接用于界面提示。 */
@@ -577,6 +592,8 @@ export interface EditorStats {
 export interface EditorEngineCallbacks {
   onSceneGraphChange: (nodes: SceneNodeSummary[]) => void;
   onSelectionChange: (target: InspectorTarget) => void;
+  /** 引擎内部因选中对象需要切换编辑工具时，同步 React 工具栏状态。 */
+  onToolChange?: (tool: EditorTool) => void;
   onAssetsChange: (assets: AssetRecord[]) => void;
   onStatsChange: (stats: EditorStats) => void;
   onDataConnectionStatusChange: (status: SceneDataConnectionStatusSnapshot) => void;

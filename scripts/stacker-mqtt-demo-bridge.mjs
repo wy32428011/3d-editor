@@ -176,18 +176,19 @@ function handleCompleteMqttPacket(packet, fixedHeaderLength, remainingLength) {
   }
 }
 
-/** 根据时间生成可视化明显的 Stacker 运动帧，并在伸叉端点发送货箱取放事件。 */
+/** 根据时间生成可视化明显的 Stacker 动作帧，并在伸叉端点发送货箱取放事件。 */
 function createStackerFrame() {
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
   const travelPhase = elapsedSeconds * 0.65;
   const liftPhase = elapsedSeconds * 1.1;
   const cargoPhase = Math.sin(liftPhase + Math.PI / 3);
+  const forkAction = createMovementAction(cargoPhase);
   const ts = Date.now();
   const frame = [
-    { e: DEVICE_ID, p: "travel_pos", v: roundNumber(Math.sin(travelPhase) * 3), ts },
-    { e: DEVICE_ID, p: "lift_pos", v: roundNumber(0.4 + ((Math.sin(liftPhase) + 1) / 2) * 2.2), ts },
-    { e: DEVICE_ID, p: "fork_extend", v: roundNumber(((cargoPhase + 1) / 2) * 0.8), ts },
-    { e: DEVICE_ID, p: "fork_side", v: roundNumber(Math.sin(travelPhase * 1.4) * 0.2), ts }
+    { e: DEVICE_ID, p: "movement_x", v: createMovementAction(Math.sin(travelPhase)), ts },
+    { e: DEVICE_ID, p: "movement_y", v: createMovementAction(Math.sin(liftPhase)), ts },
+    { e: DEVICE_ID, p: "front_movement_z", v: forkAction, ts },
+    { e: DEVICE_ID, p: "back_movement_z", v: forkAction, ts }
   ];
   const cargoAction = cargoPhase > 0.92 ? "pickup" : cargoPhase < -0.92 ? "drop" : "";
   if (cargoAction) {
@@ -196,9 +197,15 @@ function createStackerFrame() {
   return frame;
 }
 
-/** 四舍五入到 3 位小数，避免日志和消息过长。 */
-function roundNumber(value) {
-  return Math.round(value * 1000) / 1000;
+/** 把周期函数转换为协议动作枚举：1 正向，2 反向，0 静止。 */
+function createMovementAction(value) {
+  if (value > 0.2) {
+    return 1;
+  }
+  if (value < -0.2) {
+    return 2;
+  }
+  return 0;
 }
 
 /** 发布并广播一帧 demo 数据。 */

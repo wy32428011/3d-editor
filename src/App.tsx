@@ -58,6 +58,21 @@ interface ModelPackageRuntimeScriptSelection {
   className: string;
 }
 
+interface ModelPackageManifestBuildInput {
+  packageId: string;
+  displayName: string;
+  rootDirectoryName: string;
+  sourceRoot?: string;
+  primaryModelFile: string;
+  fallbackScriptFile?: string;
+  metaFile?: string;
+  projectFiles: DesktopModelPackageProjectFile[];
+  textFiles: Record<string, string>;
+  warnings: string[];
+  importedAt?: number;
+  existingFiles?: ModelPackageProjectFile[];
+}
+
 interface ModelArrayContextTarget {
   id: number;
   name: string;
@@ -85,7 +100,6 @@ interface ModelArrayDialogState {
   target: ModelArrayContextTarget;
   axis: ModelArrayAxis;
   count: string;
-  spacing: string;
 }
 
 interface HierarchySelectionResult {
@@ -120,7 +134,6 @@ const MAX_ASSET_BROWSER_HEIGHT = 420;
 const MAX_ASSET_BROWSER_HEIGHT_RATIO = 0.45;
 const MODEL_ARRAY_DEFAULT_AXIS: ModelArrayAxis = "x";
 const MODEL_ARRAY_DEFAULT_COUNT = "3";
-const MODEL_ARRAY_DEFAULT_SPACING = "1";
 const SCENE_CONTEXT_MENU_WIDTH = 220;
 const SCENE_CONTEXT_MENU_HEIGHT = 420;
 
@@ -170,11 +183,6 @@ function readStoredAssetBrowserHeight(): number {
   } catch {
     return clampAssetBrowserHeight(DEFAULT_ASSET_BROWSER_HEIGHT);
   }
-}
-
-/** 判断 UI 侧是否展示模型阵列入口，最终权限仍由 Babylon 引擎兜底校验。 */
-function canOpenModelArrayMenu(target: ModelArrayContextTarget): boolean {
-  return !target.locked && (target.kind === "Mesh" || target.kind === "Transform");
 }
 
 /** 把右键菜单限制在视口内，避免靠近窗口边缘时菜单不可点。 */
@@ -948,6 +956,68 @@ function parseModelPackageDataDrivenFromScripts(
   return undefined;
 }
 
+/** 合并模型包文件记录，刷新脚本时保留旧 GLB 和贴图记录，并用新返回的 script/meta 替换旧文本记录。 */
+function mergeModelPackageProjectFiles(
+  existingFiles: ModelPackageProjectFile[] | undefined,
+  refreshedFiles: ModelPackageProjectFile[]
+): ModelPackageProjectFile[] {
+  const files = new Map<string, ModelPackageProjectFile>();
+  const replaceTextRecords = refreshedFiles.some((file) => file.role === "script" || file.role === "meta");
+  existingFiles?.forEach((file) => {
+    if (replaceTextRecords && (file.role === "script" || file.role === "meta")) {
+      return;
+    }
+
+    files.set(normalizeModelPackageRelativePath(file.relativePath), file);
+  });
+  refreshedFiles.forEach((file) => files.set(normalizeModelPackageRelativePath(file.relativePath), file));
+  return [...files.values()];
+}
+
+/** 从 Electron 返回的模型包文本和文件记录构建编辑器稳定 manifest。 */
+function buildModelPackageManifest(input: ModelPackageManifestBuildInput): ModelPackageManifest {
+  const warnings = [...input.warnings];
+  const meta = parseModelPackageMeta(input.metaFile, input.textFiles, warnings);
+  const textFileMap = createModelPackageRelativePathMap(Object.keys(input.textFiles));
+  const fallbackScriptFile = input.fallbackScriptFile
+    ? textFileMap.get(normalizeModelPackageRelativePath(input.fallbackScriptFile))
+    : undefined;
+  const scriptFile = chooseModelPackageParameterScriptFile(meta, input.textFiles, fallbackScriptFile, warnings);
+  const runtimeScript = getMetaRuntimeScript(meta, input.textFiles, scriptFile ?? fallbackScriptFile, warnings);
+  const scriptText = scriptFile ? input.textFiles[scriptFile] ?? "" : "";
+  const parsed = parseModelPackageDecorators(scriptText, scriptFile ?? "");
+  const metaParameters = parseMetaParameterDefinition(meta, scriptFile, input.metaFile ?? "meta.json", warnings);
+  if (parsed.fields.length > 0 || metaParameters.fields.length === 0) {
+    warnings.push(...parsed.warnings);
+  }
+  const dynamicFields = mergeDynamicFields(parsed.fields, metaParameters.fields);
+  const dataDriven = parseModelPackageDataDrivenFromScripts(
+    input.textFiles,
+    [runtimeScript.scriptFile, scriptFile, input.fallbackScriptFile],
+    warnings
+  );
+
+  return {
+    version: 1,
+    packageId: input.packageId,
+    displayName: input.displayName,
+    rootDirectoryName: input.rootDirectoryName,
+    sourceRoot: input.sourceRoot,
+    primaryModelFile: input.primaryModelFile,
+    scriptFile,
+    runtimeScriptFile: runtimeScript.scriptFile,
+    runtimeClassName: runtimeScript.className,
+    dataDriven,
+    metaFile: input.metaFile,
+    meta,
+    files: mergeModelPackageProjectFiles(input.existingFiles, mapModelPackageFiles(input.projectFiles)),
+    dynamicFields,
+    initialValues: metaParameters.initialValues,
+    warnings,
+    importedAt: input.importedAt ?? Date.now()
+  };
+}
+
 /** 从项目资产目录轻量恢复模型包脚本文本，避免打开项目时强制加载大 GLB。 */
 async function restoreModelPackageScriptTextsFromProject(projectPath: string, targetEngine: BabylonEditorEngine): Promise<string[]> {
   if (!window.electronApp?.projects.loadAssetFile) {
@@ -1011,6 +1081,7 @@ export function App() {
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [projectErrorExpanded, setProjectErrorExpanded] = useState(false);
+  const [publishing, setPublishing] = useState(false);
   const [cadImportProgress, setCadImportProgress] = useState<CadDxfLineProgress | null>(null);
   const [cadImportActive, setCadImportActive] = useState(false);
   const [cadRestoreProgress, setCadRestoreProgress] = useState<CadDxfLineProgress | null>(null);
@@ -1148,6 +1219,26 @@ export function App() {
       : sceneLoadFailed
         ? "当前场景加载失败，已阻止保存"
         : undefined;
+  const publishDisabledReason = publishing
+    ? "场景正在发布，请等待完成"
+    : !window.electronApp?.publish?.buildAndOpenDist
+      ? "当前运行环境不支持发布功能"
+      : !engine
+        ? "场景引擎尚未准备好"
+        : !activeProject || !activeScene
+          ? "请先打开或创建项目场景"
+          : sceneLoading
+            ? "场景读取完成后才能发布"
+            : sceneLoadFailed
+              ? "当前场景加载失败，已阻止发布"
+              : cadImportActive
+                ? "CAD 图纸导入完成后才能发布"
+                : cadRestoreActive
+                  ? "CAD 图纸恢复完成后才能发布"
+                  : previewMode
+                    ? "停止预览后才能发布场景"
+                    : undefined;
+  const publishDisabled = Boolean(publishDisabledReason);
 
   /** 选区切换到场景属性时，同步缓存场景级配置，供对象属性面板继续显示统一数据源。 */
   const handleSelectionChange = useCallback((target: InspectorTarget) => {
@@ -1162,6 +1253,7 @@ export function App() {
     () => ({
       onSceneGraphChange: setNodes,
       onSelectionChange: handleSelectionChange,
+      onToolChange: setTool,
       onAssetsChange: setAssets,
       onStatsChange: setStats,
       onDataConnectionStatusChange: setDataConnectionStatus
@@ -1581,66 +1673,179 @@ export function App() {
       return;
     }
 
+    if (previewMode) {
+      setProjectError("请先退出预览模式，再导入或替换模型包。");
+      return;
+    }
+
     if (!engine) {
       setProjectError("3D 引擎尚未准备好，请稍后再导入模型包。");
       return;
     }
 
+    let pendingReplacementRequest: DesktopModelPackageReplacementCommitRequest | null = null;
     try {
-      const result = await window.electronApp.projects.importModelPackage(activeProject.path);
+      let finalizeWarning = "";
+      const knownPackages = engine.getAssetsSnapshot().flatMap((asset): DesktopKnownModelPackage[] => {
+        const manifest = asset.modelPackage;
+        if (!manifest) {
+          return [];
+        }
+
+        return [
+          {
+            assetId: asset.id,
+            packageId: manifest.packageId,
+            sourceRoot: manifest.sourceRoot,
+            rootDirectoryName: manifest.rootDirectoryName
+          }
+        ];
+      });
+      const result = await window.electronApp.projects.importModelPackage(activeProject.path, { knownPackages });
       if (!result) {
         return;
       }
 
-      const projectFilePaths = result.projectFiles.map((file) => file.projectFile);
-      const files = await loadProjectAssetFiles(projectFilePaths);
-      const warnings = [...result.warnings];
-      const meta = parseModelPackageMeta(result.metaFile, result.textFiles, warnings);
-      const scriptFile = chooseModelPackageParameterScriptFile(meta, result.textFiles, result.scriptFile, warnings);
-      const runtimeScript = getMetaRuntimeScript(
-        meta,
-        result.textFiles,
-        scriptFile ?? result.scriptFile,
-        warnings
-      );
-      const scriptText = scriptFile ? result.textFiles[scriptFile] ?? "" : "";
-      const parsed = parseModelPackageDecorators(scriptText, scriptFile ?? "");
-      const metaParameters = parseMetaParameterDefinition(meta, scriptFile, result.metaFile ?? "meta.json", warnings);
-      if (parsed.fields.length > 0 || metaParameters.fields.length === 0) {
-        warnings.push(...parsed.warnings);
+      if (result.replacement) {
+        if (
+          !result.replacement.pendingToken ||
+          !window.electronApp.projects.activateModelPackageReplacement ||
+          !window.electronApp.projects.finalizeModelPackageReplacement ||
+          !window.electronApp.projects.rollbackModelPackageReplacement
+        ) {
+          throw new Error("当前运行环境不支持模型包安全替换提交。");
+        }
+
+        pendingReplacementRequest = {
+          packageId: result.replacement.packageId,
+          pendingToken: result.replacement.pendingToken
+        };
       }
-      const dynamicFields = mergeDynamicFields(parsed.fields, metaParameters.fields);
-      const dataDriven = parseModelPackageDataDrivenFromScripts(
-        result.textFiles,
-        [runtimeScript.scriptFile, scriptFile, result.scriptFile],
-        warnings
+
+      const replacementAsset = result.replacement
+        ? engine
+            .getAssetsSnapshot()
+            .find((asset) => asset.id === result.replacement?.assetId && asset.modelPackage?.packageId === result.replacement?.packageId)
+        : undefined;
+      const projectFilePaths = result.projectFiles.map((file) =>
+        result.replacement ? file.stagingProjectFile ?? file.projectFile : file.projectFile
       );
-      const manifest: ModelPackageManifest = {
-        version: 1,
+      const files = await loadProjectAssetFiles(projectFilePaths);
+      const manifest = buildModelPackageManifest({
         packageId: result.packageId,
         displayName: result.displayName,
         rootDirectoryName: result.rootDirectoryName,
+        sourceRoot: result.sourceRoot,
         primaryModelFile: result.primaryModelFile,
-        scriptFile,
-        runtimeScriptFile: runtimeScript.scriptFile,
-        runtimeClassName: runtimeScript.className,
-        dataDriven,
+        fallbackScriptFile: result.scriptFile,
         metaFile: result.metaFile,
-        meta,
-        files: mapModelPackageFiles(result.projectFiles),
-        dynamicFields,
-        initialValues: metaParameters.initialValues,
-        warnings,
-        importedAt: Date.now()
-      };
+        projectFiles: result.projectFiles,
+        textFiles: result.textFiles,
+        warnings: result.warnings,
+        importedAt: replacementAsset?.modelPackage?.importedAt
+      });
 
-      engine.registerModelPackageScriptTexts(result.packageId, result.textFiles);
-      await engine.importModelPackage(files, new Vector3(0, 0, 0), manifest);
+      if (result.replacement) {
+        if (!pendingReplacementRequest) {
+          throw new Error("模型包替换请求缺少提交令牌。");
+        }
+
+        await window.electronApp.projects.activateModelPackageReplacement!(activeProject.path, pendingReplacementRequest);
+        const replaced = await engine.replaceModelPackageAsset(result.replacement.assetId, files, manifest, result.textFiles);
+        if (!replaced) {
+          throw new Error("当前场景资产替换失败，已保留旧模型包。");
+        }
+
+        const finalizeRequest = pendingReplacementRequest;
+        pendingReplacementRequest = null;
+        try {
+          await window.electronApp.projects.finalizeModelPackageReplacement!(activeProject.path, finalizeRequest);
+        } catch (finalizeError) {
+          finalizeWarning = `模型包已替换成功，但旧包备份清理失败：${getErrorMessage(finalizeError, "未知错误")}`;
+        }
+      } else {
+        engine.registerModelPackageScriptTexts(result.packageId, result.textFiles);
+        await engine.importModelPackage(files, new Vector3(0, 0, 0), manifest);
+      }
+      const warnings = finalizeWarning ? [...manifest.warnings, finalizeWarning] : manifest.warnings;
       setProjectError(warnings.length > 0 ? warnings.join("；") : null);
     } catch (error) {
-      setProjectError(getErrorMessage(error, "导入模型包失败。"));
+      let rollbackErrorMessage = "";
+      if (pendingReplacementRequest && window.electronApp.projects.rollbackModelPackageReplacement) {
+        try {
+          await window.electronApp.projects.rollbackModelPackageReplacement(activeProject.path, pendingReplacementRequest);
+        } catch (rollbackError) {
+          rollbackErrorMessage = `；模型包目录回滚失败：${getErrorMessage(rollbackError, "未知错误")}`;
+        }
+      }
+      setProjectError(`${getErrorMessage(error, "导入模型包失败。")}${rollbackErrorMessage}`);
     }
-  }, [activeProject, engine, loadProjectAssetFiles]);
+  }, [activeProject, engine, loadProjectAssetFiles, previewMode]);
+
+  /** 刷新当前选中模型包资产的脚本和 meta，并保留已导入实例的现有参数。 */
+  const handleRefreshModelPackage = useCallback(async () => {
+    if (!activeProject) {
+      setProjectError("请先打开项目，再刷新模型包。");
+      return;
+    }
+
+    if (previewMode) {
+      setProjectError("请先退出预览模式，再刷新模型包脚本。");
+      return;
+    }
+
+    if (!engine || !selectedNode?.dynamicParameters) {
+      setProjectError("请先选中已导入的模型包实例。");
+      return;
+    }
+
+    if (!window.electronApp?.projects.refreshModelPackage) {
+      setProjectError("当前运行环境不支持模型包刷新。");
+      return;
+    }
+
+    const { assetId, packageId } = selectedNode.dynamicParameters;
+    const asset = assets.find((item) => item.id === assetId && item.modelPackage?.packageId === packageId);
+    const currentManifest = asset?.modelPackage;
+    if (!asset || !currentManifest) {
+      setProjectError("当前选择未找到对应的模型包资产，无法刷新。");
+      return;
+    }
+
+    try {
+      const result = await window.electronApp.projects.refreshModelPackage(activeProject.path, {
+        packageId,
+        sourceRoot: currentManifest.sourceRoot
+      });
+      if (!result) {
+        return;
+      }
+
+      const nextManifest = buildModelPackageManifest({
+        packageId,
+        displayName: currentManifest.displayName,
+        rootDirectoryName: result.rootDirectoryName || currentManifest.rootDirectoryName,
+        sourceRoot: result.sourceRoot,
+        primaryModelFile: currentManifest.primaryModelFile,
+        fallbackScriptFile: currentManifest.scriptFile ?? currentManifest.runtimeScriptFile,
+        metaFile: result.metaFile ?? currentManifest.metaFile,
+        projectFiles: result.projectFiles,
+        textFiles: result.textFiles,
+        warnings: result.warnings,
+        importedAt: currentManifest.importedAt,
+        existingFiles: currentManifest.files
+      });
+
+      if (!engine.refreshModelPackageAsset(asset.id, nextManifest, result.textFiles)) {
+        setProjectError("模型包脚本已复制，但当前场景资产刷新失败。");
+        return;
+      }
+
+      setProjectError(nextManifest.warnings.length > 0 ? nextManifest.warnings.join("；") : null);
+    } catch (error) {
+      setProjectError(getErrorMessage(error, "刷新模型包失败。"));
+    }
+  }, [activeProject, assets, engine, previewMode, selectedNode]);
 
   /** 从工具栏或拖拽导入 CAD 图纸，允许同批选择图片参照文件。 */
   const handleImportCadDrawing = useCallback(
@@ -1944,18 +2149,17 @@ export function App() {
 
   /** 从右键菜单进入模型阵列弹窗，并填入默认参数。 */
   const handleOpenModelArrayDialog = useCallback(() => {
-    if (!sceneContextMenu?.target || !canOpenModelArrayMenu(sceneContextMenu.target)) {
+    if (!engine || !sceneContextMenu?.target || !engine.canCreateModelArrayForId(sceneContextMenu.target.id)) {
       return;
     }
 
     setModelArrayDialog({
       target: sceneContextMenu.target,
       axis: MODEL_ARRAY_DEFAULT_AXIS,
-      count: MODEL_ARRAY_DEFAULT_COUNT,
-      spacing: MODEL_ARRAY_DEFAULT_SPACING
+      count: MODEL_ARRAY_DEFAULT_COUNT
     });
     setSceneContextMenu(null);
-  }, [sceneContextMenu]);
+  }, [engine, sceneContextMenu]);
 
   /** 更新模型阵列表单字段，字符串状态保留用户正在输入的小数或空值。 */
   const handleModelArrayDialogChange = useCallback((update: Partial<Omit<ModelArrayDialogState, "target">>) => {
@@ -1971,8 +2175,7 @@ export function App() {
     const result = engine.createModelArray({
       targetId: modelArrayDialog.target.id,
       axis: modelArrayDialog.axis,
-      count: Number(modelArrayDialog.count),
-      spacing: Number(modelArrayDialog.spacing)
+      count: Number(modelArrayDialog.count)
     });
     if (!result.success) {
       setProjectError(result.message ?? "创建模型阵列失败。");
@@ -2164,6 +2367,36 @@ export function App() {
 
     engine.saveScene();
   }, [activeProject, activeScene, engine, previewMode, refreshRecentProjects, sceneLoadFailed, sceneLoading]);
+
+  /** 发布当前编辑器构建产物，成功后由 Electron 打开 dist 目录。 */
+  const handlePublish = useCallback(async () => {
+    if (publishDisabledReason) {
+      setProjectError(publishDisabledReason);
+      setProjectErrorExpanded(false);
+      return;
+    }
+
+    const publishApi = window.electronApp?.publish;
+    if (!publishApi?.buildAndOpenDist) {
+      setProjectError("当前运行环境不支持发布功能。");
+      setProjectErrorExpanded(false);
+      return;
+    }
+
+    setPublishing(true);
+    setProjectError("发布构建中，请等待 npm run build 完成。");
+    setProjectErrorExpanded(false);
+    try {
+      const result = await publishApi.buildAndOpenDist();
+      setProjectError(`发布完成，已打开 dist 目录：${result.distPath}`);
+      setProjectErrorExpanded(false);
+    } catch (error) {
+      setProjectError(getErrorMessage(error, "发布场景失败。"));
+      setProjectErrorExpanded(false);
+    } finally {
+      setPublishing(false);
+    }
+  }, [publishDisabledReason]);
 
   /** 打开 Babylon 官方 Inspector 作为高级调试面板。 */
   const handleToggleInspector = useCallback(() => {
@@ -2416,6 +2649,7 @@ export function App() {
   const contextTargetSelected = Boolean(contextTarget && selectedHierarchyNodes.some((node) => node.id === contextTarget.id));
   const contextUsesBatchSelection = contextTargetSelected && hasBatchSelection;
   const contextCanEdit = Boolean(contextTarget && !contextTarget.locked);
+  const contextCanOpenModelArray = Boolean(contextTarget && engine?.canCreateModelArrayForId(contextTarget.id));
   const contextCanToggleLock = Boolean(contextTarget && (!contextTarget.lockedByAncestor || contextTarget.selfLocked));
   const contextCanBatchEdit = contextUsesBatchSelection ? canEditSelectedBatch : contextCanEdit;
   const contextCanBatchToggleLock = contextUsesBatchSelection ? canToggleSelectedBatchLock : contextCanToggleLock;
@@ -2475,6 +2709,9 @@ export function App() {
         onSave={handleSave}
         saveDisabled={projectSaveBlocked}
         saveDisabledReason={saveDisabledReason}
+        onPublish={handlePublish}
+        publishDisabled={publishDisabled}
+        publishDisabledReason={publishDisabledReason}
         cadImportDisabled={cadBusy}
         cadImportDisabledReason={cadImportDisabledReason}
         onToggleInspector={handleToggleInspector}
@@ -2601,10 +2838,12 @@ export function App() {
           target={panelInspectorTarget}
           sceneDataDriven={sceneDataDriven}
           dataConnectionStatus={dataConnectionStatus}
+          previewMode={previewMode}
           onNodeChange={handleInspectorChange}
           onSceneChange={handleSceneInspectorChange}
           onSceneDataDrivenChange={handleSceneDataDrivenChange}
           onStartStackerDemoPreview={handleStartStackerDemoPreview}
+          onRefreshModelPackage={handleRefreshModelPackage}
           onSceneInitialize={handleInitializeScene}
           onImportCadDrawing={handleImportCadDrawing}
           cadImportDisabled={cadImportActive}
@@ -2678,6 +2917,11 @@ export function App() {
               >
                 粘贴 <span>Ctrl+V</span>
               </button>
+              {contextCanOpenModelArray && (
+                <button className="model-context-menu-item" type="button" onClick={handleOpenModelArrayDialog}>
+                  模型阵列
+                </button>
+              )}
               <button
                 className="model-context-menu-item"
                 type="button"
@@ -2753,14 +2997,6 @@ export function App() {
               >
                 折叠树 <span>P</span>
               </button>
-              {canOpenModelArrayMenu(contextTarget) && (
-                <>
-                  <div className="scene-context-menu-separator" />
-                  <button className="model-context-menu-item" type="button" onClick={handleOpenModelArrayDialog}>
-                    模型阵列
-                  </button>
-                </>
-              )}
             </>
           ) : (
             <>
@@ -2835,16 +3071,6 @@ export function App() {
                 type="number"
                 value={modelArrayDialog.count}
                 onChange={(event) => handleModelArrayDialogChange({ count: event.target.value })}
-              />
-            </label>
-            <label className="field">
-              <span>间距 m</span>
-              <input
-                min={0.001}
-                step={0.1}
-                type="number"
-                value={modelArrayDialog.spacing}
-                onChange={(event) => handleModelArrayDialogChange({ spacing: event.target.value })}
               />
             </label>
             <div className="modal-actions">

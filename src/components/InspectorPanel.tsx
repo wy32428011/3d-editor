@@ -35,10 +35,12 @@ interface InspectorPanelProps {
   target: InspectorTarget | null;
   sceneDataDriven: SceneDataDrivenSnapshot;
   dataConnectionStatus: SceneDataConnectionStatusSnapshot;
+  previewMode: boolean;
   onNodeChange: (update: TransformUpdate) => void;
   onSceneChange: (update: SceneInspectorUpdate) => void | Promise<void>;
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
   onStartStackerDemoPreview: (nodeId: number) => void;
+  onRefreshModelPackage?: () => void | Promise<void>;
   onSceneInitialize: () => void;
   onImportCadDrawing: (files: FileList | File[]) => void | Promise<void>;
   cadImportDisabled?: boolean;
@@ -108,10 +110,12 @@ export function InspectorPanel({
   target,
   sceneDataDriven,
   dataConnectionStatus,
+  previewMode,
   onNodeChange,
   onSceneChange,
   onSceneDataDrivenChange,
   onStartStackerDemoPreview,
+  onRefreshModelPackage,
   onSceneInitialize,
   onImportCadDrawing,
   cadImportDisabled = false,
@@ -165,13 +169,15 @@ export function InspectorPanel({
   }
 
   return (
-    <NodeInspector
-      selection={target.node}
-      sceneDataDriven={sceneDataDriven}
-      dataConnectionStatus={dataConnectionStatus}
-      onChange={onNodeChange}
+      <NodeInspector
+        selection={target.node}
+        sceneDataDriven={sceneDataDriven}
+        dataConnectionStatus={dataConnectionStatus}
+        previewMode={previewMode}
+        onChange={onNodeChange}
       onSceneDataDrivenChange={onSceneDataDrivenChange}
       onStartStackerDemoPreview={onStartStackerDemoPreview}
+      onRefreshModelPackage={onRefreshModelPackage}
     />
   );
 }
@@ -180,9 +186,11 @@ interface NodeInspectorProps {
   selection: TransformSnapshot;
   sceneDataDriven: SceneDataDrivenSnapshot;
   dataConnectionStatus: SceneDataConnectionStatusSnapshot;
+  previewMode: boolean;
   onChange: (update: TransformUpdate) => void;
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
   onStartStackerDemoPreview: (nodeId: number) => void;
+  onRefreshModelPackage?: () => void | Promise<void>;
 }
 
 /** 对象属性分支，保留原有模型、组件参数和资产编号编辑能力。 */
@@ -190,9 +198,11 @@ function NodeInspector({
   selection,
   sceneDataDriven,
   dataConnectionStatus,
+  previewMode,
   onChange,
   onSceneDataDrivenChange,
-  onStartStackerDemoPreview
+  onStartStackerDemoPreview,
+  onRefreshModelPackage
 }: NodeInspectorProps) {
   const isLocked = selection.locked;
   const isGroup = selection.kind === "Group";
@@ -201,6 +211,7 @@ function NodeInspector({
   const isLocator = selection.kind === "Locator";
   const isModelNode = !isGroup && !isCad && !isPoi && !isLocator;
   const isTransformReadOnly = isLocked || isGroup;
+  const previewTransformDisabledReason = previewMode ? "当前处于预览模式，编辑移动轴已暂停，请退出预览后再移动对象。" : "";
 
   return (
     <aside className="panel inspector-panel inspector-panel-redesign">
@@ -223,9 +234,12 @@ function NodeInspector({
       </div>
       {isLocked && (
         <div className="inspector-readonly-banner">
-          {selection.lockedByAncestor && !selection.selfLocked ? "父级分组已锁定，当前模型只读。" : "当前模型已锁定，只能查看属性。"}
+          {selection.lockedByAncestor && !selection.selfLocked
+            ? "父级分组已锁定，当前模型只读且不显示移动轴。"
+            : "当前模型已锁定，只能查看属性且不显示移动轴。"}
         </div>
       )}
+      {previewTransformDisabledReason && <div className="inspector-readonly-banner">{previewTransformDisabledReason}</div>}
 
       <fieldset className="inspector-readonly-fieldset" disabled={isTransformReadOnly}>
         <InspectorSection title="空间信息" defaultOpen showRefreshIcon>
@@ -255,6 +269,10 @@ function NodeInspector({
 
       {isLocator && selection.locatorAnimationConnection && (
         <fieldset className="inspector-readonly-fieldset" disabled={isLocked}>
+          <InspectorSection title="资产信息" defaultOpen>
+            <AssetInfoEditor value={selection.assetInfo} onChange={(assetInfo) => onChange({ assetInfo })} />
+          </InspectorSection>
+
           <InspectorSection title="动画连接" defaultOpen>
             <LocatorAnimationConnectionEditor
               value={selection.locatorAnimationConnection}
@@ -296,6 +314,7 @@ function NodeInspector({
             <InspectorSection title={`${selection.dynamicParameters.displayName} 参数`} defaultOpen>
               <DynamicParameterEditor
                 snapshot={selection.dynamicParameters}
+                onRefreshModelPackage={onRefreshModelPackage}
                 onChange={(dynamicParameter) => onChange({ dynamicParameter })}
               />
             </InspectorSection>
@@ -1081,7 +1100,7 @@ interface LocatorAnimationConnectionEditorProps {
   onSceneDataDrivenChange: (update: Partial<SceneDataDrivenSnapshot>) => void | Promise<void>;
 }
 
-/** 定位线框立方体专属数据驱动接收端配置，不复用普通模型资产编号面板。 */
+/** 定位线框立方体专属数据驱动接收端配置，资产编号由通用资产信息面板独立维护。 */
 function LocatorAnimationConnectionEditor({
   value,
   sceneDataDriven,
@@ -1222,14 +1241,22 @@ function CompactVectorEditor({ label, unit, value, onChange }: CompactVectorEdit
 
 interface DynamicParameterEditorProps {
   snapshot: DynamicParameterSnapshot;
+  onRefreshModelPackage?: () => void | Promise<void>;
   onChange: (update: DynamicParameterUpdate) => void;
 }
 
 /** 根据模型包 manifest 动态渲染参数字段，不硬编码具体模型字段。 */
-function DynamicParameterEditor({ snapshot, onChange }: DynamicParameterEditorProps) {
+function DynamicParameterEditor({ snapshot, onRefreshModelPackage, onChange }: DynamicParameterEditorProps) {
   return (
     <>
       {snapshot.runtimeWarning && <div className="inspector-runtime-warning">{snapshot.runtimeWarning}</div>}
+      {onRefreshModelPackage && (
+        <div className="inspector-asset-actions">
+          <button className="inspector-refresh-button" type="button" onClick={() => void onRefreshModelPackage()}>
+            刷新模型包
+          </button>
+        </div>
+      )}
       {snapshot.fields.map((field) => (
         <DynamicParameterField
           key={field.id}
@@ -1365,11 +1392,12 @@ interface MeshVertexModifyEditorProps {
   onChange: (update: Partial<MeshVertexModifySnapshot>) => void;
 }
 
-/** MeshVertexModifyComponent 参数编辑器，当前把参数保存到节点 metadata。 */
+/** MeshVertexModifyComponent 参数编辑器，参数会保存到 metadata，辊筒数量等安全字段会同步驱动场景。 */
 function MeshVertexModifyEditor({ value, materialColor, onChange }: MeshVertexModifyEditorProps) {
   const colorValue = value.mainColor ?? materialColor ?? "#ffffff";
   return (
     <>
+      <div className="inspector-empty-section">带 GT/roller 命名辊筒的普通模型会按“辊筒密度”实时显示对应辊筒数量；模型包辊道机优先使用动态参数。</div>
       <InspectorCheckboxRow label="显示腿A" checked={value.showLegA} onChange={(checked) => onChange({ showLegA: checked })} />
       <InspectorCheckboxRow label="显示腿B" checked={value.showLegB} onChange={(checked) => onChange({ showLegB: checked })} />
       <InspectorCheckboxRow label="辊轮皮" checked={value.rollerSkin} onChange={(checked) => onChange({ rollerSkin: checked })} />

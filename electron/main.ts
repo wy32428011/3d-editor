@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from "electron";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -22,6 +23,8 @@ const modelPackageMaxFiles = 200;
 const modelPackageMaxTextFileBytes = 2 * 1024 * 1024;
 const modelPackageMaxReturnedTextBytes = 8 * 1024 * 1024;
 const modelPackageMaxTotalBytes = 1024 * 1024 * 1024;
+const modelPackagePendingReplacementTtlMs = 30 * 60 * 1000;
+const publishLogTailMaxChars = 128 * 1024;
 const cadReferenceMaxImageBytes = 512 * 1024 * 1024;
 const cadReferenceImageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const projectAssetCopyAllowedExtensions = new Set([
@@ -57,8 +60,11 @@ const modelPackageAllowedExtensions = new Set([
 ]);
 
 let mainWindow: BrowserWindow | null = null;
+const pendingModelPackageReplacements = new Map<string, PendingModelPackageReplacement>();
 const authorizedProjectPaths = new Set<string>();
+const authorizedModelPackageSourceRoots = new Set<string>();
 const sceneMutationQueues = new Map<string, Promise<void>>();
+let publishBuildPromise: Promise<DesktopPublishResult> | null = null;
 
 /** 尽早向 Chromium 申请高性能 GPU，避免混合显卡或黑名单策略落到低功耗/软件渲染路径。 */
 function configureGpuAcceleration(): void {
@@ -132,21 +138,80 @@ interface LocalReferenceFilePayload {
 interface ModelPackageProjectFile {
   relativePath: string;
   projectFile: string;
+  stagingProjectFile?: string;
   role: "primaryModel" | "modelDependency" | "script" | "meta" | "texture" | "other";
   size: number;
   lastModified?: number;
+}
+
+interface KnownModelPackage {
+  assetId: string;
+  packageId: string;
+  sourceRoot?: string;
+  rootDirectoryName: string;
+}
+
+interface ModelPackageImportRequest {
+  knownPackages?: KnownModelPackage[];
+}
+
+interface ModelPackageReplacementResult {
+  assetId: string;
+  packageId: string;
+  matchRule: "sourceRoot" | "rootDirectoryName";
+  pendingToken?: string;
+}
+
+interface ModelPackageReplacementCommitRequest {
+  packageId: string;
+  pendingToken: string;
 }
 
 interface ModelPackageImportResult {
   packageId: string;
   displayName: string;
   rootDirectoryName: string;
+  sourceRoot: string;
   primaryModelFile: string;
   scriptFile?: string;
   metaFile?: string;
   projectFiles: ModelPackageProjectFile[];
   textFiles: Record<string, string>;
   warnings: string[];
+  replacement?: ModelPackageReplacementResult;
+}
+
+interface ModelPackageRefreshRequest {
+  packageId: string;
+  sourceRoot?: string;
+}
+
+interface ModelPackageRefreshResult {
+  packageId: string;
+  rootDirectoryName: string;
+  sourceRoot: string;
+  metaFile?: string;
+  projectFiles: ModelPackageProjectFile[];
+  textFiles: Record<string, string>;
+  warnings: string[];
+}
+
+interface DesktopPublishResult {
+  distPath: string;
+}
+
+interface PendingModelPackageReplacement {
+  projectPath: string;
+  packageId: string;
+  stagingDirectory: string;
+  backupDirectory?: string;
+  state: "staged" | "activated";
+  createdAt: number;
+}
+
+interface PublishBuildCommand {
+  command: string;
+  args: string[];
 }
 
 interface AppStateFile {
@@ -342,6 +407,39 @@ function authorizeProjectPath(projectPath: string): void {
 function assertAuthorizedProjectPath(projectPath: string): void {
   if (!authorizedProjectPaths.has(normalizeProjectPath(projectPath))) {
     throw new Error("项目路径未授权，请先通过启动页打开项目。");
+  }
+}
+
+/** 规范化模型包源目录，并拒绝空路径、NUL 字符、非目录和根目录符号链接。 */
+async function normalizeModelPackageSourceRoot(sourceRoot: string): Promise<string> {
+  const trimmed = sourceRoot.trim();
+  if (!trimmed || trimmed.includes("\0")) {
+    throw new Error("模型包源目录路径无效。");
+  }
+
+  const resolved = path.resolve(trimmed);
+  const stats = await fs.lstat(resolved);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error("模型包源目录必须是普通文件夹。");
+  }
+
+  return fs.realpath(resolved);
+}
+
+/** 记录用户本会话通过系统目录选择器授权过的模型包源目录。 */
+async function authorizeModelPackageSourceRoot(sourceRoot: string): Promise<string> {
+  const normalized = await normalizeModelPackageSourceRoot(sourceRoot);
+  authorizedModelPackageSourceRoots.add(normalizeProjectPath(normalized));
+  return normalized;
+}
+
+/** 仅允许本会话已授权的模型包源目录被 renderer 静默复用。 */
+async function getAuthorizedModelPackageSourceRoot(sourceRoot: string): Promise<string | null> {
+  try {
+    const normalized = await normalizeModelPackageSourceRoot(sourceRoot);
+    return authorizedModelPackageSourceRoots.has(normalizeProjectPath(normalized)) ? normalized : null;
+  } catch {
+    return null;
   }
 }
 
@@ -941,6 +1039,26 @@ function getModelPackageFileRole(relativePath: string, primaryModelFile: string)
   return "other";
 }
 
+/** 校验模型包包号只能作为 assets/source 下的一级目录名使用。 */
+function isSafeModelPackagePackageId(packageId: string): boolean {
+  return /^[a-z0-9][a-z0-9._-]*$/i.test(packageId) && packageId !== "." && packageId !== "..";
+}
+
+/** 从用户选择的模型包目录名生成安全 packageId，避免中文或特殊字符目录名触发资产目录校验。 */
+function createModelPackagePackageId(sourceRoot: string): string {
+  const rawSlug = toFileSlug(path.basename(sourceRoot), "model-package");
+  const asciiSlug = rawSlug
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[^a-z0-9]+/i, "")
+    .replace(/[^a-z0-9]+$/i, "")
+    .toLowerCase();
+  const safeSlug = asciiSlug || "model-package";
+  return `${Date.now()}-${safeSlug}`;
+}
+
 /** 递归读取模型包目录，拒绝符号链接并限制文件数量。 */
 async function readModelPackageDirectory(sourceRoot: string): Promise<string[]> {
   const entries = await fs.readdir(sourceRoot, { withFileTypes: true });
@@ -974,8 +1092,13 @@ async function copyModelPackageFileToProject(
   projectPath: string,
   packageId: string,
   sourceRoot: string,
-  absoluteFilePath: string
+  absoluteFilePath: string,
+  targetPackageDirectory?: string
 ): Promise<Omit<ModelPackageProjectFile, "role">> {
+  if (!isSafeModelPackagePackageId(packageId)) {
+    throw new Error("模型包 packageId 不是安全的目录名。");
+  }
+
   const relativePath = path.relative(sourceRoot, absoluteFilePath).replace(/\\/g, "/");
   if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath) || relativePath.includes("\0")) {
     throw new Error(`模型包文件路径不安全：${relativePath}`);
@@ -993,7 +1116,7 @@ async function copyModelPackageFileToProject(
   const projectFile = path
     .join(projectAssetsDirName, projectAssetSourceDirName, packageId, relativePath)
     .replace(/\\/g, "/");
-  const assetPath = getProjectAssetPath(projectPath, projectFile);
+  const assetPath = targetPackageDirectory ? path.join(targetPackageDirectory, relativePath) : getProjectAssetPath(projectPath, projectFile);
   await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), assetPath);
   await fs.mkdir(path.dirname(assetPath), { recursive: true });
   await fs.copyFile(absoluteFilePath, assetPath);
@@ -1007,8 +1130,215 @@ async function copyModelPackageFileToProject(
   };
 }
 
+/** 返回模型包在项目 assets/source 下的最终目录，并限制 packageId 只能定位到一级目录。 */
+function getModelPackageProjectDirectory(projectPath: string, packageId: string): string {
+  if (!isSafeModelPackagePackageId(packageId)) {
+    throw new Error("模型包 packageId 不是安全的目录名。");
+  }
+
+  return getProjectAssetPath(projectPath, path.join(projectAssetsDirName, projectAssetSourceDirName, packageId));
+}
+
+/** 为替换模型包创建临时目录，复制全部成功后再交换到正式目录。 */
+async function createModelPackageStagingDirectory(projectPath: string, packageId: string): Promise<string> {
+  const packageDirectory = getModelPackageProjectDirectory(projectPath, packageId);
+  await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), packageDirectory);
+  await fs.mkdir(path.dirname(packageDirectory), { recursive: true });
+  const stagingDirectory = `${packageDirectory}.tmp-${randomUUID()}`;
+  await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), stagingDirectory);
+  await fs.rm(stagingDirectory, { recursive: true, force: true });
+  await fs.mkdir(stagingDirectory, { recursive: true });
+  return stagingDirectory;
+}
+
+/** 把 staging 中的文件路径转换成项目资产相对路径，供渲染端在确认前读取新包内容。 */
+function getModelPackageStagingProjectFile(projectPath: string, stagingDirectory: string, relativePath: string): string {
+  const stagingFile = path.join(stagingDirectory, relativePath);
+  const projectFile = path.relative(projectPath, stagingFile).replace(/\\/g, "/");
+  getProjectAssetPath(projectPath, projectFile);
+  return projectFile;
+}
+
+/** 登记待确认的模型包替换，renderer 验证成功后才能激活并最终提交。 */
+function registerPendingModelPackageReplacement(projectPath: string, packageId: string, stagingDirectory: string): string {
+  cleanupExpiredPendingModelPackageReplacements();
+  const pendingToken = randomUUID();
+  pendingModelPackageReplacements.set(pendingToken, {
+    projectPath: path.resolve(projectPath),
+    packageId,
+    stagingDirectory,
+    state: "staged",
+    createdAt: Date.now()
+  });
+  return pendingToken;
+}
+
+/** 清理过期且尚未激活的模型包 staging 目录，避免取消导入后长期残留临时包。 */
+function cleanupExpiredPendingModelPackageReplacements(): void {
+  const now = Date.now();
+  for (const [token, pending] of pendingModelPackageReplacements) {
+    if (now - pending.createdAt <= modelPackagePendingReplacementTtlMs || pending.state === "activated") {
+      continue;
+    }
+
+    pendingModelPackageReplacements.delete(token);
+    void fs.rm(pending.stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** 读取并校验待确认替换请求，避免 renderer 伪造 packageId 或跨项目提交。 */
+function getPendingModelPackageReplacement(
+  projectPath: string,
+  request: ModelPackageReplacementCommitRequest
+): [string, PendingModelPackageReplacement] {
+  const pendingToken = typeof request?.pendingToken === "string" ? request.pendingToken : "";
+  const packageId = typeof request?.packageId === "string" ? request.packageId : "";
+  if (!pendingToken || !packageId || !isSafeModelPackagePackageId(packageId)) {
+    throw new Error("模型包替换提交请求无效。");
+  }
+
+  const pending = pendingModelPackageReplacements.get(pendingToken);
+  if (!pending) {
+    throw new Error("模型包替换请求已失效，请重新导入。");
+  }
+
+  if (pending.packageId !== packageId || path.resolve(pending.projectPath) !== path.resolve(projectPath)) {
+    throw new Error("模型包替换请求和当前项目不匹配。");
+  }
+
+  return [pendingToken, pending];
+}
+
+/** 将 staging 目录切换为正式模型包目录，但保留旧目录备份，等待 renderer 替换场景成功后再最终确认。 */
+async function activatePendingModelPackageReplacement(projectPath: string, request: ModelPackageReplacementCommitRequest): Promise<void> {
+  await readProjectManifest(projectPath);
+  const [, pending] = getPendingModelPackageReplacement(projectPath, request);
+  if (pending.state !== "staged") {
+    return;
+  }
+
+  const packageDirectory = getModelPackageProjectDirectory(projectPath, pending.packageId);
+  const backupDirectory = `${packageDirectory}.bak-${randomUUID()}`;
+  await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), packageDirectory);
+  await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), pending.stagingDirectory);
+  await fs.mkdir(path.dirname(packageDirectory), { recursive: true });
+
+  let movedExistingToBackup = false;
+  try {
+    try {
+      await fs.rename(packageDirectory, backupDirectory);
+      movedExistingToBackup = true;
+      pending.backupDirectory = backupDirectory;
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+    }
+
+    await fs.rename(pending.stagingDirectory, packageDirectory);
+    pending.state = "activated";
+  } catch (error) {
+    if (movedExistingToBackup) {
+      await fs.rm(packageDirectory, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rename(backupDirectory, packageDirectory).catch(() => undefined);
+      pending.backupDirectory = undefined;
+    }
+    throw error;
+  }
+}
+
+/** 最终确认模型包替换，删除旧目录备份并释放 pending token。 */
+async function finalizePendingModelPackageReplacement(projectPath: string, request: ModelPackageReplacementCommitRequest): Promise<void> {
+  await readProjectManifest(projectPath);
+  const [pendingToken, pending] = getPendingModelPackageReplacement(projectPath, request);
+  if (pending.backupDirectory) {
+    await fs.rm(pending.backupDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+  pendingModelPackageReplacements.delete(pendingToken);
+}
+
+/** 回滚未完成的模型包替换；未激活时删除 staging，已激活时恢复旧正式目录。 */
+async function rollbackPendingModelPackageReplacement(projectPath: string, request: ModelPackageReplacementCommitRequest): Promise<void> {
+  await readProjectManifest(projectPath);
+  const [pendingToken, pending] = getPendingModelPackageReplacement(projectPath, request);
+  pendingModelPackageReplacements.delete(pendingToken);
+  if (pending.state === "staged") {
+    await fs.rm(pending.stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+    return;
+  }
+
+  const packageDirectory = getModelPackageProjectDirectory(projectPath, pending.packageId);
+  await assertNoSymlinkInExistingPath(path.join(projectPath, projectAssetsDirName), packageDirectory);
+  await fs.rm(packageDirectory, { recursive: true, force: true }).catch(() => undefined);
+  if (pending.backupDirectory) {
+    await fs.rename(pending.backupDirectory, packageDirectory);
+  }
+}
+
+/** 从 renderer 提供的资产清单中提取可用于同包替换匹配的安全字段。 */
+function readKnownModelPackages(request: unknown): KnownModelPackage[] {
+  const value = isRecord(request) ? request : {};
+  const packages = Array.isArray(value.knownPackages) ? value.knownPackages : [];
+  return packages.slice(0, modelPackageMaxFiles).flatMap((item): KnownModelPackage[] => {
+    const record = isRecord(item) ? item : {};
+    const assetId = typeof record.assetId === "string" ? record.assetId : "";
+    const packageId = typeof record.packageId === "string" ? record.packageId : "";
+    const rootDirectoryName = typeof record.rootDirectoryName === "string" ? record.rootDirectoryName : "";
+    if (!assetId || !packageId || !rootDirectoryName || !isSafeModelPackagePackageId(packageId)) {
+      return [];
+    }
+
+    return [
+      {
+        assetId,
+        packageId,
+        rootDirectoryName,
+        sourceRoot: typeof record.sourceRoot === "string" ? record.sourceRoot : undefined
+      }
+    ];
+  });
+}
+
+/** 按 sourceRoot 优先、目录名兜底匹配已有模型包资产。 */
+async function findModelPackageReplacement(sourceRoot: string, knownPackages: KnownModelPackage[]): Promise<ModelPackageReplacementResult | undefined> {
+  const normalizedSourceRootKey = normalizeProjectPath(sourceRoot);
+  for (const knownPackage of knownPackages) {
+    if (!knownPackage.sourceRoot) {
+      continue;
+    }
+
+    try {
+      const knownSourceRoot = await normalizeModelPackageSourceRoot(knownPackage.sourceRoot);
+      if (normalizeProjectPath(knownSourceRoot) === normalizedSourceRootKey) {
+        return {
+          assetId: knownPackage.assetId,
+          packageId: knownPackage.packageId,
+          matchRule: "sourceRoot"
+        };
+      }
+    } catch {
+      // 历史 sourceRoot 失效时跳过路径匹配，后续仍可按目录名兜底。
+    }
+  }
+
+  const selectedDirectoryName = path.basename(sourceRoot).toLowerCase();
+  const directoryMatches = knownPackages.filter((knownPackage) => knownPackage.rootDirectoryName.toLowerCase() === selectedDirectoryName);
+  const directoryMatch = directoryMatches.length === 1 ? directoryMatches[0] : undefined;
+  return directoryMatch
+    ? {
+        assetId: directoryMatch.assetId,
+        packageId: directoryMatch.packageId,
+        matchRule: "rootDirectoryName"
+      }
+    : undefined;
+}
+
 /** 扫描、校验并复制文件夹模型包，返回渲染端构建 manifest 所需的轻量信息。 */
-async function importModelPackageDirectory(projectPath: string, sourceRoot: string): Promise<ModelPackageImportResult> {
+async function importModelPackageDirectory(
+  projectPath: string,
+  sourceRoot: string,
+  replacement?: ModelPackageReplacementResult
+): Promise<ModelPackageImportResult> {
   await readProjectManifest(projectPath);
   const absoluteFiles = await readModelPackageDirectory(sourceRoot);
   const relativeFiles = absoluteFiles.map((file) => path.relative(sourceRoot, file).replace(/\\/g, "/")).sort((left, right) => left.localeCompare(right));
@@ -1057,31 +1387,55 @@ async function importModelPackageDirectory(projectPath: string, sourceRoot: stri
   const primaryModelFile = glbFiles[0];
   const scriptFile = tsFiles[0];
   const metaFile = metaFiles.includes("meta.json") ? "meta.json" : metaFiles[0];
-  const packageId = `${Date.now()}-${toFileSlug(path.basename(sourceRoot), "model-package")}`;
+  const packageId = replacement?.packageId ?? createModelPackagePackageId(sourceRoot);
+  if (!isSafeModelPackagePackageId(packageId)) {
+    throw new Error("模型包 packageId 不是安全的目录名。");
+  }
   const projectFiles: ModelPackageProjectFile[] = [];
   const textFiles: Record<string, string> = {};
   let returnedTextBytes = 0;
+  const stagingDirectory = replacement ? await createModelPackageStagingDirectory(projectPath, packageId) : undefined;
+  let pendingToken: string | undefined;
 
-  for (const relativePath of allowedFiles) {
-    const copied = await copyModelPackageFileToProject(projectPath, packageId, sourceRoot, path.join(sourceRoot, relativePath));
-    projectFiles.push({
-      ...copied,
-      role: getModelPackageFileRole(copied.relativePath, primaryModelFile)
-    });
+  try {
+    for (const relativePath of allowedFiles) {
+      const copied = await copyModelPackageFileToProject(
+        projectPath,
+        packageId,
+        sourceRoot,
+        path.join(sourceRoot, relativePath),
+        stagingDirectory
+      );
+      projectFiles.push({
+        ...copied,
+        stagingProjectFile: stagingDirectory ? getModelPackageStagingProjectFile(projectPath, stagingDirectory, copied.relativePath) : undefined,
+        role: getModelPackageFileRole(copied.relativePath, primaryModelFile)
+      });
 
-    if (isModelPackageTextFile(relativePath)) {
-      if (copied.size > modelPackageMaxTextFileBytes) {
-        warnings.push(`${relativePath} 超过 2MB，已复制但未返回文本内容。`);
-        continue;
+      if (isModelPackageTextFile(relativePath)) {
+        if (copied.size > modelPackageMaxTextFileBytes) {
+          warnings.push(`${relativePath} 超过 2MB，已复制但未返回文本内容。`);
+          continue;
+        }
+        if (returnedTextBytes + copied.size > modelPackageMaxReturnedTextBytes) {
+          warnings.push(`${relativePath} 会超过模型包文本返回上限，已复制但未返回文本内容。`);
+          continue;
+        }
+        const textFilePath = stagingDirectory
+          ? path.join(stagingDirectory, relativePath)
+          : getProjectAssetPath(projectPath, copied.projectFile);
+        const text = await fs.readFile(textFilePath, "utf-8");
+        returnedTextBytes += Buffer.byteLength(text, "utf-8");
+        textFiles[relativePath] = text;
       }
-      if (returnedTextBytes + copied.size > modelPackageMaxReturnedTextBytes) {
-        warnings.push(`${relativePath} 会超过模型包文本返回上限，已复制但未返回文本内容。`);
-        continue;
-      }
-      const text = await fs.readFile(getProjectAssetPath(projectPath, copied.projectFile), "utf-8");
-      returnedTextBytes += Buffer.byteLength(text, "utf-8");
-      textFiles[relativePath] = text;
     }
+
+    pendingToken = stagingDirectory ? registerPendingModelPackageReplacement(projectPath, packageId, stagingDirectory) : undefined;
+  } catch (error) {
+    if (stagingDirectory) {
+      await fs.rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
+    throw error;
   }
 
   if (metaFile.toLowerCase() === "meta.js") {
@@ -1092,13 +1446,221 @@ async function importModelPackageDirectory(projectPath: string, sourceRoot: stri
     packageId,
     displayName: path.basename(sourceRoot),
     rootDirectoryName: path.basename(sourceRoot),
+    sourceRoot,
     primaryModelFile,
     scriptFile,
     metaFile,
     projectFiles,
     textFiles,
+    warnings,
+    replacement: replacement
+      ? {
+          ...replacement,
+          pendingToken
+        }
+      : undefined
+  };
+}
+
+/** 刷新已导入模型包的脚本和 meta 文本，不替换 GLB 几何资产。 */
+async function refreshModelPackageTextFiles(
+  projectPath: string,
+  sourceRoot: string,
+  request: ModelPackageRefreshRequest
+): Promise<ModelPackageRefreshResult> {
+  await readProjectManifest(projectPath);
+  if (!isSafeModelPackagePackageId(request.packageId)) {
+    throw new Error("模型包刷新请求缺少合法 packageId。");
+  }
+
+  const absoluteFiles = await readModelPackageDirectory(sourceRoot);
+  const relativeFiles = absoluteFiles.map((file) => path.relative(sourceRoot, file).replace(/\\/g, "/")).sort((left, right) => left.localeCompare(right));
+  const textRelativeFiles = relativeFiles.filter((file) => isModelPackageAllowedFile(file) && isModelPackageTextFile(file));
+  const ignoredFiles = relativeFiles.filter((file) => isModelPackageAllowedFile(file) && !isModelPackageTextFile(file));
+  const warnings = [
+    ...relativeFiles
+      .filter((file) => !isModelPackageAllowedFile(file))
+      .map((file) => `已忽略不支持的模型包文件：${file}`),
+    ...ignoredFiles.map((file) => `刷新模型包只更新脚本和 meta，已保留项目内现有模型文件：${file}`)
+  ];
+
+  const tsFiles = textRelativeFiles.filter((file) => path.extname(file).toLowerCase() === ".ts");
+  const metaFiles = textRelativeFiles.filter((file) => ["meta.json", "meta.js"].includes(path.basename(file).toLowerCase()));
+  if (tsFiles.length === 0) {
+    throw new Error("源模型包缺少 .ts 脚本，无法刷新旧实例。");
+  }
+  if (metaFiles.length === 0) {
+    throw new Error("源模型包缺少 meta.json 或 meta.js，无法刷新旧实例。");
+  }
+  if (metaFiles.length > 1) {
+    warnings.push(`源模型包包含多个 meta 文件，当前版本使用 ${metaFiles.includes("meta.json") ? "meta.json" : metaFiles[0]}。`);
+  }
+
+  let returnedTextBytes = 0;
+  for (const relativePath of textRelativeFiles) {
+    const stats = await fs.stat(path.join(sourceRoot, relativePath));
+    if (stats.size > modelPackageMaxTextFileBytes) {
+      throw new Error(`${relativePath} 超过 2MB，无法安全刷新模型包脚本。`);
+    }
+
+    returnedTextBytes += stats.size;
+    if (returnedTextBytes > modelPackageMaxReturnedTextBytes) {
+      throw new Error("模型包脚本和 meta 文本总量超过 8MB，无法安全刷新旧实例。");
+    }
+  }
+
+  const projectFiles: ModelPackageProjectFile[] = [];
+  const textFiles: Record<string, string> = {};
+  for (const relativePath of textRelativeFiles) {
+    const copied = await copyModelPackageFileToProject(projectPath, request.packageId, sourceRoot, path.join(sourceRoot, relativePath));
+    const role = getModelPackageFileRole(copied.relativePath, "");
+    projectFiles.push({ ...copied, role });
+
+    const text = await fs.readFile(getProjectAssetPath(projectPath, copied.projectFile), "utf-8");
+    textFiles[relativePath] = text;
+  }
+
+  const metaFile = metaFiles.includes("meta.json") ? "meta.json" : metaFiles[0];
+  if (metaFile.toLowerCase() === "meta.js") {
+    warnings.push("meta.js 已复制到项目中，但当前版本不会执行 JavaScript 元数据文件。");
+  }
+
+  return {
+    packageId: request.packageId,
+    rootDirectoryName: path.basename(sourceRoot),
+    sourceRoot,
+    metaFile,
+    projectFiles,
+    textFiles,
     warnings
   };
+}
+
+/** 返回源码项目根目录，发布构建只能在受信的应用根目录执行。 */
+function getAppRootPath(): string {
+  return path.resolve(__dirname, "..");
+}
+
+/** 追加构建日志尾部，避免长日志在主进程内无限累积。 */
+function appendPublishLogTail(current: string, chunk: Buffer | string): string {
+  const next = current + chunk.toString();
+  return next.length > publishLogTailMaxChars ? next.slice(-publishLogTailMaxChars) : next;
+}
+
+/** 格式化 npm build 失败原因，并附带有限长度的最近日志。 */
+function formatPublishBuildFailure(code: number | null, signal: NodeJS.Signals | null, logTail: string): string {
+  const reason = code === null ? `发布构建被中断${signal ? `（${signal}）` : ""}` : `发布构建失败，npm run build 退出码 ${code}`;
+  const trimmedLog = logTail.trim();
+  return trimmedLog ? `${reason}。\n最近日志：\n${trimmedLog}` : `${reason}。`;
+}
+
+/** 返回固定发布命令；Windows 通过 cmd.exe 启动 npm.cmd，规避 Node 直接 spawn .cmd 的 EINVAL。 */
+function getPublishBuildCommand(): PublishBuildCommand {
+  if (process.platform === "win32") {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", "npm.cmd", "run", "build"]
+    };
+  }
+
+  return {
+    command: "npm",
+    args: ["run", "build"]
+  };
+}
+
+/** 执行固定的 npm run build，不允许渲染进程传入命令、参数或目录。 */
+function runNpmBuild(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const buildCommand = getPublishBuildCommand();
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(buildCommand.command, buildCommand.args, {
+        cwd: getAppRootPath(),
+        shell: false,
+        windowsHide: true
+      });
+    } catch (error) {
+      reject(new Error(`启动发布构建失败：${formatUnknownError(error)}`));
+      return;
+    }
+
+    let logTail = "";
+    let settled = false;
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      logTail = appendPublishLogTail(logTail, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      logTail = appendPublishLogTail(logTail, chunk);
+    });
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(new Error(`启动发布构建失败：${formatUnknownError(error)}`));
+    });
+    child.on("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(formatPublishBuildFailure(code, signal, logTail)));
+    });
+  });
+}
+
+/** 校验 dist 目录存在，避免构建失败或产物缺失时误打开旧目录。 */
+async function assertRendererDistExists(): Promise<void> {
+  try {
+    const stat = await fs.stat(rendererDist);
+    if (!stat.isDirectory()) {
+      throw new Error("dist 路径不是目录。");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "dist 路径不是目录。") {
+      throw error;
+    }
+
+    throw new Error(`发布构建完成后未找到 dist 目录：${formatUnknownError(error)}`);
+  }
+}
+
+/** 执行发布构建并打开 dist 目录，同一时间只允许一个发布流程运行。 */
+async function buildAndOpenDist(): Promise<DesktopPublishResult> {
+  if (publishBuildPromise) {
+    throw new Error("发布构建正在进行，请稍后。");
+  }
+
+  publishBuildPromise = (async () => {
+    await runNpmBuild();
+    await assertRendererDistExists();
+    const openError = await shell.openPath(rendererDist);
+    if (openError) {
+      throw new Error(`发布构建成功，但打开 dist 目录失败：${openError}`);
+    }
+
+    return { distPath: rendererDist };
+  })();
+
+  try {
+    return await publishBuildPromise;
+  } finally {
+    publishBuildPromise = null;
+  }
+}
+
+/** 注册发布 IPC，渲染进程只能触发固定发布流程。 */
+function registerPublishIpc(): void {
+  ipcMain.handle("publish:buildAndOpenDist", async (): Promise<DesktopPublishResult> => buildAndOpenDist());
 }
 
 /** 注册项目制应用需要的 IPC，渲染端只能调用受控方法。 */
@@ -1278,7 +1840,7 @@ function registerProjectIpc(): void {
     readLocalReferenceFile(baseFilePath, referencePath)
   );
 
-  ipcMain.handle("projects:importModelPackage", async (_event, projectPath: string) => {
+  ipcMain.handle("projects:importModelPackage", async (_event, projectPath: string, request?: ModelPackageImportRequest) => {
     assertAuthorizedProjectPath(projectPath);
     const options: OpenDialogOptions = {
       title: "选择模型包文件夹",
@@ -1290,7 +1852,47 @@ function registerProjectIpc(): void {
       return null;
     }
 
-    return importModelPackageDirectory(projectPath, result.filePaths[0]);
+    const sourceRoot = await authorizeModelPackageSourceRoot(result.filePaths[0]);
+    const replacement = await findModelPackageReplacement(sourceRoot, readKnownModelPackages(request));
+    return importModelPackageDirectory(projectPath, sourceRoot, replacement);
+  });
+
+  ipcMain.handle("projects:activateModelPackageReplacement", async (_event, projectPath: string, request: ModelPackageReplacementCommitRequest) => {
+    assertAuthorizedProjectPath(projectPath);
+    return activatePendingModelPackageReplacement(projectPath, request);
+  });
+
+  ipcMain.handle("projects:finalizeModelPackageReplacement", async (_event, projectPath: string, request: ModelPackageReplacementCommitRequest) => {
+    assertAuthorizedProjectPath(projectPath);
+    return finalizePendingModelPackageReplacement(projectPath, request);
+  });
+
+  ipcMain.handle("projects:rollbackModelPackageReplacement", async (_event, projectPath: string, request: ModelPackageReplacementCommitRequest) => {
+    assertAuthorizedProjectPath(projectPath);
+    return rollbackPendingModelPackageReplacement(projectPath, request);
+  });
+
+  ipcMain.handle("projects:refreshModelPackage", async (_event, projectPath: string, request: ModelPackageRefreshRequest) => {
+    assertAuthorizedProjectPath(projectPath);
+    const safeRequest = (isRecord(request) ? request : {}) as ModelPackageRefreshRequest;
+    const requestedSourceRoot = typeof safeRequest.sourceRoot === "string" && safeRequest.sourceRoot.trim() ? safeRequest.sourceRoot.trim() : "";
+    const authorizedSourceRoot = requestedSourceRoot ? await getAuthorizedModelPackageSourceRoot(requestedSourceRoot) : null;
+    if (authorizedSourceRoot) {
+      return refreshModelPackageTextFiles(projectPath, authorizedSourceRoot, safeRequest);
+    }
+
+    const options: OpenDialogOptions = {
+      title: "选择要刷新的模型包文件夹",
+      defaultPath: path.join(os.homedir(), "Documents"),
+      properties: ["openDirectory"]
+    };
+    const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) {
+      return null;
+    }
+
+    const sourceRoot = await authorizeModelPackageSourceRoot(result.filePaths[0]);
+    return refreshModelPackageTextFiles(projectPath, sourceRoot, safeRequest);
   });
 }
 
@@ -1298,6 +1900,7 @@ function registerProjectIpc(): void {
 function registerAppLifecycle(): void {
   app.whenReady().then(async () => {
     registerProjectIpc();
+    registerPublishIpc();
     await createMainWindow();
 
     app.on("activate", () => {

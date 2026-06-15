@@ -7,6 +7,7 @@ import "@babylonjs/core/Animations/animatable";
 import "@babylonjs/loaders/glTF";
 import "@babylonjs/loaders/OBJ";
 import "@babylonjs/loaders/STL";
+import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { Camera } from "@babylonjs/core/Cameras/camera";
 import { PointerEventTypes } from "@babylonjs/core/Events/pointerEvents";
@@ -16,6 +17,7 @@ import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { Light } from "@babylonjs/core/Lights/light";
 import { PointLight } from "@babylonjs/core/Lights/pointLight";
+import { GlowLayer } from "@babylonjs/core/Layers/glowLayer";
 import { SelectionOutlineLayer } from "@babylonjs/core/Layers/selectionOutlineLayer";
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
@@ -56,7 +58,12 @@ import {
   invokeModelPackageRuntimeLifecycle,
   type ModelPackageRuntimeInstance
 } from "../editor/modelPackageRuntimeCompiler";
-import { SceneDataDrivenRuntime, type SceneDataDrivenRootMotionFields, type SceneDataDrivenTarget } from "../editor/sceneDataDrivenRuntime";
+import {
+  SceneDataDrivenRuntime,
+  type SceneDataDrivenDropTarget,
+  type SceneDataDrivenRootMotionFields,
+  type SceneDataDrivenTarget
+} from "../editor/sceneDataDrivenRuntime";
 import { SceneBusinessRuntime } from "../editor/sceneBusinessRuntime";
 import {
   parseCadDxfLineStream,
@@ -158,8 +165,33 @@ const GRID_FLASH_MIN_VISIBILITY = 0.32;
 const GRID_FLASH_MAX_VISIBILITY = 1;
 const GRID_FLASH_PULSE_ELEVATION_OFFSET_METERS = 0.026;
 const GRID_FLASH_SWEEP_ELEVATION_OFFSET_METERS = 0.018;
+const GRID_GLOW_TEXTURE_RATIO = 0.35;
+const GRID_GLOW_BLUR_KERNEL_SIZE = 28;
+const GRID_GLOW_MIN_INTENSITY = 0.08;
+const GRID_GLOW_MAX_INTENSITY = 0.68;
+const GRID_GLOW_EMISSIVE_MIN_STRENGTH = 0.55;
+const GRID_GLOW_EMISSIVE_MAX_STRENGTH = 1.85;
 const MAX_MODEL_PACKAGE_RUNTIME_GENERATED_NODES = 5000;
+const MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON = 0.000001;
 const MAX_MODEL_ARRAY_CLONE_COUNT = 50;
+const MODEL_ARRAY_MIN_AUTO_STEP_METERS = 0.000001;
+const OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES = ["GT1", "GT2", "GT3", "GT4", "GT5", "GT6", "GT7", "GT8", "GT9", "GT10"];
+const OPAQUE_ROLLER_CONVEYOR_FRONT_SUPPORT_NODE_NAMES = ["A16", "A7", "A3", "A5", "A17"];
+const OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES = ["A18", "A19", "A4", "A2", "A6"];
+// 图片规则：左侧黄色固定区作为 length 起点，不随长梁伸长移动。
+const OPAQUE_ROLLER_CONVEYOR_LENGTH_FIXED_START_NODE_NAMES = ["A16", "A17", "A7", "A5", "A3", "A9", "A13"];
+// 图片规则：红色区域只拉伸长梁右侧顶点，长梁节点自身不整体平移。
+const OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES = ["A10", "A11"];
+// 图片规则：右侧黄色尾端组件随 length 尾端平移，但不参与后支架显隐开关。
+const OPAQUE_ROLLER_CONVEYOR_LENGTH_TAIL_EXTENSION_NODE_NAMES = ["A12", "A14"];
+const OPAQUE_ROLLER_CONVEYOR_LENGTH_TAIL_FOLLOW_NODE_NAMES = [
+  ...OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES,
+  ...OPAQUE_ROLLER_CONVEYOR_LENGTH_TAIL_EXTENSION_NODE_NAMES
+];
+const OPAQUE_ROLLER_CONVEYOR_WIDTH_SCALE_NODE_NAMES = ["A1", "A2", "A3", "A21"];
+const OPAQUE_ROLLER_CONVEYOR_HEIGHT_SCALE_NODE_NAMES = ["A4", "A5", "A6", "A7"];
+const OPAQUE_ROLLER_CONVEYOR_GROUND_NODE_NAMES = ["A16", "A17", "A18", "A19"];
+const OPAQUE_ROLLER_CONVEYOR_BOTTOM_FIXED_NODE_NAMES = ["A2", "A3", ...OPAQUE_ROLLER_CONVEYOR_GROUND_NODE_NAMES];
 const CAD_LINE_ELEVATION_METERS = GRID_RENDER_ELEVATION_METERS + 0.045;
 const CAD_LINE_CHUNK_SEGMENTS = 32000;
 const CAD_LINE_PACK_MAX_BYTES = 20 * 1024 * 1024;
@@ -502,9 +534,79 @@ interface ModelPackageEditableStateSnapshot {
   position: Vector3;
   rotation: Vector3;
   rotationQuaternion: Quaternion | null;
+  /** 用户通过编辑器设置的根缩放，不包含运行脚本按参数计算出的尺寸缩放。 */
   scaling: Vector3;
+  /** 运行脚本上一次应用在根节点上的参数化缩放，用于和用户缩放相乘恢复最终视口效果。 */
+  parametricRootScaling: Vector3;
   modelPackageInstance: Record<string, unknown>;
   values: Record<string, DynamicParameterValue>;
+}
+
+/** 模型包 runtime 执行期临时写入的 metadata 标记，生命周期结束后必须恢复。 */
+interface ModelPackageRuntimeTemporaryMetadataFlag {
+  node: TransformNode;
+  hadGeneratedFlag: boolean;
+  generatedFlagValue: unknown;
+}
+
+/** 当前 opaque 辊道机 GLB 的节点基线，用于参数变化时恢复后再做部件级调整。 */
+interface OpaqueRollerConveyorNodeBaseline {
+  position: Vector3;
+  scaling: Vector3;
+  rotation: Vector3;
+  rotationQuaternion: Quaternion | null;
+  enabled?: boolean;
+  center: Vector3;
+  size: Vector3;
+  /** 当前 GLB 的长梁 pivot 离几何中心很远，长度调整必须基于原始顶点而不是节点 scaling。 */
+  positionVertices?: number[];
+}
+
+/** opaque 辊道机整体基线尺寸，坐标均为模型根节点本地坐标。 */
+interface OpaqueRollerConveyorBaseline {
+  nodes: Map<string, OpaqueRollerConveyorNodeBaseline>;
+  minimum: Vector3;
+  maximum: Vector3;
+  size: Vector3;
+  rollerBaseWidth: number;
+  rollerMarginStart: number;
+  rollerMarginEnd: number;
+}
+
+/** opaque 辊道机在根节点本地轴上的有效区间。 */
+interface OpaqueRollerConveyorAxisRange {
+  start: number;
+  end: number;
+}
+
+/** opaque 辊道机长梁尾端参考点，用于让右端组件跟随真实长梁尾端而不是固定增量方向。 */
+interface OpaqueRollerConveyorLengthTailReference {
+  baselineTailX: number;
+  currentTailX: number;
+}
+
+/** 模型包实例替换前保留的根级编辑状态，确保重载 GLB 后不丢用户场景布置。 */
+interface ModelPackageInstanceReplacementSnapshot {
+  root: TransformNode;
+  parent: Node | null;
+  editorMetadata: Record<string, unknown>;
+  editableState: ModelPackageEditableStateSnapshot;
+  visible: boolean;
+  selected: boolean;
+  primarySelected: boolean;
+}
+
+/** 已创建但尚未提交的模型包实例替换节点。 */
+interface PreparedModelPackageReplacement {
+  snapshot: ModelPackageInstanceReplacementSnapshot;
+  replacementRoot: TransformNode;
+}
+
+/** 替换模型包时临时导入的新模板层级，包含 Babylon 自动挂到 scene 的动画组。 */
+interface ModelPackageReplacementTemplate {
+  root: TransformNode;
+  unitMetadata: ModelUnitMetadata;
+  animationGroups: AnimationGroup[];
 }
 
 /** 管理 Babylon.js 运行时、编辑器交互、资产导入与场景序列化。 */
@@ -516,6 +618,7 @@ export class BabylonEditorEngine {
   private readonly editorCamera: ArcRotateCamera;
   private readonly gizmoManager: GizmoManager;
   private readonly selectionOutlineLayer: SelectionOutlineLayer;
+  private readonly gridGlowLayer: GlowLayer;
   private readonly assets: AssetRecord[] = [];
   private readonly assetFiles = new Map<string, File>();
   private readonly assetDependencyFiles = new Map<string, File[]>();
@@ -554,6 +657,9 @@ export class BabylonEditorEngine {
   private readonly gridVisualMeshes: AbstractMesh[] = [];
   private readonly gridFlashPulseMeshes: AbstractMesh[] = [];
   private readonly gridFlashSweepMeshes: AbstractMesh[] = [];
+  private readonly gridGlowMeshes: Mesh[] = [];
+  private readonly gridGlowColors = new Map<number, Color3>();
+  private gridGlowPulse = 0;
   private readonly observedTransformGizmos = new WeakSet<object>();
   private readonly handleResize = () => this.resize();
   private readonly handleWebglContextLost = (event: Event) => {
@@ -595,12 +701,14 @@ export class BabylonEditorEngine {
     });
     this.selectionOutlineLayer.outlineColor = Color3.FromHexString(SELECTION_OUTLINE_COLOR);
     this.selectionOutlineLayer.outlineThickness = SELECTION_OUTLINE_THICKNESS;
+    this.gridGlowLayer = this.createGridGlowLayer();
 
     this.configureGizmos();
     this.sceneDataDrivenRuntime = new SceneDataDrivenRuntime({
       scene: this.scene,
       getConfig: () => this.createSceneInspectorSnapshot().dataDriven,
       getTargets: () => this.createSceneDataDrivenTargets(),
+      getDropTargets: () => this.createSceneDataDrivenDropTargets(),
       onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now),
       onConnectionStatusChanged: (status) => this.callbacks.onDataConnectionStatusChange(status)
     });
@@ -648,7 +756,9 @@ export class BabylonEditorEngine {
     this.disposeClipboardTemplate();
     this.clearRegisteredLocalImportFiles();
     this.selectionOutlineLayer.clearSelection();
+    this.clearGridGlowMeshes();
     this.sceneInstrumentation.dispose();
+    this.gridGlowLayer.dispose();
     this.selectionOutlineLayer.dispose();
     this.gizmoManager.dispose();
     this.scene.dispose();
@@ -678,6 +788,7 @@ export class BabylonEditorEngine {
   public setPerformanceMode(enabled: boolean): void {
     this.performanceMode = enabled;
     this.applyRenderQuality();
+    this.updateGridGlow(this.gridGlowPulse);
     this.scene.skipPointerMovePicking = enabled;
     this.callbacks.onStatsChange(this.collectStats());
   }
@@ -993,6 +1104,60 @@ export class BabylonEditorEngine {
 
     this.scene.rootNodes.forEach(visit);
     return [...targets.values()];
+  }
+
+  /** 收集可作为 Stacker 放货目标的定位框；只要求填写资产编号，不要求启用动画连接。 */
+  private createSceneDataDrivenDropTargets(): SceneDataDrivenDropTarget[] {
+    const targets = new Map<number, SceneDataDrivenDropTarget>();
+    const visit = (node: Node): void => {
+      if (node.metadata?.[HELPER_FLAG]) {
+        return;
+      }
+
+      if (node instanceof TransformNode && this.isLocatorWireCubeNode(node) && this.isSceneGraphDisplayNode(node)) {
+        const dropTarget = this.createLocatorSceneDataDrivenDropTarget(node);
+        if (dropTarget) {
+          targets.set(node.uniqueId, dropTarget);
+        }
+        return;
+      }
+
+      this.getVisibleChildren(node).forEach(visit);
+    };
+
+    this.scene.rootNodes.forEach(visit);
+    return [...targets.values()];
+  }
+
+  /** 将定位框资产编号转换成放货目标匹配字段。 */
+  private createLocatorSceneDataDrivenDropTarget(root: TransformNode): SceneDataDrivenDropTarget | null {
+    const connection = this.getLocatorAnimationConnection(root);
+    const assetCode = this.getLocatorDropTargetAssetCode(root, connection);
+    if (!assetCode) {
+      return null;
+    }
+
+    const assetCodeField = connection.assetCodeField.trim() || DEFAULT_LOCATOR_ANIMATION_CONNECTION.assetCodeField;
+    return {
+      root,
+      matchFields: {
+        [assetCodeField]: assetCode,
+        assetCode,
+        locatorAssetCode: assetCode,
+        name: root.name,
+        uniqueId: String(root.uniqueId)
+      }
+    };
+  }
+
+  /** 读取定位框放货目标编号；优先使用通用资产编号，旧场景兜底兼容动画连接里的绑定设备。 */
+  private getLocatorDropTargetAssetCode(root: TransformNode, connection: LocatorAnimationConnectionSnapshot): string {
+    const assetCode = this.getNodeAssetInfo(root).assetCode.trim();
+    if (assetCode) {
+      return assetCode;
+    }
+
+    return connection.assetCode.trim();
   }
 
   /** 定位框只有显式启用并配置设备号时才作为数据驱动接收端，避免视觉参考框被误驱动。 */
@@ -1328,6 +1493,7 @@ export class BabylonEditorEngine {
     }
 
     this.selectedNode = node;
+    this.ensureMoveToolForTransformSelection(node);
     this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
@@ -1560,7 +1726,7 @@ export class BabylonEditorEngine {
     }
     const template = this.cloneEditableNode(sourceNode, `__editor_clipboard_${sourceNode.uniqueId}__`);
     if (sourceModelPackage) {
-      this.applyModelPackageRuntime(sourcePackageRoot, sourceModelPackage, "clone");
+      this.applyModelPackageRuntimeWithDynamicFallbacks(sourcePackageRoot, sourceModelPackage, "clone");
     }
     if (!template) {
       return false;
@@ -1598,7 +1764,7 @@ export class BabylonEditorEngine {
     pastedNode.position.addInPlace(this.clipboardPasteOffset.scale(this.clipboardPasteCount));
     const pastedModelPackage = this.getModelPackageAssetForRoot(pastedNode)?.modelPackage;
     if (pastedModelPackage) {
-      this.applyModelPackageRuntime(pastedNode, pastedModelPackage, "clone");
+      this.applyModelPackageRuntimeWithDynamicFallbacks(pastedNode, pastedModelPackage, "clone");
     }
     this.refreshNodeWorldMatrices(pastedNode);
     this.ensureNodeGridCoverage(pastedNode);
@@ -1639,6 +1805,15 @@ export class BabylonEditorEngine {
     return this.createTransformSnapshot(targetRoot);
   }
 
+  /** 判断指定节点是否能创建模型阵列，供 UI 菜单直接复用引擎兜底规则。 */
+  public canCreateModelArrayForId(targetId: number): boolean {
+    if (this.previewMode) {
+      return false;
+    }
+
+    return Boolean(this.getModelArrayTargetRoot(this.findTransformNodeByUniqueId(targetId)));
+  }
+
   /** 沿地面 X/Z 轴批量克隆指定模型，生成的副本是普通可编辑场景节点。 */
   public createModelArray(options: ModelArrayOptions): ModelArrayResult {
     if (this.previewMode) {
@@ -1653,10 +1828,6 @@ export class BabylonEditorEngine {
       cloneCount > MAX_MODEL_ARRAY_CLONE_COUNT
     ) {
       return this.createModelArrayFailure(`克隆数量必须是 1-${MAX_MODEL_ARRAY_CLONE_COUNT} 之间的整数。`);
-    }
-
-    if (!Number.isFinite(options.spacing) || options.spacing <= 0) {
-      return this.createModelArrayFailure("阵列间距必须是大于 0 的米制数值。");
     }
 
     const sourceRoot = this.getModelArrayTargetRoot(this.findTransformNodeByUniqueId(options.targetId));
@@ -1674,6 +1845,18 @@ export class BabylonEditorEngine {
     if (!direction) {
       return this.createModelArrayFailure("阵列轴向必须是 X、-X、Z 或 -Z。");
     }
+    this.refreshNodeWorldMatrices(sourceRoot);
+    const sourceBounds = this.getNodeWorldBounds(sourceRoot);
+    if (!sourceBounds) {
+      return this.createModelArrayFailure("当前模型没有可用于自动贴边阵列的可渲染包围盒。");
+    }
+
+    const autoStep = options.axis === "x" || options.axis === "-x" ? sourceBounds.size.x : sourceBounds.size.z;
+    if (!Number.isFinite(autoStep) || autoStep <= MODEL_ARRAY_MIN_AUTO_STEP_METERS) {
+      const axisLabel = options.axis === "x" || options.axis === "-x" ? "X" : "Z";
+      return this.createModelArrayFailure(`当前模型在 ${axisLabel} 方向尺寸过小，无法自动贴边阵列。`);
+    }
+
     const sourceParent = sourceRoot.parent instanceof TransformNode ? sourceRoot.parent : null;
     const sourceModelPackage = this.getModelPackageAssetForRoot(sourceRoot)?.modelPackage;
     const usedAssetCodes = this.collectSceneAssetCodes();
@@ -1698,7 +1881,7 @@ export class BabylonEditorEngine {
         this.prepareClonedHierarchy(clone, sourceRoot, false);
         clone.name = cloneName;
         clone.setEnabled(true);
-        const worldOffset = direction.scale(options.spacing * index);
+        const worldOffset = direction.scale(autoStep * index);
         clone.position.addInPlace(this.worldDeltaToParentLocalDelta(clone, worldOffset));
         if (sourceAssetCode) {
           this.updateNodeAssetInfo(clone, {
@@ -1709,7 +1892,7 @@ export class BabylonEditorEngine {
         clones.push(clone);
         const cloneModelPackage = this.getModelPackageAssetForRoot(clone)?.modelPackage;
         if (cloneModelPackage) {
-          this.applyModelPackageRuntime(clone, cloneModelPackage, "clone");
+          this.applyModelPackageRuntimeWithDynamicFallbacks(clone, cloneModelPackage, "clone");
         }
         this.refreshNodeWorldMatrices(clone);
         this.ensureNodeGridCoverage(clone);
@@ -1717,7 +1900,7 @@ export class BabylonEditorEngine {
     } catch (error) {
       clones.forEach((clone) => this.disposeClonedNodeHierarchy(clone));
       if (sourceRuntimeStopped && sourceModelPackage) {
-        this.applyModelPackageRuntime(sourceRoot, sourceModelPackage, "clone");
+        this.applyModelPackageRuntimeWithDynamicFallbacks(sourceRoot, sourceModelPackage, "clone");
       }
       this.refreshSceneGraph();
       this.scene.render();
@@ -1725,7 +1908,7 @@ export class BabylonEditorEngine {
     }
 
     if (sourceRuntimeStopped && sourceModelPackage) {
-      this.applyModelPackageRuntime(sourceRoot, sourceModelPackage, "clone");
+      this.applyModelPackageRuntimeWithDynamicFallbacks(sourceRoot, sourceModelPackage, "clone");
     }
 
     const selectedClone = clones[clones.length - 1];
@@ -1858,13 +2041,163 @@ export class BabylonEditorEngine {
     this.modelPackageScriptTexts.set(packageId, normalizedTexts);
   }
 
+  /** 替换模型包脚本文本缓存，刷新旧实例时避免已删除或改名的旧脚本残留。 */
+  public replaceModelPackageScriptTexts(packageId: string, textFiles: Record<string, string>): void {
+    const normalizedTexts = new Map<string, string>();
+    Object.entries(textFiles).forEach(([relativePath, text]) => {
+      normalizedTexts.set(this.normalizeModelPackageRelativePath(relativePath), text);
+    });
+    this.modelPackageScriptTexts.set(packageId, normalizedTexts);
+  }
+
+  /** 刷新已导入模型包资产的脚本和 manifest，并立即重跑当前场景中的同包实例。 */
+  public refreshModelPackageAsset(assetId: string, manifest: ModelPackageManifest, textFiles: Record<string, string>): boolean {
+    const asset = this.assets.find((item) => item.id === assetId && item.modelPackage?.packageId === manifest.packageId);
+    if (!asset) {
+      return false;
+    }
+
+    this.replaceModelPackageScriptTexts(manifest.packageId, textFiles);
+    asset.modelPackage = manifest;
+    asset.name = manifest.displayName;
+    asset.projectFiles = [...new Set([asset.projectFile, ...manifest.files.map((file) => file.projectFile)].filter((file): file is string => Boolean(file)))];
+
+    this.getSceneModelPackageRoots().forEach((root) => {
+      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
+      if (instance.assetId !== assetId || instance.packageId !== manifest.packageId) {
+        return;
+      }
+
+      this.stopModelPackageRuntime(root, false);
+      const values = this.getModelPackageValues(root, manifest);
+      this.applyModelPackageRuntimeWithDynamicFallbacks(root, manifest, "load", values);
+    });
+
+    this.callbacks.onAssetsChange([...this.assets]);
+    this.refreshSceneGraph();
+    this.emitSelectionSnapshot();
+    this.scene.render();
+    return true;
+  }
+
+  /** 替换已导入模型包的完整资产，并用更新后的模型层级重建当前场景中的同包实例。 */
+  public async replaceModelPackageAsset(
+    assetId: string,
+    files: File[],
+    manifest: ModelPackageManifest,
+    textFiles: Record<string, string>
+  ): Promise<boolean> {
+    const asset = this.assets.find((item) => item.id === assetId && item.modelPackage?.packageId === manifest.packageId);
+    if (!asset) {
+      return false;
+    }
+
+    const primaryFile = this.getModelPackagePrimaryFile(files, manifest);
+    const extension = this.getFileExtension(primaryFile.name);
+    if (!this.isSceneFile(extension)) {
+      throw new Error(`模型包主文件不是可导入模型：${primaryFile.name}`);
+    }
+
+    const projectFileMap = new Map<string, ModelPackageProjectFile>();
+    manifest.files.forEach((file) => projectFileMap.set(file.relativePath, file));
+    const primaryProjectFile = projectFileMap.get(manifest.primaryModelFile)?.projectFile;
+    const projectFiles = manifest.files.map((file) => file.projectFile);
+    this.registerFilesForLocalImport(files);
+    const preparedTemplate = await this.importSceneFileAsReplacementTemplate(primaryFile, extension);
+    if (!preparedTemplate) {
+      return false;
+    }
+
+    const matchingRoots = this.getSceneModelPackageRoots().filter((root) => {
+      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
+      return instance.assetId === assetId && instance.packageId === manifest.packageId;
+    });
+    const snapshots = matchingRoots.map((root) => this.captureModelPackageReplacementSnapshot(root, assetId, manifest));
+    const preparedReplacements: PreparedModelPackageReplacement[] = [];
+    const hadPreviousScriptTexts = this.modelPackageScriptTexts.has(manifest.packageId);
+    const previousScriptTexts = new Map(this.modelPackageScriptTexts.get(manifest.packageId) ?? []);
+    const previousAssetFile = this.assetFiles.get(assetId);
+    const previousDependencyFiles = this.assetDependencyFiles.get(assetId);
+    const previousAsset = { ...asset };
+
+    try {
+      for (const snapshot of snapshots) {
+        const replacementRoot = this.createModelPackageReplacementRoot(preparedTemplate.root, snapshot);
+        preparedReplacements.push({ snapshot, replacementRoot });
+      }
+
+      this.replaceModelPackageScriptTexts(manifest.packageId, textFiles);
+      const nextSelectedRoots: TransformNode[] = [];
+      let nextPrimarySelectedRoot: TransformNode | null = null;
+      preparedReplacements.forEach(({ snapshot, replacementRoot }) => {
+        replacementRoot.setEnabled(true);
+        this.syncModelPackageScriptMetadata(replacementRoot, manifest, snapshot.editableState.values);
+        this.applyModelPackageRuntimeWithDynamicFallbacks(replacementRoot, manifest, "load", snapshot.editableState.values);
+        this.updateNodeVisibility(replacementRoot, snapshot.visible);
+        this.refreshNodeWorldMatrices(replacementRoot);
+        this.ensureNodeGridCoverage(replacementRoot);
+        if (snapshot.selected) {
+          nextSelectedRoots.push(replacementRoot);
+        }
+        if (snapshot.primarySelected) {
+          nextPrimarySelectedRoot = replacementRoot;
+        }
+      });
+      preparedReplacements.forEach(({ snapshot }) => this.disposeEditableNode(snapshot.root));
+
+      this.assetFiles.set(assetId, primaryFile);
+      this.assetDependencyFiles.set(assetId, this.dedupeFiles([primaryFile, ...files]));
+      asset.name = manifest.displayName;
+      asset.sizeLabel = formatBytes(primaryFile.size);
+      asset.projectFile = primaryProjectFile;
+      asset.projectFiles = [...new Set(projectFiles)];
+      asset.sourceAvailable = true;
+      asset.modelPackage = manifest;
+      Object.assign(asset, this.createAssetUnitFields(preparedTemplate.unitMetadata));
+
+      this.disposeModelPackageReplacementTemplate(preparedTemplate);
+      this.callbacks.onAssetsChange([...this.assets]);
+      if (nextSelectedRoots.length > 0) {
+        this.setSelection(nextSelectedRoots, nextPrimarySelectedRoot ?? nextSelectedRoots[0]);
+      } else if (this.selectedNode && this.findSceneNodeByUniqueId(this.selectedNode.uniqueId)) {
+        this.emitSelectionSnapshot();
+        this.refreshSceneGraph();
+      } else {
+        this.selectNode(null);
+      }
+      this.callbacks.onStatsChange(this.collectStats());
+      this.scene.render();
+      return true;
+    } catch (error) {
+      preparedReplacements.forEach(({ replacementRoot }) => this.disposeEditableNode(replacementRoot));
+      this.disposeModelPackageReplacementTemplate(preparedTemplate);
+      if (hadPreviousScriptTexts) {
+        this.modelPackageScriptTexts.set(manifest.packageId, previousScriptTexts);
+      } else {
+        this.modelPackageScriptTexts.delete(manifest.packageId);
+      }
+      if (previousAssetFile) {
+        this.assetFiles.set(assetId, previousAssetFile);
+      } else {
+        this.assetFiles.delete(assetId);
+      }
+      if (previousDependencyFiles) {
+        this.assetDependencyFiles.set(assetId, previousDependencyFiles);
+      } else {
+        this.assetDependencyFiles.delete(assetId);
+      }
+      Object.assign(asset, previousAsset);
+      throw error;
+    }
+  }
+
   /** 项目重新打开并恢复脚本文本后，初始化场景里已有模型包实例的运行器。 */
   public initializeModelPackageRuntimesForScene(): void {
     this.getSceneModelPackageRoots().forEach((root) => {
       const asset = this.getModelPackageAssetForRoot(root);
       if (asset?.modelPackage) {
-        this.syncModelPackageScriptMetadata(root, asset.modelPackage, this.getModelPackageValues(root, asset.modelPackage));
-        this.applyModelPackageRuntime(root, asset.modelPackage, "load");
+        const values = this.getModelPackageValues(root, asset.modelPackage);
+        this.applyModelPackageRuntimeWithDynamicFallbacks(root, asset.modelPackage, "load", values);
       }
     });
     this.refreshSceneGraph();
@@ -1905,13 +2238,15 @@ export class BabylonEditorEngine {
       return false;
     }
 
-    const clonedNode = this.instantiateAssetFromSceneTemplate(asset, position);
+    const file = this.assetFiles.get(assetId);
+    const clonedNode = asset.modelPackage && file
+      ? null
+      : this.instantiateAssetFromSceneTemplate(asset, position);
     if (clonedNode) {
       this.callbacks.onStatsChange(this.collectStats());
       return true;
     }
 
-    const file = this.assetFiles.get(assetId);
     if (!file) {
       return false;
     }
@@ -1929,7 +2264,12 @@ export class BabylonEditorEngine {
 
     if (asset.modelPackage) {
       this.attachModelPackageMetadata(prepared.root, asset.id, asset.modelPackage);
-      this.applyModelPackageRuntime(prepared.root, asset.modelPackage, "import");
+      this.applyModelPackageRuntimeWithDynamicFallbacks(
+        prepared.root,
+        asset.modelPackage,
+        "import",
+        this.getModelPackageValues(prepared.root, asset.modelPackage)
+      );
       this.emitSelectionSnapshot();
     }
 
@@ -1994,10 +2334,146 @@ export class BabylonEditorEngine {
 
     const asset = this.registerModelPackageAsset(primaryFile, manifest, primaryProjectFile, projectFiles, prepared.unitMetadata, files);
     this.attachModelPackageMetadata(prepared.root, asset.id, manifest);
-    this.applyModelPackageRuntime(prepared.root, manifest, "import");
+    this.applyModelPackageRuntimeWithDynamicFallbacks(prepared.root, manifest, "import", this.getModelPackageValues(prepared.root, manifest));
     this.emitSelectionSnapshot();
     this.callbacks.onAssetsChange([...this.assets]);
     this.refreshSceneGraph();
+  }
+
+  /** 从项目文件缓存中定位模型包主模型文件，文件名和包内相对路径都兼容。 */
+  private getModelPackagePrimaryFile(files: File[], manifest: ModelPackageManifest): File {
+    const primaryFileName = manifest.primaryModelFile.split(/[\\/]/).pop() ?? manifest.primaryModelFile;
+    const primaryFile = files.find((file) => file.name === primaryFileName || file.name === manifest.primaryModelFile);
+    if (!primaryFile) {
+      throw new Error(`模型包缺少主模型文件：${manifest.primaryModelFile}`);
+    }
+    return primaryFile;
+  }
+
+  /** 导入新模型包主模型作为临时模板；模板不参与选择、序列化或资产登记。 */
+  private async importSceneFileAsReplacementTemplate(
+    file: File,
+    extension: string
+  ): Promise<ModelPackageReplacementTemplate | null> {
+    const result = await ImportMeshAsync(file, this.scene, {
+      meshNames: null,
+      pluginExtension: extension,
+      name: file.name
+    });
+    const prepared = this.prepareImportedNodes(file.name, extension, result.meshes, result.transformNodes, Vector3.Zero());
+    if (!prepared) {
+      result.animationGroups?.forEach((group) => group.dispose());
+      return null;
+    }
+
+    this.markModelPackageReplacementTemplate(prepared.root);
+    return {
+      ...prepared,
+      animationGroups: result.animationGroups ?? []
+    };
+  }
+
+  /** 释放模型包替换模板及其导入时临时注册到场景的动画组，避免模板资源残留。 */
+  private disposeModelPackageReplacementTemplate(template: ModelPackageReplacementTemplate): void {
+    template.animationGroups.forEach((group) => group.dispose());
+    this.disposeEditableNode(template.root);
+  }
+
+  /** 把临时模板整棵树标记为 helper，避免替换过程中被保存、拾取或展示。 */
+  private markModelPackageReplacementTemplate(root: TransformNode): void {
+    this.getNodeHierarchy(root).forEach((node) => {
+      node.doNotSerialize = true;
+      node.metadata = {
+        ...this.asMetadataObject(node.metadata),
+        [HELPER_FLAG]: true
+      };
+      if (node instanceof AbstractMesh) {
+        node.isPickable = false;
+      }
+    });
+    root.setEnabled(false);
+  }
+
+  /** 捕获旧模型包实例的根级状态，并按新 manifest 过滤动态参数。 */
+  private captureModelPackageReplacementSnapshot(
+    root: TransformNode,
+    assetId: string,
+    manifest: ModelPackageManifest
+  ): ModelPackageInstanceReplacementSnapshot {
+    const values = this.getModelPackageReplacementValues(root, manifest);
+    const editableState = this.captureModelPackageEditableState(root, values);
+    editableState.modelPackageInstance = {
+      ...this.asMetadataObject(editableState.modelPackageInstance),
+      packageId: manifest.packageId,
+      assetId,
+      values: this.cloneDynamicParameterValues(values)
+    };
+    editableState.values = this.cloneDynamicParameterValues(values);
+    const hierarchy = this.getNodeHierarchy(root);
+    const selected = hierarchy.some((node) => this.selectedNodeIds.has(node.uniqueId));
+
+    return {
+      root,
+      parent: root.parent,
+      editorMetadata: this.deepCloneMetadata(this.getNodeEditorMetadata(root)),
+      editableState,
+      visible: this.getNodeVisibility(root),
+      selected,
+      primarySelected: Boolean(this.selectedNode && hierarchy.some((node) => node.uniqueId === this.selectedNode?.uniqueId))
+    };
+  }
+
+  /** 从新模板克隆一个替换根节点，并恢复旧实例根级编辑状态。 */
+  private createModelPackageReplacementRoot(
+    templateRoot: TransformNode,
+    snapshot: ModelPackageInstanceReplacementSnapshot
+  ): TransformNode {
+    const replacementRoot = templateRoot.clone(snapshot.editableState.name, null, false);
+    if (!(replacementRoot instanceof TransformNode)) {
+      throw new Error("模型包替换失败：新模型模板无法克隆。");
+    }
+
+    this.prepareClonedHierarchy(replacementRoot, templateRoot, false);
+    replacementRoot.setEnabled(false);
+    replacementRoot.setParent(snapshot.parent);
+    this.applyModelPackageReplacementEditorMetadata(replacementRoot, snapshot);
+    this.restoreModelPackageEditableState(replacementRoot, snapshot.editableState);
+    return replacementRoot;
+  }
+
+  /** 把旧根节点 editor metadata 合并到新模型根，保留资产编号、锁定等编辑器状态。 */
+  private applyModelPackageReplacementEditorMetadata(
+    root: TransformNode,
+    snapshot: ModelPackageInstanceReplacementSnapshot
+  ): void {
+    const metadata = this.asMetadataObject(root.metadata);
+    const runtimeMetadata = { ...this.asMetadataObject(snapshot.editorMetadata.modelPackageRuntime) };
+    this.clearOpaqueRollerConveyorRuntimeMetadata(runtimeMetadata);
+    root.metadata = {
+      ...metadata,
+      [ROOT_FLAG]: true,
+      editor: {
+        ...snapshot.editorMetadata,
+        modelPackageInstance: {
+          ...snapshot.editableState.modelPackageInstance,
+          values: this.cloneDynamicParameterValues(snapshot.editableState.values)
+        },
+        modelPackageRuntime: {
+          ...runtimeMetadata,
+          warning: ""
+        }
+      }
+    };
+  }
+
+  /** 生成替换实例的参数值：保留同名兼容字段，新字段走默认值，旧字段被丢弃。 */
+  private getModelPackageReplacementValues(root: TransformNode, manifest: ModelPackageManifest): Record<string, DynamicParameterValue> {
+    const editorMetadata = this.getNodeEditorMetadata(root);
+    const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
+    return {
+      ...this.createInitialDynamicParameterValues(manifest),
+      ...this.normalizeDynamicParameterValueMap(this.asMetadataObject(instance.values), manifest.dynamicFields, false)
+    };
   }
 
   /** 从工具栏导入 DXF CAD 图纸，Worker 会把图纸源单位统一换算成米制二进制线段 chunk。 */
@@ -3932,10 +4408,14 @@ export class BabylonEditorEngine {
     }
 
     if (transformEditable && update.meshVertexModify) {
-      this.updateNodeMeshVertexModify(node, update.meshVertexModify);
+      const meshVertexModify = this.updateNodeMeshVertexModify(node, update.meshVertexModify);
+      if (update.meshVertexModify.rollerDensity !== undefined) {
+        this.applyMeshVertexModifyRuntime(node, meshVertexModify);
+      }
       if (update.meshVertexModify.mainColor && !this.isCadDrawingNode(node)) {
         this.updateNodeMaterialColor(node, update.meshVertexModify.mainColor);
       }
+      graphDirty = true;
     }
 
     if (transformEditable && update.assetInfo) {
@@ -3943,8 +4423,7 @@ export class BabylonEditorEngine {
     }
 
     if (transformEditable && update.dynamicParameter) {
-      this.updateNodeDynamicParameter(node, update.dynamicParameter);
-      graphDirty = true;
+      graphDirty = this.updateNodeDynamicParameter(node, update.dynamicParameter) || graphDirty;
     }
 
     if (transformEditable && update.poi && this.isPoiNode(node)) {
@@ -3970,7 +4449,8 @@ export class BabylonEditorEngine {
     );
     camera.metadata = { [HELPER_FLAG]: true };
     camera.doNotSerialize = true;
-    camera.lowerRadiusLimit = 2;
+    // 不设置最近半径限制，允许滚轮贴近并穿过模型观察内部结构。
+    camera.lowerRadiusLimit = null;
     camera.upperRadiusLimit = DEFAULT_CAMERA_FAR_CLIP_METERS;
     camera.wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
     camera.panningSensibility = DEFAULT_CAMERA_PANNING_SENSIBILITY;
@@ -5202,6 +5682,59 @@ export class BabylonEditorEngine {
     return selectedNode;
   }
 
+  /** 创建只作用于工作网格闪光层的专用光晕，避免污染模型、CAD 和选中描边。 */
+  private createGridGlowLayer(): GlowLayer {
+    const glowLayer = new GlowLayer("编辑网格光晕层", this.scene, {
+      mainTextureRatio: GRID_GLOW_TEXTURE_RATIO,
+      mainTextureSamples: 1,
+      blurKernelSize: GRID_GLOW_BLUR_KERNEL_SIZE,
+      excludeByDefault: true
+    });
+    glowLayer.intensity = 0;
+    glowLayer.isEnabled = false;
+    glowLayer.customEmissiveColorSelector = (mesh, _subMesh, _material, result) => {
+      const color = this.gridGlowColors.get(mesh.uniqueId) ?? Color3.White();
+      const strength =
+        GRID_GLOW_EMISSIVE_MIN_STRENGTH +
+        (GRID_GLOW_EMISSIVE_MAX_STRENGTH - GRID_GLOW_EMISSIVE_MIN_STRENGTH) * this.gridGlowPulse;
+      result.set(color.r * strength, color.g * strength, color.b * strength, 1);
+    };
+    return glowLayer;
+  }
+
+  /** 注册参与光晕后处理的网格闪光层，并记录它在光晕贴图中的发光颜色。 */
+  private registerGridGlowMesh(mesh: AbstractMesh, color: Color4): void {
+    if (!(mesh instanceof Mesh)) {
+      return;
+    }
+
+    this.gridGlowMeshes.push(mesh);
+    this.gridGlowColors.set(mesh.uniqueId, new Color3(color.r, color.g, color.b));
+    this.gridGlowLayer.addIncludedOnlyMesh(mesh);
+  }
+
+  /** 清理动态网格重建前的 GlowLayer include 列表，避免旧 mesh uniqueId 残留。 */
+  private clearGridGlowMeshes(): void {
+    this.gridGlowMeshes.forEach((mesh) => {
+      this.gridGlowLayer.removeIncludedOnlyMesh(mesh);
+    });
+    this.gridGlowMeshes.length = 0;
+    this.gridGlowColors.clear();
+    this.gridGlowPulse = 0;
+    this.gridGlowLayer.intensity = 0;
+    this.gridGlowLayer.isEnabled = false;
+  }
+
+  /** 按当前呼吸相位同步光晕强度；性能预览模式下关闭后处理，仅保留线段呼吸。 */
+  private updateGridGlow(pulse: number): void {
+    const hasGlowMeshes = this.gridGlowMeshes.some((mesh) => !mesh.isDisposed());
+    this.gridGlowPulse = this.performanceMode || !hasGlowMeshes ? 0 : pulse;
+    this.gridGlowLayer.isEnabled = !this.performanceMode && hasGlowMeshes;
+    this.gridGlowLayer.intensity = this.gridGlowLayer.isEnabled
+      ? GRID_GLOW_MIN_INTENSITY + (GRID_GLOW_MAX_INTENSITY - GRID_GLOW_MIN_INTENSITY) * pulse
+      : 0;
+  }
+
   /** 创建随相机动态覆盖的线段工作网格和透明拖放平面，避免视口看到固定边界。 */
   private createGridHelper(
     sizeMeters = EDITOR_GRID_SIZE_METERS,
@@ -5274,6 +5807,7 @@ export class BabylonEditorEngine {
 
   /** 释放旧网格辅助对象，供导入超大模型后重建更大参考网格。 */
   private disposeGridHelper(): void {
+    this.clearGridGlowMeshes();
     const materials = new Set(this.gridHelperMeshes.map((mesh) => mesh.material).filter(Boolean));
     this.gridHelperMeshes.forEach((mesh) => mesh.dispose());
     materials.forEach((material) => material?.dispose());
@@ -5325,6 +5859,7 @@ export class BabylonEditorEngine {
     }
     this.gridHelperMeshes.push(pulseLineSystem);
     this.gridFlashPulseMeshes.push(pulseLineSystem);
+    this.registerGridGlowMesh(pulseLineSystem, color);
   }
 
   /** 创建一组移动高亮线，形成更醒目的网格定位闪光且不参与拾取。 */
@@ -5353,6 +5888,7 @@ export class BabylonEditorEngine {
     }
     this.gridHelperMeshes.push(sweepLines);
     this.gridFlashSweepMeshes.push(sweepLines);
+    this.registerGridGlowMesh(sweepLines, color);
   }
 
   /** 创建只用于拖放拾取的透明地面，视觉网格不再承担拾取职责。 */
@@ -5889,6 +6425,7 @@ export class BabylonEditorEngine {
 
     const metricMetadata = this.inferImportedModelUnitMetadata(root, extension, fileName, persistedUnitMetadata);
     root = this.normalizeImportedModelRoots(root, importedRoots, displayName, metricMetadata);
+    root = this.ensureEditableRootOriginAtModelBase(root, displayName);
     root.name = root.name === "__root__" || root.name === "root" ? displayName : root.name;
     importedNodes.forEach((node) => {
       node.metadata = this.withMetricModelMetadata(node.metadata, metricMetadata);
@@ -5949,6 +6486,27 @@ export class BabylonEditorEngine {
     });
     this.refreshNodeWorldMatrices(normalizedRoot);
     return normalizedRoot;
+  }
+
+  /** 为几何原点明显偏离模型的导入资源创建外层编辑根节点，让 Gizmo 出现在模型底面中心。 */
+  private ensureEditableRootOriginAtModelBase(root: TransformNode, displayName: string): TransformNode {
+    this.refreshNodeWorldMatrices(root);
+    const bounds = this.getNodeWorldBounds(root);
+    if (!bounds) {
+      return root;
+    }
+
+    const baseCenter = new Vector3(bounds.center.x, bounds.minimum.y, bounds.center.z);
+    if (Vector3.DistanceSquared(root.getAbsolutePosition(), baseCenter) < 0.0001) {
+      return root;
+    }
+
+    const editableRoot = new TransformNode(displayName, this.scene);
+    editableRoot.position.copyFrom(baseCenter);
+    this.refreshNodeWorldMatrices(editableRoot);
+    root.setParent(editableRoot);
+    this.refreshNodeWorldMatrices(editableRoot);
+    return editableRoot;
   }
 
   /** 将导入模型的底部中心移动到落点，避免模型中心贴地后半截沉入地面。 */
@@ -6147,6 +6705,7 @@ export class BabylonEditorEngine {
   /** 让所有可见网格线按同一节奏整体闪烁，帮助用户在大视野中快速定位编辑平面。 */
   private updateGridFlash(): void {
     if (this.gridVisualMeshes.length === 0) {
+      this.updateGridGlow(0);
       return;
     }
 
@@ -6174,6 +6733,7 @@ export class BabylonEditorEngine {
         mesh.visibility = synchronizedVisibility;
       }
     });
+    this.updateGridGlow(easedPulse);
   }
 
   /** 根据网格覆盖范围选择易读的单元格尺寸，控制线段数量并保留 1m 默认精度。 */
@@ -6433,10 +6993,25 @@ export class BabylonEditorEngine {
 
     this.selectedNodeIds = new Set(selectableNodes.map((node) => node.uniqueId));
     this.selectedNode = nextPrimary;
+    this.ensureMoveToolForTransformSelection(nextPrimary);
     this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
     this.refreshSceneGraph();
+  }
+
+  /** 选中可变换对象时自动进入移动工具，保证 X/Y/Z 方向轴立即绑定到可编辑根节点。 */
+  private ensureMoveToolForTransformSelection(node: TransformNode | null): void {
+    if (!node || this.previewMode || this.isEditorGroup(node) || this.isNodeLocked(node)) {
+      return;
+    }
+
+    if (this.currentTool === "move") {
+      return;
+    }
+
+    this.currentTool = "move";
+    this.callbacks.onToolChange?.("move");
   }
 
   /** 读取当前选区中的可编辑 TransformNode，并过滤掉已经由选中祖先覆盖的子节点。 */
@@ -6476,7 +7051,7 @@ export class BabylonEditorEngine {
   private findSelectableRoot(mesh: AbstractMesh): TransformNode {
     let current: Node | null = mesh;
     while (current?.parent) {
-      if (current.metadata?.[ROOT_FLAG]) {
+      if (current.metadata?.[ROOT_FLAG] && !current.metadata?.generatedByParametricRuntime) {
         return current as TransformNode;
       }
       current = current.parent;
@@ -6534,8 +7109,13 @@ export class BabylonEditorEngine {
   }
 
   /** 计算节点下真实可渲染网格的世界包围盒，用于导入定位、自适应网格和相机取景。 */
-  private getNodeWorldBounds(node: TransformNode): NodeWorldBounds | null {
-    const meshes = this.getEditableMeshes(node).filter((mesh) => mesh.getTotalVertices() > 0 && mesh.isEnabled());
+  private getNodeWorldBounds(node: TransformNode, includeDisabled = false): NodeWorldBounds | null {
+    const meshes = this.getEditableMeshes(node).filter((mesh) => mesh.getTotalVertices() > 0 && (includeDisabled || mesh.isEnabled()));
+    return this.createNodeWorldBoundsFromMeshes(meshes);
+  }
+
+  /** 从一组 mesh 聚合世界包围盒。 */
+  private createNodeWorldBoundsFromMeshes(meshes: AbstractMesh[]): NodeWorldBounds | null {
     if (meshes.length === 0) {
       return null;
     }
@@ -6752,10 +7332,7 @@ export class BabylonEditorEngine {
       return undefined;
     }
 
-    const values = {
-      ...this.createInitialDynamicParameterValues(asset.modelPackage),
-      ...this.asMetadataObject(instance.values)
-    } as Record<string, DynamicParameterValue>;
+    const values = this.getModelPackageValues(packageRoot, asset.modelPackage);
 
     return {
       packageId,
@@ -6781,12 +7358,12 @@ export class BabylonEditorEngine {
     const fieldsByKey = new Map(manifest.dynamicFields.map((field) => [field.key, field]));
     Object.entries(this.asMetadataObject(manifest.initialValues)).forEach(([key, value]) => {
       const field = fieldsByKey.get(key);
-      const parameterValue = value as DynamicParameterValue;
-      if (!field || !this.isDynamicParameterValueCompatible(field, parameterValue)) {
+      const parameterValue = field ? this.normalizeDynamicParameterValueForField(field, value) : undefined;
+      if (parameterValue === undefined) {
         return;
       }
 
-      values[key] = this.cloneDynamicParameterValue(parameterValue);
+      values[key] = parameterValue;
     });
     return values;
   }
@@ -6968,17 +7545,1604 @@ export class BabylonEditorEngine {
   }
 
   /** 合并写回指定节点的 MeshVertexModifyComponent 参数，不直接修改真实 mesh 顶点。 */
-  private updateNodeMeshVertexModify(node: TransformNode, update: Partial<MeshVertexModifySnapshot>): void {
+  private updateNodeMeshVertexModify(node: TransformNode, update: Partial<MeshVertexModifySnapshot>): MeshVertexModifySnapshot {
     const current = this.getNodeMeshVertexModify(node, this.getNodeMaterialColor(node));
     const editorMetadata = this.getNodeEditorMetadata(node);
     const stored = this.asMetadataObject(editorMetadata.meshVertexModify);
-    this.mergeNodeEditorMetadata(node, {
-      meshVertexModify: {
-        ...stored,
-        ...current,
-        ...update
+    const next = {
+      ...stored,
+      ...current,
+      ...update
+    } as MeshVertexModifySnapshot;
+    this.mergeNodeEditorMetadata(node, { meshVertexModify: next });
+    return next;
+  }
+
+  /** 对旧版 MeshVertexModifyComponent 中可安全落地的参数应用运行态几何变化。 */
+  private applyMeshVertexModifyRuntime(node: TransformNode, value: MeshVertexModifySnapshot): void {
+    this.applyRollerCountToNamedRollers(node, value.rollerDensity, false);
+    this.refreshNodeWorldMatrices(node);
+    this.applyHighlight();
+    this.callbacks.onStatsChange(this.collectStats());
+  }
+
+  /** 模型包运行脚本执行后统一补齐编辑器侧安全兜底，覆盖脚本缺失和旧命名模型。 */
+  private applyModelPackageDynamicFallbacks(
+    root: TransformNode,
+    values: Record<string, DynamicParameterValue>,
+    changedParameterKey?: string
+  ): void {
+    if (this.applyOpaqueRollerConveyorParameterFallback(root, values, changedParameterKey)) {
+      return;
+    }
+
+    this.applyModelPackageRollerDensityFallback(root, values);
+    this.applyOpaqueRollerConveyorSupportFallback(root, values);
+  }
+
+  /** 当前辊道机 GLB 使用不透明 A 系列和 GT 系列命名，参数变化时按部件级规则更新，避免整体根缩放把模型拉伸变形。 */
+  private applyOpaqueRollerConveyorParameterFallback(
+    root: TransformNode,
+    values: Record<string, DynamicParameterValue>,
+    changedParameterKey?: string
+  ): boolean {
+    if (!this.isOpaqueRollerConveyorPackage(root)) {
+      return false;
+    }
+
+    const baseline = this.ensureOpaqueRollerConveyorBaseline(root);
+    if (!baseline) {
+      return false;
+    }
+
+    let changed = this.resetModelPackageRootParametricScaling(root);
+    this.restoreOpaqueRollerConveyorBaseline(root, baseline);
+    this.disposeGeneratedRollerCountNodes(root, true);
+
+    const requestedLength = this.readPositiveDynamicNumberParameter(values.length, baseline.size.x);
+    const lengthAnchorX = this.getOpaqueRollerConveyorLengthAnchorX(baseline);
+    const targetLength = this.createOpaqueRollerConveyorEffectiveLength(baseline, requestedLength, lengthAnchorX);
+    const targetWidth = this.readPositiveDynamicNumberParameter(values.width, baseline.size.z);
+    const targetHeight = this.readPositiveDynamicNumberParameter(values.height, baseline.size.y);
+    if (changedParameterKey === "rollerDensity") {
+      this.setOpaqueRollerConveyorManualRollerCount(root, true);
+    }
+    this.ensureOpaqueRollerConveyorInitialRollerCountValue(root, values);
+    const rollerDensity = this.resolveOpaqueRollerConveyorRollerCount(root, values);
+    const widthRatio = this.createSafeRatio(targetWidth, baseline.size.z);
+    const targetRollerWidthRange = this.createOpaqueRollerConveyorTargetRollerWidthRange(baseline, widthRatio);
+    const automaticRollerWidth = targetRollerWidthRange
+      ? targetRollerWidthRange.end - targetRollerWidthRange.start
+      : baseline.rollerBaseWidth * widthRatio;
+    const targetRollerCenterZ = targetRollerWidthRange
+      ? (targetRollerWidthRange.start + targetRollerWidthRange.end) / 2
+      : this.createOpaqueRollerConveyorBaseRollerCenterZ(baseline);
+    const targetRollerWidth = this.resolveOpaqueRollerConveyorRollerWidth(root, baseline, automaticRollerWidth, values, changedParameterKey);
+    const heightRatio = this.createSafeRatio(targetHeight, baseline.size.y);
+    const lengthDelta = targetLength - baseline.size.x;
+    const heightDelta = targetHeight - baseline.size.y;
+    const rollerWidthRatio = this.createSafeRatio(targetRollerWidth, baseline.rollerBaseWidth);
+
+    this.applyOpaqueRollerConveyorFrameTransforms(root, baseline, lengthAnchorX, lengthDelta, widthRatio, heightRatio, heightDelta);
+    const rollerLayoutLength = changedParameterKey === "rollerDensity" || changedParameterKey === undefined ? targetLength : baseline.size.x;
+    this.applyOpaqueRollerConveyorRollers(
+      root,
+      baseline,
+      rollerDensity,
+      rollerWidthRatio,
+      heightDelta,
+      lengthAnchorX,
+      rollerLayoutLength,
+      targetRollerCenterZ
+    );
+    const showFrontSupport = this.readDynamicBooleanParameter(values.showFrontSupport);
+    const showRearSupport = this.readDynamicBooleanParameter(values.showRearSupport);
+    if (showFrontSupport !== undefined) {
+      changed = this.setNamedSupportNodesEnabled(root, OPAQUE_ROLLER_CONVEYOR_FRONT_SUPPORT_NODE_NAMES, showFrontSupport) || changed;
+    }
+    if (showRearSupport !== undefined) {
+      changed = this.setNamedSupportNodesEnabled(root, OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES, showRearSupport) || changed;
+    }
+
+    this.refreshNodeWorldMatrices(root);
+    this.applyHighlight();
+    this.callbacks.onStatsChange(this.collectStats());
+    return true;
+  }
+
+  /** 解析 opaque 辊道机最终辊筒数；长度变化不再自动增减或重排辊筒。 */
+  private resolveOpaqueRollerConveyorRollerCount(root: TransformNode, values: Record<string, DynamicParameterValue>): number {
+    const requestedCount = this.readDynamicNumberParameter(values.rollerDensity);
+    if (!this.hasOpaqueRollerConveyorManualRollerCount(root)) {
+      return 1;
+    }
+    return requestedCount === undefined ? 1 : this.clampRollerConveyorCount(requestedCount);
+  }
+
+  /** 未手动接管辊筒数量时，把面板值也同步为 1，避免模型包默认数量和视图显示不一致。 */
+  private ensureOpaqueRollerConveyorInitialRollerCountValue(
+    root: TransformNode,
+    values: Record<string, DynamicParameterValue>
+  ): void {
+    if (this.hasOpaqueRollerConveyorManualRollerCount(root) || this.readDynamicNumberParameter(values.rollerDensity) === 1) {
+      return;
+    }
+
+    values.rollerDensity = 1;
+    const asset = this.getModelPackageAssetForRoot(root);
+    this.persistModelPackageValues(root, values);
+    if (asset?.modelPackage) {
+      this.syncModelPackageScriptMetadata(root, asset.modelPackage, values);
+    }
+  }
+
+  /** 解析 opaque 辊道机辊筒宽度：整机宽度变化时默认随动，用户显式改辊筒宽度后保持手动值。 */
+  private resolveOpaqueRollerConveyorRollerWidth(
+    root: TransformNode,
+    baseline: OpaqueRollerConveyorBaseline,
+    automaticRollerWidth: number,
+    values: Record<string, DynamicParameterValue>,
+    changedParameterKey?: string
+  ): number {
+    const automaticWidth = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, automaticRollerWidth);
+    const requestedWidth = this.readPositiveDynamicNumberParameter(values.rollerWidth, baseline.rollerBaseWidth);
+    const previousAutomaticWidth = this.getOpaqueRollerConveyorPreviousAutoRollerWidth(root);
+    if (changedParameterKey === "rollerWidth") {
+      this.setOpaqueRollerConveyorManualRollerWidth(root, true);
+      return requestedWidth;
+    }
+
+    const hasManualRollerWidth = this.hasOpaqueRollerConveyorManualRollerWidth(root);
+    const shouldUseAutomaticWidth =
+      !hasManualRollerWidth &&
+      (changedParameterKey === "width" ||
+        values.rollerWidth === undefined ||
+        this.areNumbersClose(requestedWidth, baseline.rollerBaseWidth) ||
+        (previousAutomaticWidth !== undefined && this.areNumbersClose(requestedWidth, previousAutomaticWidth)));
+
+    if (!shouldUseAutomaticWidth) {
+      return requestedWidth;
+    }
+
+    if (!this.areNumbersClose(requestedWidth, automaticWidth)) {
+      values.rollerWidth = automaticWidth;
+      const asset = this.getModelPackageAssetForRoot(root);
+      this.persistModelPackageValues(root, values);
+      if (asset?.modelPackage) {
+        this.syncModelPackageScriptMetadata(root, asset.modelPackage, values);
+      }
+    }
+    this.setOpaqueRollerConveyorPreviousAutoRollerWidth(root, automaticWidth);
+    this.setOpaqueRollerConveyorManualRollerWidth(root, false);
+    return automaticWidth;
+  }
+
+  /** 计算当前宽度下两侧 A10/A11 长梁的内侧区间，辊筒宽度按该区间贴合侧梁。 */
+  private createOpaqueRollerConveyorTargetRollerWidthRange(
+    baseline: OpaqueRollerConveyorBaseline,
+    widthRatio: number
+  ): OpaqueRollerConveyorAxisRange | null {
+    const beamRanges = OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES
+      .map((nodeName) => {
+        const nodeBaseline = baseline.nodes.get(nodeName);
+        return nodeBaseline
+          ? this.createOpaqueRollerConveyorTargetWidthNodeRange(nodeName, nodeBaseline, baseline, widthRatio)
+          : null;
+      })
+      .filter((range): range is OpaqueRollerConveyorAxisRange => Boolean(range))
+      .sort((left, right) => (left.start + left.end) / 2 - (right.start + right.end) / 2);
+    if (beamRanges.length < 2) {
+      return null;
+    }
+
+    const minimumSideBeam = beamRanges[0];
+    const maximumSideBeam = beamRanges[beamRanges.length - 1];
+    const start = minimumSideBeam.end;
+    const end = maximumSideBeam.start;
+    return end - start > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? { start, end } : null;
+  }
+
+  /** 按 width 参数推导单个节点的目标 Z 向范围，复用框架宽度中心计算避免两套规则漂移。 */
+  private createOpaqueRollerConveyorTargetWidthNodeRange(
+    nodeName: string,
+    nodeBaseline: OpaqueRollerConveyorNodeBaseline,
+    baseline: OpaqueRollerConveyorBaseline,
+    widthRatio: number
+  ): OpaqueRollerConveyorAxisRange {
+    const targetCenter = this.createOpaqueRollerConveyorWidthCenter(nodeName, nodeBaseline, baseline, widthRatio);
+    const targetSize = OPAQUE_ROLLER_CONVEYOR_WIDTH_SCALE_NODE_NAMES.includes(nodeName)
+      ? nodeBaseline.size.z * widthRatio
+      : nodeBaseline.size.z;
+    return {
+      start: targetCenter - targetSize / 2,
+      end: targetCenter + targetSize / 2
+    };
+  }
+
+  /** 读取基线辊筒 Z 中心，长梁区间不可用时保持旧行为。 */
+  private createOpaqueRollerConveyorBaseRollerCenterZ(baseline: OpaqueRollerConveyorBaseline): number {
+    const rollerCenters = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => baseline.nodes.get(name)?.center.z)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center));
+    return rollerCenters.length > 0
+      ? rollerCenters.reduce((sum, center) => sum + center, 0) / rollerCenters.length
+      : (baseline.minimum.z + baseline.maximum.z) / 2;
+  }
+
+  /** 收敛辊筒数量，防止异常参数生成过多运行态节点。 */
+  private clampRollerConveyorCount(value: number): number {
+    return Math.max(1, Math.min(100, Math.round(value)));
+  }
+
+  /** 读取上一次由整机宽度自动计算出的辊筒宽度，用于区分默认随动值和用户手动输入。 */
+  private getOpaqueRollerConveyorPreviousAutoRollerWidth(root: TransformNode): number | undefined {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    const width = Number(runtimeMetadata.opaqueRollerConveyorAutoRollerWidth);
+    return Number.isFinite(width) && width > 0 ? width : undefined;
+  }
+
+  /** 记录本次整机宽度自动计算出的辊筒宽度，保存重开后仍可继续随宽度变化。 */
+  private setOpaqueRollerConveyorPreviousAutoRollerWidth(root: TransformNode, width: number): void {
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        opaqueRollerConveyorAutoRollerWidth: Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, width)
       }
     });
+  }
+
+  /** 判断辊筒宽度是否已由用户手动接管，避免后续整机宽度变化覆盖手动参数。 */
+  private hasOpaqueRollerConveyorManualRollerWidth(root: TransformNode): boolean {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    return runtimeMetadata.opaqueRollerConveyorManualRollerWidth === true;
+  }
+
+  /** 记录辊筒宽度当前是自动随动还是用户手动接管。 */
+  private setOpaqueRollerConveyorManualRollerWidth(root: TransformNode, manual: boolean): void {
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        opaqueRollerConveyorManualRollerWidth: manual
+      }
+    });
+  }
+
+  /** 判断用户是否已经手动设置过辊筒数量；未设置时初始化只显示第一根。 */
+  private hasOpaqueRollerConveyorManualRollerCount(root: TransformNode): boolean {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    return runtimeMetadata.opaqueRollerConveyorManualRollerCount === true;
+  }
+
+  /** 记录辊筒数量已经由用户接管，避免模型包默认值让初始化显示全部辊筒。 */
+  private setOpaqueRollerConveyorManualRollerCount(root: TransformNode, manual: boolean): void {
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        opaqueRollerConveyorManualRollerCount: manual
+      }
+    });
+  }
+
+  /** 按参数更新框架节点；length 让 A10/A11 从蓝框锚点向右延伸，尾部支撑脚和短横件跟随末端。 */
+  private applyOpaqueRollerConveyorFrameTransforms(
+    root: TransformNode,
+    baseline: OpaqueRollerConveyorBaseline,
+    lengthAnchorX: number,
+    lengthDelta: number,
+    widthRatio: number,
+    heightRatio: number,
+    heightDelta: number
+  ): void {
+    const nodesByName = this.getOpaqueRollerConveyorNodesByName(root);
+    OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      const node = nodesByName.get(nodeName);
+      if (nodeBaseline && node) {
+        this.applyOpaqueRollerConveyorLengthGeometry(node, nodeBaseline, lengthAnchorX, lengthDelta);
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
+    const lengthTailReference = this.createOpaqueRollerConveyorLengthTailReference(root, baseline, nodesByName);
+
+    baseline.nodes.forEach((nodeBaseline, nodeName) => {
+      if (OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES.includes(nodeName)) {
+        return;
+      }
+
+      const node = nodesByName.get(nodeName);
+      if (!node) {
+        return;
+      }
+
+      const isLengthGeometryNode = OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.includes(nodeName);
+      const isLengthTailFollowNode = OPAQUE_ROLLER_CONVEYOR_LENGTH_TAIL_FOLLOW_NODE_NAMES.includes(nodeName);
+      if (OPAQUE_ROLLER_CONVEYOR_WIDTH_SCALE_NODE_NAMES.includes(nodeName)) {
+        node.scaling.z = nodeBaseline.scaling.z * widthRatio;
+      }
+      if (OPAQUE_ROLLER_CONVEYOR_HEIGHT_SCALE_NODE_NAMES.includes(nodeName)) {
+        node.scaling.y = nodeBaseline.scaling.y * this.createOpaqueRollerConveyorLegHeightRatio(nodeBaseline, heightDelta, heightRatio);
+      }
+
+      const nextCenter = nodeBaseline.center.clone();
+      nextCenter.x =
+        isLengthTailFollowNode && lengthTailReference
+          ? lengthTailReference.currentTailX + (nodeBaseline.center.x - lengthTailReference.baselineTailX)
+          : isLengthTailFollowNode
+            ? nodeBaseline.center.x + lengthDelta
+            : nodeBaseline.center.x;
+      nextCenter.z = this.createOpaqueRollerConveyorWidthCenter(nodeName, nodeBaseline, baseline, widthRatio);
+      if (!OPAQUE_ROLLER_CONVEYOR_BOTTOM_FIXED_NODE_NAMES.includes(nodeName)) {
+        nextCenter.y = OPAQUE_ROLLER_CONVEYOR_HEIGHT_SCALE_NODE_NAMES.includes(nodeName)
+          ? this.moveCenterWithFixedMinimum(nodeBaseline.center.y, nodeBaseline.size.y, heightDelta)
+          : nodeBaseline.center.y + heightDelta;
+      }
+
+      if (!isLengthGeometryNode) {
+        this.moveNodeCenterOnRootAxis(root, node, "x", nextCenter.x);
+      }
+      this.moveNodeCenterOnRootAxis(root, node, "y", nextCenter.y);
+      this.moveNodeCenterOnRootAxis(root, node, "z", nextCenter.z);
+    });
+  }
+
+  /** 基于左端支架锚点拉伸长梁右侧顶点，绕开当前 GLB 远原点 pivot 导致的 transform 缩放漂移。 */
+  private applyOpaqueRollerConveyorLengthGeometry(
+    node: TransformNode,
+    baseline: OpaqueRollerConveyorNodeBaseline,
+    lengthAnchorX: number,
+    lengthDelta: number
+  ): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices || !Number.isFinite(lengthAnchorX) || !Number.isFinite(lengthDelta)) {
+      return;
+    }
+
+    const bounds = this.getPositionVertexAxisBounds(baseline.positionVertices, "x");
+    if (!bounds || baseline.size.x <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const anchorVertexX = this.mapOpaqueRollerConveyorRootXToLengthVertexX(lengthAnchorX, baseline, bounds);
+    const stretchableLength = bounds.maximum - anchorVertexX;
+    if (stretchableLength <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const stretchRatio = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, stretchableLength + lengthDelta) / stretchableLength;
+    const nextPositions = baseline.positionVertices.slice();
+    for (let index = 0; index < nextPositions.length; index += 3) {
+      const sourceX = baseline.positionVertices[index];
+      if (sourceX > anchorVertexX + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        nextPositions[index] = anchorVertexX + (sourceX - anchorVertexX) * stretchRatio;
+      }
+    }
+    node.setVerticesData(VertexBuffer.PositionKind, nextPositions, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 读取长梁当前真实尾端，尾部支撑脚按该尾端保持原始偏移，避免场景轴向变化时跟随方向反转。 */
+  private createOpaqueRollerConveyorLengthTailReference(
+    root: TransformNode,
+    baseline: OpaqueRollerConveyorBaseline,
+    nodesByName: Map<string, TransformNode>
+  ): OpaqueRollerConveyorLengthTailReference | null {
+    const baselineBeamRange = this.createOpaqueRollerConveyorBaselineLengthBeamRange(baseline);
+    const currentBeamRange = this.createOpaqueRollerConveyorCurrentLengthBeamRange(root, nodesByName);
+    if (!baselineBeamRange || !currentBeamRange) {
+      return null;
+    }
+
+    const tailCenters = OPAQUE_ROLLER_CONVEYOR_LENGTH_TAIL_FOLLOW_NODE_NAMES
+      .map((nodeName) => baseline.nodes.get(nodeName)?.center.x)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center));
+    const tailCenter = tailCenters.length > 0
+      ? tailCenters.reduce((sum, center) => sum + center, 0) / tailCenters.length
+      : baselineBeamRange.end;
+    const followsRangeEnd =
+      Math.abs(tailCenter - baselineBeamRange.end) <= Math.abs(tailCenter - baselineBeamRange.start);
+    return {
+      baselineTailX: followsRangeEnd ? baselineBeamRange.end : baselineBeamRange.start,
+      currentTailX: followsRangeEnd ? currentBeamRange.end : currentBeamRange.start
+    };
+  }
+
+  /** 计算 A10/A11 在基线中的完整 X 覆盖范围。 */
+  private createOpaqueRollerConveyorBaselineLengthBeamRange(
+    baseline: OpaqueRollerConveyorBaseline
+  ): OpaqueRollerConveyorAxisRange | null {
+    const ranges = OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES
+      .map((nodeName) => baseline.nodes.get(nodeName))
+      .filter((node): node is OpaqueRollerConveyorNodeBaseline => Boolean(node))
+      .map((node) => ({
+        start: node.center.x - node.size.x / 2,
+        end: node.center.x + node.size.x / 2
+      }))
+      .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start);
+    if (ranges.length === 0) {
+      return null;
+    }
+    return {
+      start: Math.min(...ranges.map((range) => range.start)),
+      end: Math.max(...ranges.map((range) => range.end))
+    };
+  }
+
+  /** 计算 A10/A11 经过顶点拉伸后的真实根节点本地 X 并集范围，用于读取长梁尾端。 */
+  private createOpaqueRollerConveyorCurrentLengthBeamRange(
+    root: TransformNode,
+    nodesByName: Map<string, TransformNode>
+  ): OpaqueRollerConveyorAxisRange | null {
+    const ranges = this.createOpaqueRollerConveyorCurrentLengthBeamNodeRanges(root, nodesByName);
+    if (ranges.length === 0) {
+      return null;
+    }
+    return {
+      start: Math.min(...ranges.map((range) => range.start)),
+      end: Math.max(...ranges.map((range) => range.end))
+    };
+  }
+
+  /** 计算 A10/A11 当前共同覆盖区，辊筒只能从该红框入口开始并在双长梁轨道内追加。 */
+  private createOpaqueRollerConveyorCurrentLengthBeamSharedRange(
+    root: TransformNode,
+    nodesByName: Map<string, TransformNode>
+  ): OpaqueRollerConveyorAxisRange | null {
+    const ranges = this.createOpaqueRollerConveyorCurrentLengthBeamNodeRanges(root, nodesByName);
+    if (ranges.length === 0) {
+      return null;
+    }
+
+    const start = Math.max(...ranges.map((range) => range.start));
+    const end = Math.min(...ranges.map((range) => range.end));
+    return end - start > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? { start, end } : null;
+  }
+
+  /** 读取每根 A10/A11 长梁当前 X 范围，供尾端跟随和辊筒轨道分别组合。 */
+  private createOpaqueRollerConveyorCurrentLengthBeamNodeRanges(
+    root: TransformNode,
+    nodesByName: Map<string, TransformNode>
+  ): OpaqueRollerConveyorAxisRange[] {
+    return OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES
+      .map((nodeName) => nodesByName.get(nodeName))
+      .filter((node): node is TransformNode => Boolean(node))
+      .map((node) => {
+        const bounds = this.getOpaqueRollerConveyorBaselineWorldBounds(node, true);
+        return bounds ? this.worldBoundsToRootLocalBounds(root, bounds) : null;
+      })
+      .filter((bounds): bounds is NodeWorldBounds => Boolean(bounds))
+      .map((bounds) => ({
+        start: bounds.minimum.x,
+        end: bounds.maximum.x
+      }))
+      .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start);
+  }
+
+  /** 按辊筒数量参数重排辊筒；length 单独变化不主动补增数量，但会使用当前长梁轨道边界。 */
+  private applyOpaqueRollerConveyorRollers(
+    root: TransformNode,
+    baseline: OpaqueRollerConveyorBaseline,
+    rollerDensity: number,
+    rollerWidthRatio: number,
+    heightDelta: number,
+    lengthAnchorX: number,
+    targetLength: number,
+    targetRollerCenterZ: number
+  ): void {
+    const nodesByName = this.getOpaqueRollerConveyorNodesByName(root);
+    const rollers = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES.map((name) => nodesByName.get(name))
+      .filter((node): node is TransformNode => Boolean(node))
+      .sort((left, right) => {
+        const leftCenter = baseline.nodes.get(left.name)?.center.x ?? 0;
+        const rightCenter = baseline.nodes.get(right.name)?.center.x ?? 0;
+        return leftCenter - rightCenter;
+      });
+    if (rollers.length === 0) {
+      return;
+    }
+
+    const lengthTailReference = this.createOpaqueRollerConveyorLengthTailReference(root, baseline, nodesByName);
+    const currentSharedBeamRange = this.createOpaqueRollerConveyorCurrentLengthBeamSharedRange(root, nodesByName);
+    const measuredTrackRange = currentSharedBeamRange
+      ? this.createOpaqueRollerConveyorMeasuredRollerTrackRange(currentSharedBeamRange)
+      : null;
+    const targetCount = Math.max(1, Math.min(100, Math.round(rollerDensity)));
+    const targetCenters = this.createOpaqueRollerConveyorRollerCenters(
+      baseline,
+      targetCount,
+      lengthAnchorX,
+      targetLength,
+      lengthTailReference,
+      measuredTrackRange
+    );
+    const visibleCount = targetCenters.length;
+    const baseRollerCenterY =
+      baseline.nodes.get(OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES[0])?.center.y ?? baseline.maximum.y;
+    const targetRollerCenterY = baseRollerCenterY + heightDelta;
+    rollers.forEach((roller, index) => {
+      const rollerBaseline = baseline.nodes.get(roller.name);
+      const visible = index < Math.min(visibleCount, rollers.length);
+      roller.setEnabled(visible);
+      if (!rollerBaseline || !visible) {
+        return;
+      }
+
+      roller.scaling.z = rollerBaseline.scaling.z * rollerWidthRatio;
+      this.moveNodeCenterOnRootAxis(root, roller, "x", targetCenters[index]);
+      this.moveNodeCenterOnRootAxis(root, roller, "y", targetRollerCenterY);
+      this.moveNodeCenterOnRootAxis(root, roller, "z", targetRollerCenterZ);
+    });
+
+    for (let index = rollers.length; index < visibleCount; index += 1) {
+      const source = rollers[index % rollers.length];
+      const sourceBaseline = baseline.nodes.get(source.name);
+      const clone = source.clone(`${source.name || "roller"}_mesh_vertex_${index + 1}`, source.parent, false);
+      if (!clone || !sourceBaseline) {
+        continue;
+      }
+
+      clone.metadata = {
+        ...this.asMetadataObject(clone.metadata),
+        generatedByMeshVertexModifyRuntime: true,
+        sourceNodeName: source.name,
+        reason: "rollerDensity"
+      };
+      clone.doNotSerialize = true;
+      clone.setEnabled(true);
+      clone.scaling.copyFrom(sourceBaseline.scaling);
+      clone.scaling.z = sourceBaseline.scaling.z * rollerWidthRatio;
+      this.copyMeshVertexModifyPickability(source, clone);
+      this.moveNodeCenterOnRootAxis(root, clone, "x", targetCenters[index]);
+      this.moveNodeCenterOnRootAxis(root, clone, "y", targetRollerCenterY);
+      this.moveNodeCenterOnRootAxis(root, clone, "z", targetRollerCenterZ);
+    }
+  }
+
+  /** 确保当前辊道机拥有未参数化前的节点基线，后续每次参数变化都从基线重新应用。 */
+  private ensureOpaqueRollerConveyorBaseline(root: TransformNode): OpaqueRollerConveyorBaseline | null {
+    const hasDirtyBaselineNodes = this.hasDirtyOpaqueRollerConveyorBaselineNodeNames(root);
+    const existing = this.readOpaqueRollerConveyorBaseline(root);
+    if (existing) {
+      this.ensureOpaqueRollerConveyorLengthGeometryBaseline(root, existing);
+      if (hasDirtyBaselineNodes) {
+        this.persistOpaqueRollerConveyorBaseline(root, existing);
+      }
+      return existing;
+    }
+
+    this.disposeGeneratedRollerCountNodes(root, true);
+    const baseline = this.captureOpaqueRollerConveyorBaseline(root);
+    if (!baseline) {
+      return null;
+    }
+
+    this.persistOpaqueRollerConveyorBaseline(root, baseline);
+    return baseline;
+  }
+
+  /** 兼容已打开旧场景：旧基线没有长梁顶点时，从当前 GLB mesh 读取原始顶点补进 metadata。 */
+  private ensureOpaqueRollerConveyorLengthGeometryBaseline(root: TransformNode, baseline: OpaqueRollerConveyorBaseline): void {
+    const nodesByName = this.getOpaqueRollerConveyorNodesByName(root);
+    let changed = false;
+    OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (!nodeBaseline) {
+        return;
+      }
+
+      const node = nodesByName.get(nodeName);
+      if (this.isOpaqueRollerConveyorLengthVertexBaselineValid(nodeBaseline)) {
+        return;
+      }
+
+      const positionVertices = node ? this.captureOpaqueRollerConveyorLengthVertices(node, nodeName, nodeBaseline.size.x) : undefined;
+      if (!positionVertices) {
+        return;
+      }
+
+      nodeBaseline.positionVertices = positionVertices;
+      changed = true;
+    });
+
+    if (changed) {
+      this.persistOpaqueRollerConveyorBaseline(root, baseline);
+    }
+  }
+
+  /** 捕获当前 opaque 辊道机节点的原始局部状态和根节点本地包围盒。 */
+  private captureOpaqueRollerConveyorBaseline(root: TransformNode): OpaqueRollerConveyorBaseline | null {
+    this.refreshNodeWorldMatrices(root);
+    const rootBounds = this.getOpaqueRollerConveyorBaselineWorldBounds(root, true);
+    if (!rootBounds) {
+      return null;
+    }
+
+    const rootLocalBounds = this.worldBoundsToRootLocalBounds(root, rootBounds);
+    const rootMinimum = rootLocalBounds.minimum;
+    const rootMaximum = rootLocalBounds.maximum;
+    const size = rootLocalBounds.size;
+    const nodes = new Map<string, OpaqueRollerConveyorNodeBaseline>();
+    this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root && Boolean(node.name))
+      .filter((node) => this.isOpaqueRollerConveyorOriginalNodeName(node.name))
+      .filter((node) => !this.isGeneratedRuntimeNodeForBaseline(node))
+      .forEach((node) => {
+        const bounds = this.getOpaqueRollerConveyorBaselineWorldBounds(node, true);
+        const localBounds = bounds ? this.worldBoundsToRootLocalBounds(root, bounds) : null;
+        const center = localBounds?.center ?? Vector3.Zero();
+        const nodeSize = localBounds?.size ?? Vector3.Zero();
+        nodes.set(node.name, {
+          position: node.position.clone(),
+          scaling: node.scaling.clone(),
+          rotation: node.rotation.clone(),
+          rotationQuaternion: node.rotationQuaternion?.clone() ?? null,
+          enabled: typeof node.isEnabled === "function" ? node.isEnabled() : undefined,
+          center,
+          size: nodeSize,
+          positionVertices: this.captureOpaqueRollerConveyorLengthVertices(node, node.name, nodeSize.x)
+        });
+      });
+
+    const rollerCenters = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => nodes.get(name)?.center.x)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center));
+    const rollerWidths = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => nodes.get(name)?.size.z)
+      .filter((width): width is number => typeof width === "number" && Number.isFinite(width) && width > 0);
+    const rollerStart = rollerCenters.length > 0 ? Math.min(...rollerCenters) : rootMinimum.x;
+    const rollerEnd = rollerCenters.length > 0 ? Math.max(...rollerCenters) : rootMaximum.x;
+
+    return {
+      nodes,
+      minimum: rootMinimum,
+      maximum: rootMaximum,
+      size,
+      rollerBaseWidth: rollerWidths[0] ?? size.z,
+      rollerMarginStart: Math.max(0, rollerStart - rootMinimum.x),
+      rollerMarginEnd: Math.max(0, rootMaximum.x - rollerEnd)
+    };
+  }
+
+  /** 读取需要长度参数化的长梁原始顶点，后续按顶点中心拉长，不再依赖 TransformNode.scaling。 */
+  private captureOpaqueRollerConveyorLengthVertices(
+    node: TransformNode,
+    nodeName: string,
+    expectedLength: number
+  ): number[] | undefined {
+    if (!OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.includes(nodeName) || !(node instanceof Mesh)) {
+      return undefined;
+    }
+
+    const positions = node.getVerticesData(VertexBuffer.PositionKind, true, true);
+    if (!positions || positions.length < 3 || positions.length % 3 !== 0) {
+      return undefined;
+    }
+    return this.normalizePositionVerticesToAxisLength(Array.from(positions, (position) => Number(position)), "x", expectedLength);
+  }
+
+  /** 把 opaque 辊道机基线写入 metadata，避免保存重开后参数重复叠加。 */
+  private persistOpaqueRollerConveyorBaseline(root: TransformNode, baseline: OpaqueRollerConveyorBaseline): void {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...runtimeMetadata,
+        opaqueRollerConveyorBaseline: {
+          version: 1,
+          minimum: snapshotVector(baseline.minimum),
+          maximum: snapshotVector(baseline.maximum),
+          size: snapshotVector(baseline.size),
+          rollerBaseWidth: baseline.rollerBaseWidth,
+          rollerMarginStart: baseline.rollerMarginStart,
+          rollerMarginEnd: baseline.rollerMarginEnd,
+          nodes: Object.fromEntries(
+            [...baseline.nodes.entries()].map(([name, node]) => [
+              name,
+              {
+                position: snapshotVector(node.position),
+                scaling: snapshotVector(node.scaling),
+                rotation: snapshotVector(node.rotation),
+                rotationQuaternion: node.rotationQuaternion ? this.snapshotQuaternion(node.rotationQuaternion) : null,
+                enabled: node.enabled,
+                center: snapshotVector(node.center),
+                size: snapshotVector(node.size),
+                ...(node.positionVertices ? { positionVertices: node.positionVertices } : {})
+              }
+            ])
+          )
+        }
+      }
+    });
+  }
+
+  /** 从 metadata 读取 opaque 辊道机基线，损坏或旧格式缺字段时返回空并重新捕获。 */
+  private readOpaqueRollerConveyorBaseline(root: TransformNode): OpaqueRollerConveyorBaseline | null {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    const baselineMetadata = this.asMetadataObject(runtimeMetadata.opaqueRollerConveyorBaseline);
+    const nodeMetadata = this.asMetadataObject(baselineMetadata.nodes);
+    if (Number(baselineMetadata.version) !== 1 || Object.keys(nodeMetadata).length === 0) {
+      return null;
+    }
+    const hasDirtyBaselineNodes = Object.keys(nodeMetadata).some(
+      (nodeName) => this.isGeneratedRuntimeNodeNameForBaseline(nodeName) || !this.isOpaqueRollerConveyorOriginalNodeName(nodeName)
+    );
+
+    const minimum = this.readMetadataVector3(baselineMetadata.minimum);
+    const maximum = this.readMetadataVector3(baselineMetadata.maximum);
+    const size = this.readMetadataVector3(baselineMetadata.size);
+    if (!minimum || !maximum || !size) {
+      return null;
+    }
+
+    const nodes = new Map<string, OpaqueRollerConveyorNodeBaseline>();
+    Object.entries(nodeMetadata).forEach(([name, value]) => {
+      if (this.isGeneratedRuntimeNodeNameForBaseline(name) || !this.isOpaqueRollerConveyorOriginalNodeName(name)) {
+        return;
+      }
+
+      const node = this.asMetadataObject(value);
+      const position = this.readMetadataVector3(node.position);
+      const scaling = this.readMetadataVector3(node.scaling);
+      const rotation = this.readMetadataVector3(node.rotation);
+      const center = this.readMetadataVector3(node.center);
+      const nodeSize = this.readMetadataVector3(node.size);
+      if (!position || !scaling || !rotation || !center || !nodeSize) {
+        return;
+      }
+
+      nodes.set(name, {
+        position,
+        scaling,
+        rotation,
+        rotationQuaternion: this.readMetadataQuaternion(node.rotationQuaternion),
+        enabled: typeof node.enabled === "boolean" ? node.enabled : undefined,
+        center,
+        size: nodeSize,
+        positionVertices: this.readMetadataNumberArray(node.positionVertices)
+      });
+    });
+
+    if (nodes.size === 0) {
+      return null;
+    }
+
+    const cleanBounds = this.createOpaqueRollerConveyorBaselineBounds(nodes);
+    if (!cleanBounds) {
+      return null;
+    }
+
+    const baselineMinimum = cleanBounds.minimum ?? minimum;
+    const baselineMaximum = cleanBounds.maximum ?? maximum;
+    const baselineSize = cleanBounds.size ?? size;
+    const rollerCenters = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => nodes.get(name)?.center.x)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center));
+    const rollerStart = rollerCenters.length > 0 ? Math.min(...rollerCenters) : baselineMinimum.x;
+    const rollerEnd = rollerCenters.length > 0 ? Math.max(...rollerCenters) : baselineMaximum.x;
+
+    return {
+      nodes,
+      minimum: baselineMinimum,
+      maximum: baselineMaximum,
+      size: baselineSize,
+      rollerBaseWidth: this.readPositiveMetadataNumber(baselineMetadata.rollerBaseWidth, baselineSize.z),
+      rollerMarginStart: hasDirtyBaselineNodes
+        ? Math.max(0, rollerStart - baselineMinimum.x)
+        : this.readPositiveMetadataNumber(baselineMetadata.rollerMarginStart, 0),
+      rollerMarginEnd: hasDirtyBaselineNodes
+        ? Math.max(0, baselineMaximum.x - rollerEnd)
+        : this.readPositiveMetadataNumber(baselineMetadata.rollerMarginEnd, 0)
+    };
+  }
+
+  /** 从已读取的原始节点基线重算整体包围盒，用于修复历史脏基线中混入运行态辊筒克隆的情况。 */
+  private createOpaqueRollerConveyorBaselineBounds(nodes: Map<string, OpaqueRollerConveyorNodeBaseline>): NodeWorldBounds | null {
+    const bounds = [...nodes.values()]
+      .map((node) => ({
+        minimum: node.center.subtract(node.size.scale(0.5)),
+        maximum: node.center.add(node.size.scale(0.5))
+      }))
+      .filter((item) =>
+        [item.minimum.x, item.minimum.y, item.minimum.z, item.maximum.x, item.maximum.y, item.maximum.z].every((value) =>
+          Number.isFinite(value)
+        )
+      );
+    if (bounds.length === 0) {
+      return null;
+    }
+
+    const minimum = bounds[0].minimum.clone();
+    const maximum = bounds[0].maximum.clone();
+    bounds.slice(1).forEach((item) => {
+      minimum.minimizeInPlace(item.minimum);
+      maximum.maximizeInPlace(item.maximum);
+    });
+    return this.createNodeWorldBounds(minimum, maximum);
+  }
+
+  /** 计算 opaque 辊道机基线包围盒，排除运行态克隆及其子网格，避免父节点间接吞入临时辊筒。 */
+  private getOpaqueRollerConveyorBaselineWorldBounds(node: TransformNode, includeDisabled = false): NodeWorldBounds | null {
+    const meshes = this.getEditableMeshes(node).filter(
+      (mesh) =>
+        mesh.getTotalVertices() > 0 &&
+        (includeDisabled || mesh.isEnabled()) &&
+        !this.hasGeneratedRuntimeAncestorForBaseline(mesh, node)
+    );
+    return this.createNodeWorldBoundsFromMeshes(meshes);
+  }
+
+  /** 判断 mesh 自身或到边界节点之间的祖先是否属于运行态生成节点。 */
+  private hasGeneratedRuntimeAncestorForBaseline(node: Node, boundary: TransformNode): boolean {
+    let current: Node | null = node;
+    while (current) {
+      if (current instanceof TransformNode && this.isGeneratedRuntimeNodeForBaseline(current)) {
+        return true;
+      }
+      if (current === boundary) {
+        return false;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
+  /** 判断历史基线 metadata 是否混入运行态克隆名或聚合父节点，命中时需要过滤并重新写回干净基线。 */
+  private hasDirtyOpaqueRollerConveyorBaselineNodeNames(root: TransformNode): boolean {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    const baselineMetadata = this.asMetadataObject(runtimeMetadata.opaqueRollerConveyorBaseline);
+    const nodeMetadata = this.asMetadataObject(baselineMetadata.nodes);
+    return Object.keys(nodeMetadata).some(
+      (nodeName) => this.isGeneratedRuntimeNodeNameForBaseline(nodeName) || !this.isOpaqueRollerConveyorOriginalNodeName(nodeName)
+    );
+  }
+
+  /** 将 opaque 辊道机所有已知节点恢复到基线状态，再应用新的参数。 */
+  private restoreOpaqueRollerConveyorBaseline(root: TransformNode, baseline: OpaqueRollerConveyorBaseline): void {
+    const nodesByName = this.getOpaqueRollerConveyorNodesByName(root);
+    baseline.nodes.forEach((nodeBaseline, nodeName) => {
+      const node = nodesByName.get(nodeName);
+      if (!node) {
+        return;
+      }
+
+      node.position.copyFrom(nodeBaseline.position);
+      node.scaling.copyFrom(nodeBaseline.scaling);
+      node.rotation.copyFrom(nodeBaseline.rotation);
+      node.rotationQuaternion = nodeBaseline.rotationQuaternion?.clone() ?? null;
+      this.restoreOpaqueRollerConveyorLengthVertices(node, nodeBaseline);
+      if (nodeBaseline.enabled !== undefined && typeof node.setEnabled === "function") {
+        node.setEnabled(nodeBaseline.enabled);
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
+  }
+
+  /** 每次重新应用参数前先恢复长梁原始顶点，避免连续输入长度时重复拉伸。 */
+  private restoreOpaqueRollerConveyorLengthVertices(node: TransformNode, baseline: OpaqueRollerConveyorNodeBaseline): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices) {
+      return;
+    }
+
+    node.setVerticesData(VertexBuffer.PositionKind, baseline.positionVertices, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 清除不应跨模型包替换复用的 opaque 辊道机运行态基线和自动参数记录。 */
+  private clearOpaqueRollerConveyorRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
+    delete runtimeMetadata.opaqueRollerConveyorBaseline;
+    delete runtimeMetadata.opaqueRollerConveyorAutoRollerCount;
+    delete runtimeMetadata.opaqueRollerConveyorAutoRollerWidth;
+    delete runtimeMetadata.opaqueRollerConveyorManualRollerCount;
+    delete runtimeMetadata.opaqueRollerConveyorManualRollerWidth;
+  }
+
+  /** 基线只能来自 GLB 原始节点，运行态克隆和脚本生成节点都不能参与。 */
+  private isGeneratedRuntimeNodeForBaseline(node: TransformNode): boolean {
+    const metadata = this.asMetadataObject(node.metadata);
+    return metadata.generatedByParametricRuntime === true || metadata.generatedByMeshVertexModifyRuntime === true;
+  }
+
+  /** 识别历史脏基线中可能混入的运行态克隆节点名，读取时会过滤这些节点。 */
+  private isGeneratedRuntimeNodeNameForBaseline(nodeName: string): boolean {
+    return /_(mesh_vertex|roller)_\d+$/i.test(nodeName);
+  }
+
+  /** 当前 opaque 辊道机 GLB 的真实物理节点命名，只保留这些节点进入部件级基线。 */
+  private isOpaqueRollerConveyorOriginalNodeName(nodeName: string): boolean {
+    return /^(A\d+|GT\d+)$/i.test(nodeName);
+  }
+
+  /** 去掉模型包 runtime 写到根节点的参数化缩放，保留用户在编辑器里手动设置的缩放。 */
+  private resetModelPackageRootParametricScaling(root: TransformNode): boolean {
+    const parametricRootScaling = this.getModelPackageParametricRootScaling(root);
+    const userScaling = this.divideVectorComponents(root.scaling, parametricRootScaling);
+    const changed =
+      Math.abs(parametricRootScaling.x - 1) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ||
+      Math.abs(parametricRootScaling.y - 1) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ||
+      Math.abs(parametricRootScaling.z - 1) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON;
+    root.scaling.copyFrom(userScaling);
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        parametricRootScaling: snapshotVector(this.createDefaultParametricRootScaling())
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
+    return changed;
+  }
+
+  /** 获取 opaque 辊道机子节点名称索引，当前 GLB 的 A 系列和 GT 系列名称唯一。 */
+  private getOpaqueRollerConveyorNodesByName(root: TransformNode): Map<string, TransformNode> {
+    return new Map(
+      this.getNodeHierarchy(root)
+        .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
+        .map((node) => [node.name, node])
+    );
+  }
+
+  /** 在整体基线中心周围按比例移动坐标，不改变节点自身非对应轴尺寸。 */
+  private scaleCoordinateAroundCenter(coordinate: number, minimum: number, maximum: number, ratio: number): number {
+    const center = (minimum + maximum) / 2;
+    return center + (coordinate - center) * ratio;
+  }
+
+  /** 以左端支架右边界作为长度伸长起点，蓝框固定区不参与 X 方向拉伸。 */
+  private getOpaqueRollerConveyorLengthAnchorX(baseline: OpaqueRollerConveyorBaseline): number {
+    const fixedMaximums = OPAQUE_ROLLER_CONVEYOR_LENGTH_FIXED_START_NODE_NAMES
+      .map((nodeName) => baseline.nodes.get(nodeName))
+      .filter((node): node is OpaqueRollerConveyorNodeBaseline => Boolean(node))
+      .map((node) => node.center.x + node.size.x / 2)
+      .filter((maximum) => Number.isFinite(maximum));
+    if (fixedMaximums.length === 0) {
+      return baseline.minimum.x;
+    }
+    return Math.min(baseline.maximum.x, Math.max(baseline.minimum.x, Math.max(...fixedMaximums)));
+  }
+
+  /** 限制长度不能短到压坏固定支架区，过小输入只压缩固定区右侧的有效输送段。 */
+  private createOpaqueRollerConveyorEffectiveLength(
+    baseline: OpaqueRollerConveyorBaseline,
+    requestedLength: number,
+    lengthAnchorX: number
+  ): number {
+    const fixedStartLength = Math.max(0, lengthAnchorX - baseline.minimum.x);
+    const minimumLength = fixedStartLength + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON;
+    return Math.max(minimumLength, requestedLength);
+  }
+
+  /** 将根节点本地 X 锚点映射到长梁 position 顶点 X，用于只拉伸锚点右侧顶点。 */
+  private mapOpaqueRollerConveyorRootXToLengthVertexX(
+    rootX: number,
+    baseline: OpaqueRollerConveyorNodeBaseline,
+    bounds: { minimum: number; maximum: number; center: number }
+  ): number {
+    const nodeMinimumX = baseline.center.x - baseline.size.x / 2;
+    const nodeMaximumX = baseline.center.x + baseline.size.x / 2;
+    const clampedRootX = Math.min(nodeMaximumX, Math.max(nodeMinimumX, rootX));
+    const rootRatio = this.createSafeRatio(clampedRootX - nodeMinimumX, baseline.size.x);
+    return bounds.minimum + (bounds.maximum - bounds.minimum) * rootRatio;
+  }
+
+  /** 按整机目标外宽移动节点中心，侧边零件贴齐新边界，横向贯穿件保持中心线对称缩放。 */
+  private createOpaqueRollerConveyorWidthCenter(
+    nodeName: string,
+    nodeBaseline: OpaqueRollerConveyorNodeBaseline,
+    baseline: OpaqueRollerConveyorBaseline,
+    widthRatio: number
+  ): number {
+    const baseCenter = (baseline.minimum.z + baseline.maximum.z) / 2;
+    const targetWidth = baseline.size.z * widthRatio;
+    const targetMinimum = baseCenter - targetWidth / 2;
+    const targetMaximum = baseCenter + targetWidth / 2;
+    const nodeMinimum = nodeBaseline.center.z - nodeBaseline.size.z / 2;
+    const nodeMaximum = nodeBaseline.center.z + nodeBaseline.size.z / 2;
+    const nodeTargetSize = OPAQUE_ROLLER_CONVEYOR_WIDTH_SCALE_NODE_NAMES.includes(nodeName)
+      ? nodeBaseline.size.z * widthRatio
+      : nodeBaseline.size.z;
+    const edgeTolerance = Math.max(0.01, baseline.size.z * 0.08);
+    const touchesMinimum = Math.abs(nodeMinimum - baseline.minimum.z) <= edgeTolerance;
+    const touchesMaximum = Math.abs(nodeMaximum - baseline.maximum.z) <= edgeTolerance;
+
+    if (touchesMinimum && !touchesMaximum) {
+      return targetMinimum + nodeTargetSize / 2;
+    }
+    if (touchesMaximum && !touchesMinimum) {
+      return targetMaximum - nodeTargetSize / 2;
+    }
+    return this.scaleCoordinateAroundCenter(nodeBaseline.center.z, baseline.minimum.z, baseline.maximum.z, widthRatio);
+  }
+
+  /** 用统一容差比较浮点参数，避免连续输入时自动值被微小误差误判成手动值。 */
+  private areNumbersClose(left: number, right: number): boolean {
+    return Math.abs(left - right) <= Math.max(0.000001, Math.max(Math.abs(left), Math.abs(right)) * 0.000001);
+  }
+
+  /** 按底端固定的方式计算立柱增高后的中心，避免脚杯离地。 */
+  private moveCenterWithFixedMinimum(center: number, size: number, delta: number): number {
+    const targetSize = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, size + delta);
+    const minimum = center - size / 2;
+    return minimum + targetSize / 2;
+  }
+
+  /** 计算四根立柱的高度缩放比例，只有立柱自身承担高度变化。 */
+  private createOpaqueRollerConveyorLegHeightRatio(
+    baseline: OpaqueRollerConveyorNodeBaseline,
+    heightDelta: number,
+    fallbackRatio: number
+  ): number {
+    if (baseline.size.y <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return fallbackRatio;
+    }
+
+    const targetHeight = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, baseline.size.y + heightDelta);
+    return targetHeight / baseline.size.y;
+  }
+
+  /** 按长梁内部有效范围生成辊筒中心，避免脏 GT 位置把辊筒排到长梁外侧。 */
+  private createOpaqueRollerConveyorRollerCenters(
+    baseline: OpaqueRollerConveyorBaseline,
+    targetCount: number,
+    lengthAnchorX: number,
+    targetLength: number,
+    lengthTailReference?: OpaqueRollerConveyorLengthTailReference | null,
+    measuredTrackRange?: OpaqueRollerConveyorAxisRange | null
+  ): number[] {
+    const trackRange = measuredTrackRange ?? this.createOpaqueRollerConveyorRollerTrackRange(baseline, targetLength);
+    const fallbackRange = trackRange ? this.createOpaqueRollerConveyorInsetTrackRange(baseline, trackRange) : null;
+    if (fallbackRange) {
+      return this.createIncrementalOpaqueRollerConveyorCenters(baseline, fallbackRange, targetCount, lengthTailReference);
+    }
+
+    return [Math.max(baseline.minimum.x, Math.min(baseline.maximum.x, lengthAnchorX))];
+  }
+
+  /** 以整机目标长度为硬边界，并优先与 A10/A11 当前长梁共同覆盖范围取交集。 */
+  private createOpaqueRollerConveyorRollerTrackRange(
+    baseline: OpaqueRollerConveyorBaseline,
+    targetLength: number
+  ): OpaqueRollerConveyorAxisRange | null {
+    if (!Number.isFinite(targetLength)) {
+      return null;
+    }
+
+    const targetMaximumX = baseline.minimum.x + targetLength;
+    const targetRange: OpaqueRollerConveyorAxisRange = {
+      start: Math.min(baseline.minimum.x, targetMaximumX),
+      end: targetMaximumX
+    };
+    const beamRange = this.createOpaqueRollerConveyorCurrentBeamRange(baseline, targetLength);
+    const range = beamRange
+      ? {
+        start: Math.max(targetRange.start, beamRange.start),
+        end: Math.min(targetRange.end, beamRange.end)
+      }
+      : targetRange;
+    return range.end - range.start > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? range : null;
+  }
+
+  /** 根据 A10/A11 基线和当前目标长度估算长梁共同覆盖范围，入口使用长梁左端而不是 length 拉伸锚点。 */
+  private createOpaqueRollerConveyorCurrentBeamRange(
+    baseline: OpaqueRollerConveyorBaseline,
+    targetLength: number
+  ): OpaqueRollerConveyorAxisRange | null {
+    const lengthDelta = targetLength - baseline.size.x;
+    const ranges = OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES
+      .map((nodeName) => baseline.nodes.get(nodeName))
+      .filter((node): node is OpaqueRollerConveyorNodeBaseline => Boolean(node))
+      .map((node) => ({
+        start: node.center.x - node.size.x / 2,
+        end: node.center.x + node.size.x / 2 + lengthDelta
+      }))
+      .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start);
+    if (ranges.length === 0) {
+      return null;
+    }
+
+    const start = Math.max(...ranges.map((range) => range.start));
+    const end = Math.min(...ranges.map((range) => range.end));
+    return end - start > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? { start, end } : null;
+  }
+
+  /** 使用当前 A10/A11 真实共同包围盒作为辊筒轨道，保证第一根从红框入口向内侧开始。 */
+  private createOpaqueRollerConveyorMeasuredRollerTrackRange(
+    currentBeamRange: OpaqueRollerConveyorAxisRange
+  ): OpaqueRollerConveyorAxisRange | null {
+    if (currentBeamRange.end - currentBeamRange.start <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return null;
+    }
+
+    return { start: currentBeamRange.start, end: currentBeamRange.end };
+  }
+
+  /** 长梁轨道兜底分布时向内缩进半个辊筒直径，避免首尾辊筒贴到端部框架外侧。 */
+  private createOpaqueRollerConveyorInsetTrackRange(
+    baseline: OpaqueRollerConveyorBaseline,
+    trackRange: OpaqueRollerConveyorAxisRange
+  ): OpaqueRollerConveyorAxisRange {
+    const rollerDepths = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => baseline.nodes.get(name)?.size.x)
+      .filter((size): size is number => typeof size === "number" && Number.isFinite(size) && size > 0);
+    const trackSpan = Math.max(0, trackRange.end - trackRange.start);
+    const rollerHalfDepth = rollerDepths.length > 0 ? Math.max(...rollerDepths) / 2 : 0;
+    const margin = Math.min(rollerHalfDepth, trackSpan / 3);
+    const start = trackRange.start + margin;
+    const end = trackRange.end - margin;
+    return end - start > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? { start, end } : trackRange;
+  }
+
+  /** 从远离长梁尾端的一侧开始按原始间距向尾端增加，超过长梁安全范围的数量不显示。 */
+  private createIncrementalOpaqueRollerConveyorCenters(
+    baseline: OpaqueRollerConveyorBaseline,
+    range: OpaqueRollerConveyorAxisRange,
+    targetCount: number,
+    lengthTailReference?: OpaqueRollerConveyorLengthTailReference | null
+  ): number[] {
+    const layout = this.createOpaqueRollerConveyorRollerLayoutRange(range, lengthTailReference);
+    const firstCenter = this.createOpaqueRollerConveyorFirstRollerCenter(layout);
+    const pitch = this.createOpaqueRollerConveyorRollerPitch(baseline);
+    if (pitch <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return [firstCenter];
+    }
+
+    const centers: number[] = [];
+    for (let index = 0; index < targetCount; index += 1) {
+      const center = firstCenter + pitch * layout.direction * index;
+      const hasPassedEnd = layout.direction > 0
+        ? center > layout.end + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON
+        : center < layout.end - MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON;
+      if (hasPassedEnd) {
+        break;
+      }
+      centers.push(center);
+    }
+    return centers.length > 0 ? centers : [layout.start];
+  }
+
+  /** 以长梁真实尾端决定辊筒追加方向，从远离尾端的一侧向尾端逐个追加。 */
+  private createOpaqueRollerConveyorRollerLayoutRange(
+    range: OpaqueRollerConveyorAxisRange,
+    lengthTailReference?: OpaqueRollerConveyorLengthTailReference | null
+  ): OpaqueRollerConveyorAxisRange & { direction: 1 | -1 } {
+    if (!lengthTailReference) {
+      return { ...range, direction: 1 };
+    }
+
+    const followsRangeEnd =
+      Math.abs(lengthTailReference.currentTailX - range.end) <= Math.abs(lengthTailReference.currentTailX - range.start);
+    return followsRangeEnd
+      ? { start: range.start, end: range.end, direction: 1 }
+      : { start: range.end, end: range.start, direction: -1 };
+  }
+
+  /** 第一根辊筒以当前长梁安全区间的起点为准，避免沿用原始 GT 外部坐标。 */
+  private createOpaqueRollerConveyorFirstRollerCenter(range: OpaqueRollerConveyorAxisRange): number {
+    return range.start;
+  }
+
+  /** 使用原始 GT 中心距作为新增辊筒固定间距，保证数量增加时沿尾端方向追加而不是重新铺满。 */
+  private createOpaqueRollerConveyorRollerPitch(baseline: OpaqueRollerConveyorBaseline): number {
+    const centers = this.getOpaqueRollerConveyorBaseRollerCenters(baseline);
+    for (let index = 1; index < centers.length; index += 1) {
+      const pitch = centers[index] - centers[index - 1];
+      if (pitch > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        return pitch;
+      }
+    }
+
+    const rollerDepths = OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => baseline.nodes.get(name)?.size.x)
+      .filter((size): size is number => typeof size === "number" && Number.isFinite(size) && size > 0);
+    return rollerDepths.length > 0 ? Math.max(...rollerDepths) : 0;
+  }
+
+  /** 读取原始 GT 中心点，只作为固定间距基准，不再决定第一根辊筒位置。 */
+  private getOpaqueRollerConveyorBaseRollerCenters(baseline: OpaqueRollerConveyorBaseline): number[] {
+    return OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES
+      .map((name) => baseline.nodes.get(name)?.center.x)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center))
+      .sort((left, right) => left - right);
+  }
+
+  /** 将世界坐标点转为根节点本地坐标。 */
+  private worldPointToRootLocal(root: TransformNode, point: Vector3): Vector3 {
+    const rootMatrix = root.getWorldMatrix().clone();
+    rootMatrix.invert();
+    return Vector3.TransformCoordinates(point, rootMatrix);
+  }
+
+  /** 将世界包围盒完整转换为根节点本地包围盒，兼容 GLB 根节点存在负轴缩放或旋转的情况。 */
+  private worldBoundsToRootLocalBounds(root: TransformNode, bounds: NodeWorldBounds): NodeWorldBounds {
+    const rootMatrix = root.getWorldMatrix().clone();
+    rootMatrix.invert();
+    const localPoints = this.createBoundsCornerPoints(bounds).map((point) => Vector3.TransformCoordinates(point, rootMatrix));
+    const minimum = localPoints[0].clone();
+    const maximum = localPoints[0].clone();
+    localPoints.slice(1).forEach((point) => {
+      minimum.minimizeInPlace(point);
+      maximum.maximizeInPlace(point);
+    });
+    return this.createNodeWorldBounds(minimum, maximum);
+  }
+
+  /** 枚举包围盒 8 个角点，避免只转换 min/max 时遇到负轴缩放后范围反转。 */
+  private createBoundsCornerPoints(bounds: NodeWorldBounds): Vector3[] {
+    return [
+      new Vector3(bounds.minimum.x, bounds.minimum.y, bounds.minimum.z),
+      new Vector3(bounds.minimum.x, bounds.minimum.y, bounds.maximum.z),
+      new Vector3(bounds.minimum.x, bounds.maximum.y, bounds.minimum.z),
+      new Vector3(bounds.minimum.x, bounds.maximum.y, bounds.maximum.z),
+      new Vector3(bounds.maximum.x, bounds.minimum.y, bounds.minimum.z),
+      new Vector3(bounds.maximum.x, bounds.minimum.y, bounds.maximum.z),
+      new Vector3(bounds.maximum.x, bounds.maximum.y, bounds.minimum.z),
+      new Vector3(bounds.maximum.x, bounds.maximum.y, bounds.maximum.z)
+    ];
+  }
+
+  /** 计算 position 顶点数组在指定轴上的范围，供局部几何参数化围绕自身中心应用。 */
+  private getPositionVertexAxisBounds(vertices: number[], axis: "x" | "y" | "z"): { minimum: number; maximum: number; center: number } | null {
+    const offset = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+    let minimum = Number.POSITIVE_INFINITY;
+    let maximum = Number.NEGATIVE_INFINITY;
+    for (let index = offset; index < vertices.length; index += 3) {
+      const value = vertices[index];
+      if (!Number.isFinite(value)) {
+        return null;
+      }
+      minimum = Math.min(minimum, value);
+      maximum = Math.max(maximum, value);
+    }
+
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) {
+      return null;
+    }
+    return {
+      minimum,
+      maximum,
+      center: (minimum + maximum) / 2
+    };
+  }
+
+  /** 判断 metadata 中的长梁顶点基线是否仍是原始长度，防止旧运行态顶点被当成基线继续放大。 */
+  private isOpaqueRollerConveyorLengthVertexBaselineValid(baseline: OpaqueRollerConveyorNodeBaseline): boolean {
+    if (!baseline.positionVertices) {
+      return false;
+    }
+
+    const bounds = this.getPositionVertexAxisBounds(baseline.positionVertices, "x");
+    if (!bounds || baseline.size.x <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return false;
+    }
+
+    const length = bounds.maximum - bounds.minimum;
+    return Math.abs(length - baseline.size.x) <= Math.max(0.001, baseline.size.x * 0.01);
+  }
+
+  /** 把当前长梁顶点收敛回原始基线长度；旧场景已保存运行态顶点时，用这个步骤恢复可预测基线。 */
+  private normalizePositionVerticesToAxisLength(
+    vertices: number[],
+    axis: "x" | "y" | "z",
+    targetLength: number
+  ): number[] | undefined {
+    if (!Number.isFinite(targetLength) || targetLength <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return undefined;
+    }
+
+    const bounds = this.getPositionVertexAxisBounds(vertices, axis);
+    if (!bounds) {
+      return undefined;
+    }
+
+    const currentLength = bounds.maximum - bounds.minimum;
+    if (currentLength <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return undefined;
+    }
+
+    const offset = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+    const ratio = targetLength / currentLength;
+    const normalized = vertices.slice();
+    for (let index = offset; index < normalized.length; index += 3) {
+      normalized[index] = bounds.center + (vertices[index] - bounds.center) * ratio;
+    }
+    return normalized;
+  }
+
+  /** 从 metadata 读取 Vector3 快照。 */
+  private readMetadataVector3(value: unknown): Vector3 | null {
+    const vector = this.asMetadataObject(value);
+    if ([vector.x, vector.y, vector.z].every((component) => typeof component === "number" && Number.isFinite(component))) {
+      return new Vector3(Number(vector.x), Number(vector.y), Number(vector.z));
+    }
+    return null;
+  }
+
+  /** 从 metadata 读取有限数字数组，旧场景没有顶点基线时返回空并由当前 mesh 补录。 */
+  private readMetadataNumberArray(value: unknown): number[] | undefined {
+    if (!Array.isArray(value) || value.length < 3 || value.length % 3 !== 0) {
+      return undefined;
+    }
+    const numbers = value.map((item) => Number(item));
+    return numbers.every((item) => Number.isFinite(item)) ? numbers : undefined;
+  }
+
+  /** 从 metadata 读取 Quaternion 快照，缺失时表示节点没有四元数旋转。 */
+  private readMetadataQuaternion(value: unknown): Quaternion | null {
+    const quaternion = this.asMetadataObject(value);
+    if (
+      [quaternion.x, quaternion.y, quaternion.z, quaternion.w].every(
+        (component) => typeof component === "number" && Number.isFinite(component)
+      )
+    ) {
+      return new Quaternion(Number(quaternion.x), Number(quaternion.y), Number(quaternion.z), Number(quaternion.w));
+    }
+    return null;
+  }
+
+  /** 将 Quaternion 转成可写入 metadata 的快照对象。 */
+  private snapshotQuaternion(value: Quaternion): { x: number; y: number; z: number; w: number } {
+    return {
+      x: value.x,
+      y: value.y,
+      z: value.z,
+      w: value.w
+    };
+  }
+
+  /** 读取正数 metadata 字段，非法值回退到调用方给出的基线。 */
+  private readPositiveMetadataNumber(value: unknown, fallback: number): number {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) && numberValue > 0 ? numberValue : fallback;
+  }
+
+  /** 读取正数动态参数，非法或未填写时使用模型基线值。 */
+  private readPositiveDynamicNumberParameter(value: unknown, fallback: number): number {
+    const numberValue = this.readDynamicNumberParameter(value);
+    return numberValue !== undefined && numberValue > 0 ? numberValue : fallback;
+  }
+
+  /** 创建安全比例，避免基线尺寸异常时产生无限缩放。 */
+  private createSafeRatio(target: number, baseline: number): number {
+    return Number.isFinite(target) && Number.isFinite(baseline) && Math.abs(baseline) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON
+      ? target / baseline
+      : 1;
+  }
+
+  /** 模型包脚本缺失、未刷新或旧状态残留时，仍按动态参数实时修正辊筒数量。 */
+  private applyModelPackageRollerDensityFallback(root: TransformNode, values: Record<string, DynamicParameterValue>): void {
+    const rollerDensity = this.readDynamicNumberParameter(values.rollerDensity);
+    if (rollerDensity === undefined) {
+      return;
+    }
+
+    if (this.applyRollerCountToNamedRollers(root, rollerDensity, true)) {
+      this.refreshNodeWorldMatrices(root);
+      this.applyHighlight();
+      this.callbacks.onStatsChange(this.collectStats());
+    }
+  }
+
+  /** 当前辊道机 GLB 的支架节点没有语义命名时，按已验证 A* 节点组兜底处理显隐。 */
+  private applyOpaqueRollerConveyorSupportFallback(root: TransformNode, values: Record<string, DynamicParameterValue>): void {
+    const showFrontSupport = this.readDynamicBooleanParameter(values.showFrontSupport);
+    const showRearSupport = this.readDynamicBooleanParameter(values.showRearSupport);
+    if (showFrontSupport === undefined && showRearSupport === undefined) {
+      return;
+    }
+
+    if (!this.isOpaqueRollerConveyorPackage(root)) {
+      return;
+    }
+
+    let changed = false;
+    if (showFrontSupport !== undefined) {
+      changed = this.setNamedSupportNodesEnabled(root, OPAQUE_ROLLER_CONVEYOR_FRONT_SUPPORT_NODE_NAMES, showFrontSupport) || changed;
+    }
+    if (showRearSupport !== undefined) {
+      changed = this.setNamedSupportNodesEnabled(root, OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES, showRearSupport) || changed;
+    }
+
+    if (changed) {
+      this.refreshNodeWorldMatrices(root);
+      this.applyHighlight();
+      this.callbacks.onStatsChange(this.collectStats());
+    }
+  }
+
+  /** 判断当前根节点是否是需要 A* 支架兼容的辊道机模型包实例。 */
+  private isOpaqueRollerConveyorPackage(root: TransformNode): boolean {
+    return this.hasOpaqueRollerConveyorNodeSet(root);
+  }
+
+  /** 检查当前 GLB 的不透明节点名集合，防止支架兜底误命中其它模型。 */
+  private hasOpaqueRollerConveyorNodeSet(root: TransformNode): boolean {
+    const names = new Set(
+      this.getNodeHierarchy(root)
+        .filter((node) => node instanceof TransformNode)
+        .map((node) => node.name)
+    );
+    return [
+      ...OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES,
+      ...OPAQUE_ROLLER_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES,
+      ...OPAQUE_ROLLER_CONVEYOR_FRONT_SUPPORT_NODE_NAMES,
+      ...OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES
+    ].every((name) => names.has(name));
+  }
+
+  /** 按精确节点名切换支架可见性，返回是否真的改变了节点启用状态。 */
+  private setNamedSupportNodesEnabled(root: TransformNode, nodeNames: string[], enabled: boolean): boolean {
+    const nodesByName = new Map(
+      this.getNodeHierarchy(root)
+        .filter((node): node is TransformNode => node instanceof TransformNode)
+        .map((node) => [node.name, node])
+    );
+    return nodeNames.reduce((changed, nodeName) => {
+      const node = nodesByName.get(nodeName);
+      if (!node || typeof node.setEnabled !== "function") {
+        return changed;
+      }
+
+      const wasEnabled = typeof node.isEnabled === "function" ? node.isEnabled() : undefined;
+      node.setEnabled(enabled);
+      return changed || wasEnabled !== enabled;
+    }, false);
+  }
+
+  /** 按最终数量重排命名辊筒，普通 GLB 和模型包兜底逻辑共用同一套实现。 */
+  private applyRollerCountToNamedRollers(root: TransformNode, rollerDensity: number, cleanupModelPackageRollerClones: boolean): boolean {
+    const rollers = this.getRollerCountTemplates(root);
+    if (rollers.length === 0) {
+      return false;
+    }
+
+    this.disposeGeneratedRollerCountNodes(root, cleanupModelPackageRollerClones);
+    const targetCount = Math.max(1, Math.min(100, Math.round(rollerDensity)));
+    const targetCenters = this.createMeshVertexModifyRollerCenters(root, rollers, targetCount);
+    rollers.forEach((roller, index) => {
+      const visible = index < Math.min(targetCount, rollers.length);
+      roller.setEnabled(visible);
+      if (visible) {
+        this.moveNodeCenterOnRootAxis(root, roller, "x", targetCenters[index]);
+      }
+    });
+
+    for (let index = rollers.length; index < targetCount; index += 1) {
+      const source = rollers[index % rollers.length];
+      const clone = source.clone(`${source.name || "roller"}_mesh_vertex_${index + 1}`, source.parent, false);
+      if (!clone) {
+        continue;
+      }
+
+      clone.metadata = {
+        ...this.asMetadataObject(clone.metadata),
+        generatedByMeshVertexModifyRuntime: true,
+        sourceNodeName: source.name,
+        reason: "rollerDensity"
+      };
+      clone.doNotSerialize = true;
+      clone.setEnabled(true);
+      this.copyMeshVertexModifyPickability(source, clone);
+      this.moveNodeCenterOnRootAxis(root, clone, "x", targetCenters[index]);
+    }
+    return true;
+  }
+
+  /** 复制源节点及子网格的拾取能力，避免生成辊筒破坏选中根节点的体验。 */
+  private copyMeshVertexModifyPickability(source: TransformNode, clone: TransformNode): void {
+    const sourceMeshes = source instanceof AbstractMesh ? [source, ...source.getChildMeshes()] : source.getChildMeshes();
+    const cloneMeshes = clone instanceof AbstractMesh ? [clone, ...clone.getChildMeshes()] : clone.getChildMeshes();
+    cloneMeshes.forEach((mesh, index) => {
+      mesh.isPickable = sourceMeshes[index]?.isPickable ?? true;
+      mesh.doNotSerialize = true;
+    });
+  }
+
+  /** 清理编辑器兜底生成的辊筒，模型包路径还会清理脚本生成的 roller 克隆避免重复叠加。 */
+  private disposeGeneratedRollerCountNodes(root: TransformNode, includeModelPackageRollerClones: boolean): void {
+    const generatedNodes = this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
+      .filter((node) => this.isGeneratedRollerCountNode(node, includeModelPackageRollerClones));
+    const materials = new Set<Material>();
+    generatedNodes.forEach((node) => {
+      const meshes = node instanceof AbstractMesh ? [node, ...node.getChildMeshes()] : node.getChildMeshes();
+      meshes.forEach((mesh) => this.collectMaterialTree(mesh.material, materials));
+    });
+    generatedNodes.forEach((node) => node.dispose(false, false));
+    this.disposeUnusedMaterials(materials);
+  }
+
+  /** 判断节点是否属于辊筒数量逻辑生成的临时克隆。 */
+  private isGeneratedRollerCountNode(node: TransformNode, includeModelPackageRollerClones: boolean): boolean {
+    const metadata = this.asMetadataObject(node.metadata);
+    if (metadata.generatedByMeshVertexModifyRuntime) {
+      return true;
+    }
+
+    return (
+      includeModelPackageRollerClones &&
+      metadata.generatedByParametricRuntime === true &&
+      (metadata.reason === "roller" ||
+        metadata.reason === "rollerDensity" ||
+        this.isRollerCountNodeName(String(metadata.sourceNodeName ?? "")))
+    );
+  }
+
+  /** 收集原始辊筒模板，按模型根节点本地 X 轴从小到大排序。 */
+  private getRollerCountTemplates(root: TransformNode): TransformNode[] {
+    return this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
+      .filter((node) => {
+        const metadata = this.asMetadataObject(node.metadata);
+        return !metadata.generatedByMeshVertexModifyRuntime && !metadata.generatedByParametricRuntime;
+      })
+      .filter((node) => this.isRollerCountNodeName(node.name || ""))
+      .sort((left, right) => {
+        const delta = this.getNodeCenterOnRootAxis(root, left, "x") - this.getNodeCenterOnRootAxis(root, right, "x");
+        return Math.abs(delta) > 0.000001 ? delta : left.name.localeCompare(right.name, "zh-Hans-CN", { numeric: true });
+      });
+  }
+
+  /** 识别辊道机常见辊筒命名，兼容 GT1..GT10、roller 以及中文辊/滚。 */
+  private isRollerCountNodeName(name: string): boolean {
+    return /^(GT\d+)|roller|辊|滚/i.test(name);
+  }
+
+  /** 在原始辊筒覆盖范围内按目标数量生成根节点本地 X 轴中心点。 */
+  private createMeshVertexModifyRollerCenters(root: TransformNode, rollers: TransformNode[], targetCount: number): number[] {
+    const centers = rollers.map((roller) => this.getNodeCenterOnRootAxis(root, roller, "x"));
+    const start = Math.min(...centers);
+    const end = Math.max(...centers);
+    if (targetCount <= 1) {
+      return [(start + end) / 2];
+    }
+
+    const span = end - start;
+    if (Math.abs(span) < 0.000001) {
+      const bounds = this.getNodeWorldBounds(rollers[0], true);
+      const spacing = Math.max(0.01, bounds?.size.x ?? 0.01);
+      const first = start - ((targetCount - 1) * spacing) / 2;
+      return Array.from({ length: targetCount }, (_, index) => first + index * spacing);
+    }
+
+    return Array.from({ length: targetCount }, (_, index) => start + (span * index) / (targetCount - 1));
+  }
+
+  /** 读取节点世界包围盒中心在根节点本地坐标系的轴向坐标。 */
+  private getNodeCenterOnRootAxis(root: TransformNode, node: TransformNode, axis: "x" | "y" | "z"): number {
+    this.refreshNodeWorldMatrices(root);
+    const bounds = this.getNodeWorldBounds(node, true);
+    if (!bounds) {
+      return 0;
+    }
+
+    const center = bounds.center;
+    const rootMatrix = root.getWorldMatrix().clone();
+    rootMatrix.invert();
+    return Vector3.TransformCoordinates(center, rootMatrix)[axis];
+  }
+
+  /** 沿根节点本地轴移动节点，使节点包围盒中心对齐目标坐标。 */
+  private moveNodeCenterOnRootAxis(root: TransformNode, node: TransformNode, axis: "x" | "y" | "z", targetCenter: number): void {
+    if (!node.position || !Number.isFinite(targetCenter)) {
+      return;
+    }
+
+    const currentCenter = this.getNodeCenterOnRootAxis(root, node, axis);
+    const delta = targetCenter - currentCenter;
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.000001) {
+      return;
+    }
+
+    // targetCenter 属于编辑根节点本地轴，节点 position 属于父级局部轴，必须转换坐标系后再写入。
+    root.computeWorldMatrix(true);
+    if (node.parent instanceof TransformNode) {
+      node.parent.computeWorldMatrix(true);
+    }
+    const rootLocalDelta = Vector3.Zero();
+    rootLocalDelta[axis] = delta;
+    const worldDelta = Vector3.TransformNormal(rootLocalDelta, root.getWorldMatrix());
+    const parent = node.parent;
+    const parentLocalDelta =
+      parent instanceof TransformNode
+        ? Vector3.TransformNormal(worldDelta, parent.getWorldMatrix().clone().invert())
+        : worldDelta;
+    node.position.addInPlace(parentLocalDelta);
+    this.refreshNodeWorldMatrices(root);
   }
 
   /** 合并写回指定节点的业务资产信息，assetCode 不与文件资产 ID 混用。 */
@@ -7006,16 +9170,18 @@ export class BabylonEditorEngine {
   }
 
   /** 写回指定节点所属模型包的动态参数，并立即重跑运行脚本驱动真实模型。 */
-  private updateNodeDynamicParameter(node: TransformNode, update: DynamicParameterUpdate): void {
+  private updateNodeDynamicParameter(node: TransformNode, update: DynamicParameterUpdate): boolean {
     const packageRoot = this.findModelPackageRoot(node);
     if (!packageRoot) {
-      return;
+      console.warn(`动态参数 ${update.key} 更新失败：当前节点不属于模型包实例。`);
+      return false;
     }
 
     const editorMetadata = this.getNodeEditorMetadata(packageRoot);
     const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
     if (update.packageId && instance.packageId !== update.packageId) {
-      return;
+      this.setModelPackageRuntimeWarning(packageRoot, `动态参数 ${update.key} 更新失败：模型包编号不匹配。`);
+      return false;
     }
 
     const assetId = typeof instance.assetId === "string" ? instance.assetId : "";
@@ -7023,27 +9189,27 @@ export class BabylonEditorEngine {
     const asset = this.assets.find((item) => item.id === assetId && item.modelPackage?.packageId === packageId);
     const manifest = asset?.modelPackage;
     if (!manifest) {
-      return;
+      this.setModelPackageRuntimeWarning(packageRoot, `动态参数 ${update.key} 更新失败：未找到对应模型包资产。`);
+      return false;
     }
 
     const field = manifest.dynamicFields.find((item) => item.key === update.key);
-    if (!field || !this.isDynamicParameterValueCompatible(field, update.value)) {
-      return;
+    const parameterValue = field ? this.normalizeDynamicParameterValueForField(field, update.value) : undefined;
+    if (!field || parameterValue === undefined) {
+      this.setModelPackageRuntimeWarning(packageRoot, `动态参数 ${update.key} 更新失败：字段不存在或值类型不匹配。`);
+      return false;
     }
 
-    const values = this.asMetadataObject(instance.values);
+    const values = this.getModelPackageValues(packageRoot, manifest);
     const nextValues = {
       ...values,
-      [update.key]: update.value
+      [update.key]: parameterValue
     } as Record<string, DynamicParameterValue>;
-    this.mergeNodeEditorMetadata(packageRoot, {
-      modelPackageInstance: {
-        ...instance,
-        values: nextValues
-      }
-    });
-    this.syncModelPackageScriptMetadata(packageRoot, manifest, nextValues);
-    this.applyModelPackageRuntime(packageRoot, manifest, "parameter");
+    this.applyModelPackageRuntimeWithDynamicFallbacks(packageRoot, manifest, "parameter", nextValues, update.key);
+    this.refreshSceneGraph();
+    this.emitSelectionSnapshot();
+    this.scene.render();
+    return true;
   }
 
   /** 遍历当前场景的模型包根节点，保存后用于恢复视口中的参数化效果。 */
@@ -7051,14 +9217,29 @@ export class BabylonEditorEngine {
     this.getSceneModelPackageRoots().forEach((root) => {
       const asset = this.getModelPackageAssetForRoot(root);
       if (asset?.modelPackage) {
-        this.syncModelPackageScriptMetadata(root, asset.modelPackage, this.getModelPackageValues(root, asset.modelPackage));
-        this.applyModelPackageRuntime(root, asset.modelPackage, reason);
+        const values = this.getModelPackageValues(root, asset.modelPackage);
+        this.applyModelPackageRuntimeWithDynamicFallbacks(root, asset.modelPackage, reason, values);
       }
     });
     this.refreshSceneGraph();
     this.emitSelectionSnapshot();
     this.callbacks.onStatsChange(this.collectStats());
     this.scene.render();
+  }
+
+  /** 应用模型包运行脚本后立即执行编辑器兜底，避免导入、拖入、复制和阵列路径遗漏部件级修正。 */
+  private applyModelPackageRuntimeWithDynamicFallbacks(
+    root: TransformNode,
+    manifest: ModelPackageManifest,
+    reason: "import" | "load" | "parameter" | "serialize" | "clone",
+    values?: Record<string, DynamicParameterValue>,
+    changedParameterKey?: string
+  ): void {
+    const runtimeValues = values ?? this.getModelPackageValues(root, manifest);
+    this.persistModelPackageValues(root, runtimeValues);
+    this.syncModelPackageScriptMetadata(root, manifest, runtimeValues);
+    this.applyModelPackageRuntime(root, manifest, reason);
+    this.applyModelPackageDynamicFallbacks(root, runtimeValues, changedParameterKey);
   }
 
   /** 对指定模型包根节点应用运行脚本；失败只记录告警，参数值仍然保存。 */
@@ -7088,10 +9269,11 @@ export class BabylonEditorEngine {
     }
 
     const values = this.getModelPackageValues(root, manifest);
+    this.persistModelPackageValues(root, values);
     this.syncModelPackageScriptMetadata(root, manifest, values);
     this.assignModelPackageRuntimeValues(handle.instance, values, manifest.dynamicFields);
     const methodName = handle.started ? "onUpdate" : "onStart";
-    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, () =>
+    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, "apply", () =>
       invokeModelPackageRuntimeLifecycle(handle.instance, methodName, scriptFile)
     );
     if (warning) {
@@ -7163,10 +9345,11 @@ export class BabylonEditorEngine {
     const manifest = this.getModelPackageAssetForRoot(root)?.modelPackage;
     const values = manifest ? this.getModelPackageValues(root, manifest) : this.getRawModelPackageValues(root);
     if (manifest) {
+      this.persistModelPackageValues(root, values);
       this.syncModelPackageScriptMetadata(root, manifest, values);
     }
     this.assignModelPackageRuntimeValues(handle.instance, values, manifest?.dynamicFields);
-    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, () =>
+    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, "stop", () =>
       invokeModelPackageRuntimeLifecycle(handle.instance, "onStop", handle.scriptFile)
     );
     if (warning) {
@@ -7194,13 +9377,27 @@ export class BabylonEditorEngine {
     root: TransformNode,
     manifest: ModelPackageManifest | undefined,
     values: Record<string, DynamicParameterValue>,
+    mode: "apply" | "stop",
     action: () => string | undefined
   ): string | undefined {
     const editableState = this.captureModelPackageEditableState(root, values);
+    const temporaryMetadataFlags = this.markNonRenderableRuntimeBoundsNodes(root);
+    let warning: string | undefined;
     try {
       this.normalizeModelPackageRootForLifecycle(root);
-      return action();
+      if (manifest && this.isOpaqueRollerConveyorPackage(root)) {
+        this.ensureOpaqueRollerConveyorBaseline(root);
+      }
+      warning = action();
+      if (mode === "stop") {
+        editableState.parametricRootScaling = this.createDefaultParametricRootScaling();
+      } else if (!warning) {
+        editableState.parametricRootScaling =
+          this.normalizeModelPackageParametricRootScaling(root.scaling);
+      }
+      return warning;
     } finally {
+      this.restoreTemporaryRuntimeMetadataFlags(temporaryMetadataFlags);
       this.restoreModelPackageEditableState(root, editableState);
       if (manifest) {
         this.syncModelPackageScriptMetadata(root, manifest, editableState.values);
@@ -7218,6 +9415,48 @@ export class BabylonEditorEngine {
     this.refreshNodeWorldMatrices(root);
   }
 
+  /** 临时隐藏 0 顶点 GLB 包装 mesh，避免模型包脚本把它当作有效包围盒参与参数化计算。 */
+  private markNonRenderableRuntimeBoundsNodes(root: TransformNode): ModelPackageRuntimeTemporaryMetadataFlag[] {
+    const markers: ModelPackageRuntimeTemporaryMetadataFlag[] = [];
+    this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode)
+      .filter((node): node is AbstractMesh => node instanceof AbstractMesh && node.getTotalVertices() <= 0)
+      .forEach((node) => {
+        const metadata = this.asMetadataObject(node.metadata);
+        if (metadata.generatedByParametricRuntime === true) {
+          return;
+        }
+
+        markers.push({
+          node,
+          hadGeneratedFlag: Object.prototype.hasOwnProperty.call(metadata, "generatedByParametricRuntime"),
+          generatedFlagValue: metadata.generatedByParametricRuntime
+        });
+        node.metadata = {
+          ...metadata,
+          generatedByParametricRuntime: true
+        };
+      });
+    return markers;
+  }
+
+  /** 恢复 runtime 生命周期期间临时写入的 metadata，避免临时标记进入保存、克隆和清理逻辑。 */
+  private restoreTemporaryRuntimeMetadataFlags(markers: ModelPackageRuntimeTemporaryMetadataFlag[]): void {
+    markers.forEach((marker) => {
+      if (marker.node.isDisposed()) {
+        return;
+      }
+
+      const metadata = { ...this.asMetadataObject(marker.node.metadata) };
+      if (marker.hadGeneratedFlag) {
+        metadata.generatedByParametricRuntime = marker.generatedFlagValue;
+      } else {
+        delete metadata.generatedByParametricRuntime;
+      }
+      marker.node.metadata = metadata;
+    });
+  }
+
   /** 捕获模型包根节点用户可编辑状态，供运行脚本生命周期结束后恢复。 */
   private captureModelPackageEditableState(
     root: TransformNode,
@@ -7225,12 +9464,14 @@ export class BabylonEditorEngine {
   ): ModelPackageEditableStateSnapshot {
     const editorMetadata = this.getNodeEditorMetadata(root);
     const modelPackageInstance = this.deepCloneMetadata(editorMetadata.modelPackageInstance);
+    const parametricRootScaling = this.getModelPackageParametricRootScaling(root);
     return {
       name: root.name,
       position: root.position.clone(),
       rotation: root.rotation.clone(),
       rotationQuaternion: root.rotationQuaternion?.clone() ?? null,
-      scaling: root.scaling.clone(),
+      scaling: this.divideVectorComponents(root.scaling, parametricRootScaling),
+      parametricRootScaling,
       modelPackageInstance,
       values: this.cloneDynamicParameterValues(values)
     };
@@ -7242,13 +9483,62 @@ export class BabylonEditorEngine {
     root.position.copyFrom(snapshot.position);
     root.rotation.copyFrom(snapshot.rotation);
     root.rotationQuaternion = snapshot.rotationQuaternion?.clone() ?? null;
-    root.scaling.copyFrom(snapshot.scaling);
+    root.scaling.copyFrom(this.multiplyVectorComponents(snapshot.scaling, snapshot.parametricRootScaling));
     this.mergeNodeEditorMetadata(root, {
       modelPackageInstance: {
         ...snapshot.modelPackageInstance,
         values: this.cloneDynamicParameterValues(snapshot.values)
+      },
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        parametricRootScaling: snapshotVector(snapshot.parametricRootScaling)
       }
     });
+  }
+
+  /** 读取上一次 runtime 写入的根节点参数化缩放，旧场景没有记录时按无参数化缩放处理。 */
+  private getModelPackageParametricRootScaling(root: TransformNode): Vector3 {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    const scaling = this.asMetadataObject(runtimeMetadata.parametricRootScaling);
+    return new Vector3(
+      this.normalizeModelPackageScaleComponent(scaling.x),
+      this.normalizeModelPackageScaleComponent(scaling.y),
+      this.normalizeModelPackageScaleComponent(scaling.z)
+    );
+  }
+
+  /** 创建默认参数化缩放，表示 runtime 暂未改变根节点尺寸。 */
+  private createDefaultParametricRootScaling(): Vector3 {
+    return new Vector3(1, 1, 1);
+  }
+
+  /** 收敛 runtime 本次算出的根节点缩放，避免异常脚本把非法值写入 metadata。 */
+  private normalizeModelPackageParametricRootScaling(scaling: Vector3): Vector3 {
+    return new Vector3(
+      this.normalizeModelPackageScaleComponent(scaling.x),
+      this.normalizeModelPackageScaleComponent(scaling.y),
+      this.normalizeModelPackageScaleComponent(scaling.z)
+    );
+  }
+
+  /** 归一化单个缩放分量，过小或非法时回退到 1，避免后续拆分用户缩放时除零。 */
+  private normalizeModelPackageScaleComponent(value: unknown): number {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) && Math.abs(numberValue) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? numberValue : 1;
+  }
+
+  /** 按分量相除，用于从最终根缩放中扣除参数化缩放，得到用户编辑缩放。 */
+  private divideVectorComponents(left: Vector3, right: Vector3): Vector3 {
+    return new Vector3(
+      left.x / this.normalizeModelPackageScaleComponent(right.x),
+      left.y / this.normalizeModelPackageScaleComponent(right.y),
+      left.z / this.normalizeModelPackageScaleComponent(right.z)
+    );
+  }
+
+  /** 按分量相乘，用于把用户缩放和 runtime 参数化缩放合成最终视口缩放。 */
+  private multiplyVectorComponents(left: Vector3, right: Vector3): Vector3 {
+    return new Vector3(left.x * right.x, left.y * right.y, left.z * right.z);
   }
 
   /** 同步脚本读取的 metadata.scripts[]，桥接编辑器内部参数存储和模型包运行脚本契约。 */
@@ -7309,21 +9599,160 @@ export class BabylonEditorEngine {
     };
   }
 
-  /** 读取模型包实例当前值，缺失字段回退 manifest 默认值。 */
+  /** 读取并归一化模型包实例当前值，缺失字段回退 manifest 默认值，旧包装值返回为裸值。 */
   private getModelPackageValues(root: TransformNode, manifest: ModelPackageManifest): Record<string, DynamicParameterValue> {
     const editorMetadata = this.getNodeEditorMetadata(root);
     const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
     return {
       ...this.createInitialDynamicParameterValues(manifest),
-      ...this.asMetadataObject(instance.values)
+      ...this.normalizeDynamicParameterValueMap(this.asMetadataObject(instance.values), manifest.dynamicFields, true)
     } as Record<string, DynamicParameterValue>;
+  }
+
+  /** 将模型包参数按裸值字典写回 metadata.editor，作为场景保存和脚本同步的权威来源。 */
+  private persistModelPackageValues(root: TransformNode, values: Record<string, DynamicParameterValue>): void {
+    const editorMetadata = this.getNodeEditorMetadata(root);
+    const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageInstance: {
+        ...instance,
+        values: this.cloneDynamicParameterValues(values)
+      }
+    });
   }
 
   /** 在缺少资产 manifest 时读取原始模型包参数，用于停止运行脚本时兜底保护用户输入。 */
   private getRawModelPackageValues(root: TransformNode): Record<string, DynamicParameterValue> {
     const editorMetadata = this.getNodeEditorMetadata(root);
     const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
-    return this.cloneDynamicParameterValues(this.asMetadataObject(instance.values) as Record<string, DynamicParameterValue>);
+    return this.normalizeUntypedDynamicParameterValueMap(this.asMetadataObject(instance.values));
+  }
+
+  /** 按字段定义批量归一化动态参数，兼容旧场景中的 { value } 包装结构。 */
+  private normalizeDynamicParameterValueMap(
+    rawValues: Record<string, unknown>,
+    fields: DynamicInspectorField[],
+    includeUnknown: boolean
+  ): Record<string, DynamicParameterValue> {
+    const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
+    return Object.entries(rawValues).reduce<Record<string, DynamicParameterValue>>((output, [key, rawValue]) => {
+      const field = fieldsByKey.get(key);
+      const value = field
+        ? this.normalizeDynamicParameterValueForField(field, rawValue)
+        : includeUnknown
+          ? this.normalizeUntypedDynamicParameterValue(rawValue)
+          : undefined;
+      if (value !== undefined) {
+        output[key] = value;
+      }
+      return output;
+    }, {});
+  }
+
+  /** 未拿到 manifest 时按安全标量规则归一化旧参数值。 */
+  private normalizeUntypedDynamicParameterValueMap(rawValues: Record<string, unknown>): Record<string, DynamicParameterValue> {
+    return Object.entries(rawValues).reduce<Record<string, DynamicParameterValue>>((output, [key, rawValue]) => {
+      const value = this.normalizeUntypedDynamicParameterValue(rawValue);
+      if (value !== undefined) {
+        output[key] = value;
+      }
+      return output;
+    }, {});
+  }
+
+  /** 根据字段类型归一化单个动态参数值。 */
+  private normalizeDynamicParameterValueForField(field: DynamicInspectorField, value: unknown): DynamicParameterValue | undefined {
+    const unwrapped = this.unwrapDynamicParameterValue(value);
+    if (field.kind === "number") {
+      return this.normalizeNumberDynamicParameterValue(unwrapped);
+    }
+
+    if (field.kind === "string") {
+      return typeof unwrapped === "string" ? unwrapped : undefined;
+    }
+
+    if (field.kind === "boolean") {
+      return this.normalizeBooleanDynamicParameterValue(unwrapped);
+    }
+
+    if (field.kind === "color3") {
+      return this.normalizeColor3DynamicParameterValue(unwrapped);
+    }
+
+    return undefined;
+  }
+
+  /** 在没有字段定义时只保留可安全序列化的动态参数值。 */
+  private normalizeUntypedDynamicParameterValue(value: unknown): DynamicParameterValue | undefined {
+    const unwrapped = this.unwrapDynamicParameterValue(value);
+    if (typeof unwrapped === "number") {
+      return Number.isFinite(unwrapped) ? unwrapped : undefined;
+    }
+    if (typeof unwrapped === "string" || typeof unwrapped === "boolean") {
+      return unwrapped;
+    }
+    return this.normalizeColor3DynamicParameterValue(unwrapped);
+  }
+
+  /** 从 meta 或旧场景包装对象中拆出真实参数值。 */
+  private unwrapDynamicParameterValue(value: unknown): unknown {
+    const record = this.asMetadataObject(value);
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (Object.prototype.hasOwnProperty.call(record, "value") ||
+        Object.prototype.hasOwnProperty.call(record, "currentValue") ||
+        Object.prototype.hasOwnProperty.call(record, "defaultValue"))
+    ) {
+      return record.value ?? record.currentValue ?? record.defaultValue;
+    }
+    return value;
+  }
+
+  /** 归一化数字动态参数，兼容旧场景保存为字符串数字的情况。 */
+  private normalizeNumberDynamicParameterValue(value: unknown): number | undefined {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
+      return Number(value);
+    }
+    return undefined;
+  }
+
+  /** 归一化布尔动态参数，兼容旧场景保存为 true/false 字符串的情况。 */
+  private normalizeBooleanDynamicParameterValue(value: unknown): boolean | undefined {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string" && ["true", "false"].includes(value.trim().toLowerCase())) {
+      return value.trim().toLowerCase() === "true";
+    }
+    return undefined;
+  }
+
+  /** 归一化 Color3 动态参数，保持 0-1 颜色快照可序列化。 */
+  private normalizeColor3DynamicParameterValue(value: unknown): DynamicParameterValue | undefined {
+    const color = this.asMetadataObject(value);
+    if ([color.r, color.g, color.b].every((component) => typeof component === "number" && Number.isFinite(component))) {
+      return {
+        r: Number(color.r),
+        g: Number(color.g),
+        b: Number(color.b)
+      };
+    }
+    return undefined;
+  }
+
+  /** 读取数字参数值，用于旧实例兜底逻辑兼容包装值。 */
+  private readDynamicNumberParameter(value: unknown): number | undefined {
+    return this.normalizeNumberDynamicParameterValue(this.unwrapDynamicParameterValue(value));
+  }
+
+  /** 读取布尔参数值，用于旧实例兜底逻辑兼容包装值和字符串布尔值。 */
+  private readDynamicBooleanParameter(value: unknown): boolean | undefined {
+    return this.normalizeBooleanDynamicParameterValue(this.unwrapDynamicParameterValue(value));
   }
 
   /** 把动态参数注入运行脚本实例，兼容脚本通过 this.xxx 读取参数的写法。 */
@@ -7463,23 +9892,7 @@ export class BabylonEditorEngine {
 
   /** 校验动态参数值是否匹配字段类型，避免损坏数据写入 metadata。 */
   private isDynamicParameterValueCompatible(field: DynamicInspectorField, value: DynamicParameterValue): boolean {
-    if (field.kind === "number") {
-      return typeof value === "number" && Number.isFinite(value);
-    }
-
-    if (field.kind === "color3") {
-      return this.isColor3ParameterValue(value);
-    }
-
-    if (field.kind === "string") {
-      return typeof value === "string";
-    }
-
-    if (field.kind === "boolean") {
-      return typeof value === "boolean";
-    }
-
-    return false;
+    return this.normalizeDynamicParameterValueForField(field, value) !== undefined;
   }
 
   /** 判断动态参数是否是可序列化 Color3 值。 */
@@ -8061,26 +10474,35 @@ export class BabylonEditorEngine {
       return null;
     }
 
+    const sourceValues = asset.modelPackage ? this.getModelPackageValues(sourceNode, asset.modelPackage) : undefined;
     if (asset.modelPackage) {
       this.stopModelPackageRuntime(sourceNode, true);
     }
     const cloneName = this.createUniqueCopyName(sourceNode.name || asset.name);
-    const clone = sourceNode.clone(cloneName, null, false);
-    if (asset.modelPackage) {
-      this.applyModelPackageRuntime(sourceNode, asset.modelPackage, "clone");
+    let clone: TransformNode | null = null;
+    try {
+      const clonedNode = sourceNode.clone(cloneName, null, false);
+      if (clonedNode instanceof TransformNode) {
+        clone = clonedNode;
+        this.prepareClonedHierarchy(clone, sourceNode, false);
+      }
+    } finally {
+      if (asset.modelPackage && sourceValues) {
+        this.applyModelPackageRuntimeWithDynamicFallbacks(sourceNode, asset.modelPackage, "clone", sourceValues);
+      }
     }
+
     if (!(clone instanceof TransformNode)) {
       return null;
     }
 
-    this.prepareClonedHierarchy(clone, sourceNode, false);
     clone.name = cloneName;
     clone.setEnabled(true);
     this.updateNodeVisibility(clone, true);
 
     this.alignNodeBaseToPosition(clone, position);
     if (asset.modelPackage) {
-      this.applyModelPackageRuntime(clone, asset.modelPackage, "import");
+      this.applyModelPackageRuntimeWithDynamicFallbacks(clone, asset.modelPackage, "import", this.getModelPackageValues(clone, asset.modelPackage));
     }
     this.selectNode(clone);
     this.ensureNodeGridCoverage(clone);
@@ -8199,6 +10621,7 @@ export class BabylonEditorEngine {
       typeof manifest.packageId === "string" &&
       typeof manifest.displayName === "string" &&
       typeof manifest.rootDirectoryName === "string" &&
+      (manifest.sourceRoot === undefined || typeof manifest.sourceRoot === "string") &&
       typeof manifest.primaryModelFile === "string" &&
       (manifest.scriptFile === undefined || typeof manifest.scriptFile === "string") &&
       (manifest.runtimeScriptFile === undefined || typeof manifest.runtimeScriptFile === "string") &&
@@ -8259,9 +10682,21 @@ export class BabylonEditorEngine {
       (group.kind === undefined || group.kind === "translate" || group.kind === "rotate") &&
       ["x", "y", "z"].includes(String(group.axis)) &&
       this.isStringArray(group.nodes) &&
+      (group.valueMode === undefined || group.valueMode === "target" || group.valueMode === "action") &&
+      (group.actionMap === undefined || this.isModelDataDrivenActionMap(group.actionMap)) &&
+      (group.target === undefined || group.target === "nodes" || group.target === "root") &&
       (group.fallbackPattern === undefined || typeof group.fallbackPattern === "string") &&
       (group.speed === undefined || (typeof group.speed === "number" && Number.isFinite(group.speed) && group.speed > 0)) &&
       (group.limits === undefined || this.isModelDataDrivenMotionLimitDefinition(group.limits))
+    );
+  }
+
+  /** 校验 action 模式下协议枚举到运动方向的映射表。 */
+  private isModelDataDrivenActionMap(value: unknown): boolean {
+    const actionMap = this.asMetadataObject(value);
+    return (
+      Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
+      Object.values(actionMap).every((direction) => typeof direction === "number" && Number.isFinite(direction))
     );
   }
 
@@ -8285,6 +10720,7 @@ export class BabylonEditorEngine {
       Boolean(value && typeof value === "object" && !Array.isArray(value)) &&
       (cargoHandling.actionFields === undefined || this.isStringArray(cargoHandling.actionFields)) &&
       (cargoHandling.cargoFields === undefined || this.isStringArray(cargoHandling.cargoFields)) &&
+      (cargoHandling.targetFields === undefined || this.isStringArray(cargoHandling.targetFields)) &&
       (cargoHandling.pickupValues === undefined || this.isStringArray(cargoHandling.pickupValues)) &&
       (cargoHandling.dropValues === undefined || this.isStringArray(cargoHandling.dropValues)) &&
       (cargoHandling.pickupMinForkExtension === undefined || (typeof cargoHandling.pickupMinForkExtension === "number" && Number.isFinite(cargoHandling.pickupMinForkExtension))) &&
@@ -8385,13 +10821,7 @@ export class BabylonEditorEngine {
   private isDynamicParameterValueMap(value: unknown): boolean {
     const values = this.asMetadataObject(value);
     return Boolean(value && typeof value === "object" && !Array.isArray(value)) && Object.values(values).every((item) => {
-      if (typeof item === "number") {
-        return Number.isFinite(item);
-      }
-      if (typeof item === "string" || typeof item === "boolean") {
-        return true;
-      }
-      return this.isColor3ParameterValue(item as DynamicParameterValue);
+      return this.normalizeUntypedDynamicParameterValue(item) !== undefined;
     });
   }
 
