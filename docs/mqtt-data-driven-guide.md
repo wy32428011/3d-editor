@@ -48,9 +48,9 @@ Babylon 场景节点位姿变化（模型按真实数据运动）
 - `movement_z`：`0` 原位/停止，`1` 上升，`2` 下降；用于四向车等需要顶升的整车模型预留。
 - `front_movement_z` / `back_movement_z` / `forkState`：`0` 停止，`1/3` 伸出，`2/4` 缩回；用于 Stacker 和多穿小车货叉。
 - `rotation`：`0` 停止，`1` 正转，`2` 反转；可作为输送线辊筒、移载辊的正反转别名。
-- `distance_x/distance_y/distance_z` 与 `rpm_*` 当前只作为协议遥测字段保留，不直接换算模型位移或角速度。
+- Stacker `distancex` 是行走绝对距离，单位毫米，运行时直接使用 MQTT 原值并以轨道起点为 0 点校准行走位置；`front_distanceY/back_distanceY` 是前/后叉载台高度校准值，单位毫米，运行时换算为米后校准 Stacker 升降位置；通用 `distance_x/distance_y/distance_z` 与 `rpm_*` 当前只作为协议遥测字段保留，不直接换算模型位移或角速度。
 - 设备号既支持旧字段 `e`，也支持 Excel 常用字段 `deviceCode`；现场 DDJ2 报文中的 `device_code/deviceCode` 会作为调度号和业务字段保留，默认不覆盖 `e` 设备匹配号。规范 topic 缺少设备字段时仍会用 topic 中的 `{deviceId}` 兜底。
-- DDJ2 Stacker PLC 报文支持 `{data:[{e,p,v}],ts}` 包装：`action` bit0/bit1 转行走前进/后退，`front_action/back_action` bit2/bit3 转载货台上升/下降，`front_forkAction/back_forkAction` bit1 或 bit3 转伸叉、bit2 或 bit4 转缩叉。蓝色区域遥测和状态字段默认不驱动模型。
+- DDJ2 Stacker PLC 报文支持 `{data:[{e,p,v}],ts}` 包装：`action` bit0/bit1 转行走前进/后退，`front_action/back_action` bit2/bit3 转载货台上升/下降，`front_distanceY/back_distanceY` 校准载台高度，`front_forkAction/back_forkAction` bit1 或 bit3 转伸叉、bit2 或 bit4 转缩叉。蓝色区域其他遥测和状态字段默认不驱动模型。
 - 模型包新增 `valueMode:"action"`、`actionMap` 和 `target:"root"`。旧 `valueMode:"target"` 数值目标模式继续保留，已导入的旧场景不会自动切换到动作模式。
 - 新模型包或修改过 `dataDriven` 的模型包需要重新导入，编辑器才会重新解析模型脚本里的动作声明。
 
@@ -213,7 +213,7 @@ dt/factory/logistics/+/+/twindatadriven/#
 
 **坐标映射规则**：文档平面 `x/y` 落到编辑器地面 `x/z`，文档高度 `h` 落到编辑器垂直 `y`。该映射对**声明了 `dataDriven.device` 的模型包**（本仓库 9 个设备模型全部声明）和识别为 Stacker 的模型自动生效。
 
-**数值语义**：整机位姿是**世界绝对坐标**（不是相对基线），数据服务直接发设备在场景坐标系中的真实位置；`r` 为绝对朝向角。字段可缺省——缺省的轴保持当前值不变。
+**数值语义**：整机位姿是**世界绝对坐标**（不是相对基线），数据服务直接发设备在场景坐标系中的真实位置；`r` 为绝对朝向角。字段可缺省——缺省的轴保持当前值不变。Stacker 会额外把 `twinspawn` 平面位置夹紧到进入预览时的上下轨道范围内，高度 `h` 和朝向 `r` 不参与夹紧。
 
 兜底字段：除 `x/y/h/r` 外，运行时还接受 `position.x`、`pos.x`、`location.x`、`height`、`yaw`、`rotationY`、`heading` 等常见别名。
 
@@ -260,19 +260,21 @@ dt/factory/logistics/+/+/twindatadriven/#
 - `movement_z: 0/1/2` 表示原位/上升/下降，主要给四向车等有顶升动作的整车模型预留。
 - `front_movement_z`、`back_movement_z`、`forkState`：`0` 停止，`1/3` 伸出，`2/4` 缩回。
 - `rotation: 0/1/2` 表示停止/正转/反转，可作为输送线辊筒、移载辊的别名字段。
-- `distance_x/distance_y/distance_z` 和 `rpm_*` 本轮只作为协议遥测字段保留，不直接换算位移或角速度。
+- Stacker `distancex` 按 MQTT 毫米原值校准行走位置，不做单位转换，同帧存在 `action` 时优先使用 `distancex`；`front_distanceY/back_distanceY` 按毫米值换算为米后校准载台高度，并优先于同帧升降动作；通用 `distance_x/distance_y/distance_z` 和 `rpm_*` 只作为协议遥测字段保留，不直接换算位移或角速度。
 
 **DDJ2 PLC 点位映射**：
 
 | PLC 点位 | 位信号 | 标准动作字段 | 说明 |
 |---|---|---|---|
 | `action` | bit0 前进，bit1 后退 | `movement_x` | 两个位同时为 0 或冲突时按停止处理 |
+| `distancex` | 毫米绝对距离 | Stacker travel 目标 | 以轨道起点为 0 点，直接使用 MQTT 原值校准行走位置 |
 | `front_action` / `back_action` | bit2 上升，bit3 下降 | `movement_y` | 任一前/后叉升降信号可驱动载货台升降 |
+| `front_distanceY` / `back_distanceY` | 毫米绝对高度 | Stacker lift 目标 | 前叉值优先，缺失或非法时使用后叉值；同帧优先于升降动作 |
 | `front_forkAction` | bit1/bit3 伸叉，bit2/bit4 缩叉 | `front_movement_z` | 前叉伸缩 |
 | `back_forkAction` | bit1/bit3 伸叉，bit2/bit4 缩叉 | `back_movement_z` | 后叉伸缩 |
 | `device_code` / `deviceCode` | 调度号 | 保留业务字段 | 不覆盖 `e=DDJ2` 设备匹配号 |
 
-运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`deviceCode/device_code` 都能被识别。`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`front_distanceY/back_distanceY`、`*_rpm`、`*_electric Current`、`*_workingHours`、`*_runingTimes` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算。截图蓝色区域属于非程序逻辑信号，非必要时不作为模型驱动输入。
+运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`deviceCode/device_code`、`distanceX/distance_x`、`frontDistanceY/backDistanceY`、`front_distanceY/back_distanceY` 都能被识别。`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`*_rpm`、`*_electric Current`、`*_workingHours`、`*_runingTimes` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算。截图蓝色区域属于非程序逻辑信号，非必要时不作为模型驱动输入。
 
 **模型包语义**：`dataDriven.motion.<group>.valueMode` 缺省为 `"target"`，保留旧数值目标模式；新模型包显式声明 `valueMode:"action"`。action 模式下运行时按渲染帧积分：`当前值 += actionDirection * speed * deltaSeconds`，`translate` 的 `speed` 单位为 `m/s`，`rotate` 的 `speed` 单位为 `deg/s`。动作值为 `0` 时停止并保持当前位置；真实连接超过 5 秒无新消息时也会停住，避免断流后继续移动。
 
@@ -280,7 +282,7 @@ dt/factory/logistics/+/+/twindatadriven/#
 
 ### 5.3 负载、状态与告警帧
 
-负载绑定用于同步载体设备与负载的关系。模型包配置了货箱吸附语义时，`twindatadriven/payload` 会被归一为现有货箱字段并在预览态同步到载体锚点；配置了运动组的输送线类设备收到同类 payload 后，可以把货箱绑定到该输送线并由 `movement_x` 动作推进货箱，不要求数据侧持续发送货箱距离坐标。当前 opaque 辊道机 `RollerConveyor01` 支持 `payload` 绑定货箱，`movement_x/rotation` 会同时驱动 `GT` 辊筒旋转和货箱沿辊道有界移动，货箱整箱不会超出辊筒输送段：
+负载绑定用于同步载体设备与负载的关系。模型包配置了货箱吸附语义时，`twindatadriven/payload` 会被归一为现有货箱字段并在预览态同步到载体锚点；配置了运动组的输送线类设备收到同类 payload 后，可以把货箱绑定到该输送线并由 `movement_x` 动作推进货箱，不要求数据侧持续发送货箱距离坐标。当前 opaque 辊道机 `RollerConveyor01` 支持 `payload` 绑定货箱，`movement_x/rotation` 会同时驱动原始 `GT` 辊筒和参数化生成的同源辊筒绕自身几何中心自转，并推动货箱沿辊道有界移动，货箱整箱不会超出辊筒输送段：
 
 ```json
 {"e":"Stacker01","p":"payload","v":"BOX008","ts":1746991234567}
@@ -382,7 +384,9 @@ payload 示例：
 | 点位 | 动作枚举 | kind/axis | 默认速度 | 效果 |
 |---|---|---|---|---|
 | `movement_x` | `0` 停止，`1` 前进，`2` 后退 | translate / z | `0.8m/s` | 行走机构沿轨道方向持续移动；上下轨道 `fixedNodes` 保持固定 |
+| `distancex` | 毫米绝对距离 | translate / z | `0.8m/s` | 以轨道起点为 0 点校准行走位置；同帧优先于 `action/movement_x` |
 | `movement_y` | `0` 停止，`1` 上升，`2` 下降 | translate / y | `0.3m/s` | 载货台 + 货叉垂直升降 |
+| `front_distanceY` / `back_distanceY` | 毫米绝对高度 | translate / y | `0.3m/s` | 校准载台 + 货叉垂直位置；同帧优先于 `front_action/back_action` |
 | `front_movement_z` / `back_movement_z` / `forkState` | `0` 停止，`1/3` 伸，`2/4` 缩 | translate / x | `0.25m/s` | 货叉水平伸缩 |
 | `cargo_action` | 字符串 | — | — | `pickup`/`drop`，见第 7 章 |
 | `cargo` | 字符串 | — | — | 被取放货箱的资产编号 |
@@ -391,7 +395,9 @@ payload 示例：
 ```json
 [
   {"deviceCode":"Stacker01","p":"movement_x","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"distancex","v":260928,"ts":1746991234567},
   {"deviceCode":"Stacker01","p":"movement_y","v":1,"ts":1746991234567},
+  {"deviceCode":"Stacker01","p":"front_distanceY","v":2366,"ts":1746991234567},
   {"deviceCode":"Stacker01","p":"front_movement_z","v":1,"ts":1746991234567},
   {"deviceCode":"Stacker01","p":"back_movement_z","v":1,"ts":1746991234567},
   {"deviceCode":"Stacker01","p":"cargo_action","v":"pickup","ts":1746991234567},
@@ -399,7 +405,7 @@ payload 示例：
 ]
 ```
 
-Stacker 行走会按固定轨道节点推导行程边界；升降和货叉伸缩也声明了 `limits`，动作持续发送到边界后会停在边界内侧，不会越界。
+Stacker 行走会按固定轨道节点推导行程边界；没有端部挡块节点时，运行时会用上下轨道 `fixedNodes` 的整体几何范围兜底。`distancex`、`movement_x` 持续动作和 `twinspawn` 平面位置都会被限制在进入预览时的轨道范围内；`front_distanceY/back_distanceY` 会换算为米制高度并按 lift 限位截断，升降动作和货叉伸缩仍按各自 `limits` 截断。
 
 DDJ2 PLC 点位示例：
 
@@ -408,6 +414,7 @@ DDJ2 PLC 点位示例：
   "data": [
     {"e":"DDJ2","p":"device_code","v":"1"},
     {"e":"DDJ2","p":"action","v":"1"},
+    {"e":"DDJ2","p":"distancex","v":"260928"},
     {"e":"DDJ2","p":"front_action","v":"4"},
     {"e":"DDJ2","p":"back_action","v":"4"},
     {"e":"DDJ2","p":"front_forkAction","v":"2"},
@@ -466,7 +473,7 @@ DDJ2 PLC 点位示例：
 ]
 ```
 
-`RollerConveyor01` 会保留模型包 `dataDriven.motion.roller`，因此 `movement_x=1/2/0` 和 `rotation=1/2/0` 会驱动 `GT` 辊筒自转；收到 `payload` 绑定后，货箱会沿辊道根节点本地 X 轴移动，并按当前辊筒输送段做整箱夹紧。货箱到末端后保持绑定并停在末端，继续收到同向信号不会越界；收到反向 `movement_x/rotation` 或新的 `payload` 绑定后恢复移动。
+`RollerConveyor01` 会保留模型包 `dataDriven.motion.roller`，因此 `movement_x=1/2/0` 和 `rotation=1/2/0` 会驱动原始 `GT` 辊筒和参数化生成的同源辊筒自转；预览态会把这些辊筒的 pivot 临时校正到各自几何中心，避免围绕模型原点旋转。收到 `payload` 绑定后，货箱会沿辊道根节点本地 X 轴移动，并按当前辊筒输送段做整箱夹紧。货箱到末端后保持绑定并停在末端，继续收到同向信号不会越界；收到反向 `movement_x/rotation` 或新的 `payload` 绑定后恢复移动。
 
 ### 6.5 有电机辊道 MotorConveyor
 
@@ -587,9 +594,10 @@ motion: {
 
 规则：
 
-规则：
-
 - 显式 `min`/`max` 优先；缺省端点时，运行时沿运动轴投影**移动部件**和**防撞物体**的几何包围盒，取防撞物体内侧面（含 `clearance`）作为边界；
+- Stacker 行走组没有真实端部挡块、只声明上下轨道 `fixedNodes` 时，运行时会在防撞物体内侧面推导失败后改用轨道整体包围盒推导边界，并把 `twinspawn` 平面位置同步夹紧到同一轨道范围；
+- Stacker `distancex` 使用同一条行程边界，超过轨道范围的毫米距离只会被截断到最近端点；
+- Stacker `front_distanceY/back_distanceY` 会先从毫米换算到米，再使用 lift 组同一条升降边界截断；
 - 超范围的 payload 值**只截断不报错**，预览不中断；
 - 仅对 `translate` 运动组生效；
 - 旧 Stacker 模型未声明 `limits` 时自动用固定轨道节点推导行走范围，推导失败则不启用限制。
@@ -792,7 +800,7 @@ npm run demo:stacker-scene:dry-run -- --plc
 | 11 | 整机动但内部机构不动（或反之） | 点位名与模型包 `motion.*.fields` 不一致；或运动组节点名失配 | 核对第 6 章点位名；用层级面板核对 glTF 节点名与 `dataDriven.motion.*.nodes` |
 | 12 | 数据包了一层 `data`/`result` | 包装未解开 | 设置「数据路径」；`data`/`payload`/`message` 包装会自动递归展开 |
 | 13 | 模型瞬移不平滑 | 插值设为 0，或发布间隔远大于插值时长 | 调大「插值(ms)」（如 200–500） |
-| 14 | 行走到一半停住 | 触发行程限制截断（不是故障） | 核对 `limits` 配置与轨道长度；越界值按边界截断 |
+| 14 | 行走到一半停住 | 触发行程限制截断（不是故障），或 `distancex` 已超过轨道可行走范围 | 核对 `limits` 配置、轨道长度和 `distancex` 毫米值；Stacker 无端部挡块时会按上下轨道几何范围截断 |
 | 15 | 货箱不吸附 | 伸叉量 < 0.45m、货箱超 2.5m、编号不匹配 | 核对 7.2 阈值与货箱资产编号 |
 | 16 | 「启动 Stacker 模拟」按钮置灰 | 模型被锁定 | 层级面板解锁后重试 |
 | 17 | 选中后没有「数据驱动」分区 | 选中的是 Group/POI/CAD 节点 | 选择拖入场景的模型实例本体 |

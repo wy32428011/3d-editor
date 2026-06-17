@@ -1816,25 +1816,33 @@ export class BabylonEditorEngine {
       return false;
     }
 
-    const sourcePackageRoot = this.findModelPackageRoot(sourceNode) ?? sourceNode;
-    const sourceModelPackage = this.getModelPackageAssetForRoot(sourcePackageRoot)?.modelPackage;
-    this.cleanupPoiRuntimeInHierarchy(sourceNode);
-    if (sourceModelPackage) {
-      this.stopModelPackageRuntime(sourcePackageRoot, true);
+    const copyRoot = this.findModelPackageRoot(sourceNode) ?? sourceNode;
+    if (this.isNodeLocked(copyRoot)) {
+      return false;
     }
-    const template = this.cloneEditableNode(sourceNode, `__editor_clipboard_${sourceNode.uniqueId}__`);
+
+    const sourceModelPackage = this.getModelPackageAssetForRoot(copyRoot)?.modelPackage;
+    this.cleanupPoiRuntimeInHierarchy(copyRoot);
     if (sourceModelPackage) {
-      this.applyModelPackageRuntimeWithDynamicFallbacks(sourcePackageRoot, sourceModelPackage, "clone");
+      this.stopModelPackageRuntime(copyRoot, true);
+    }
+    let template: TransformNode | null = null;
+    try {
+      template = this.cloneEditableNode(copyRoot, `__editor_clipboard_${copyRoot.uniqueId}__`);
+    } finally {
+      if (sourceModelPackage) {
+        this.applyModelPackageRuntimeWithDynamicFallbacks(copyRoot, sourceModelPackage, "clone");
+      }
     }
     if (!template) {
       return false;
     }
 
-    this.prepareClonedHierarchy(template, sourceNode, true);
+    this.prepareClonedHierarchy(template, copyRoot, true);
     template.setEnabled(false);
     const previousTemplate = this.clipboardTemplateNode;
     this.clipboardTemplateNode = template;
-    this.clipboardBaseName = sourceNode.name || "模型";
+    this.clipboardBaseName = copyRoot.name || "模型";
     this.clipboardPasteCount = 0;
     if (previousTemplate) {
       this.disposeClonedNodeHierarchy(previousTemplate);
@@ -5674,6 +5682,7 @@ export class BabylonEditorEngine {
       }
       if (cloneNode === cloneRoot) {
         metadata[ROOT_FLAG] = !asClipboardTemplate;
+        this.resetClonedModelPackageRuntimeMetadata(metadata);
       }
       cloneNode.metadata = metadata;
       cloneNode.doNotSerialize = asClipboardTemplate;
@@ -5684,6 +5693,26 @@ export class BabylonEditorEngine {
 
     const cloneMeshes = cloneRoot instanceof AbstractMesh ? [cloneRoot, ...cloneRoot.getChildMeshes()] : cloneRoot.getChildMeshes();
     this.cloneHierarchyMaterials(cloneMeshes, asClipboardTemplate);
+  }
+
+  /** 重置克隆实例的模型包运行态缓存，动态参数仍从 modelPackageInstance.values 继承。 */
+  private resetClonedModelPackageRuntimeMetadata(metadata: Record<string, unknown>): void {
+    const editorMetadata = this.asMetadataObject(metadata.editor);
+    const instance = this.asMetadataObject(editorMetadata.modelPackageInstance);
+    if (typeof instance.packageId !== "string" || typeof instance.assetId !== "string") {
+      return;
+    }
+
+    const runtimeMetadata = { ...this.asMetadataObject(editorMetadata.modelPackageRuntime) };
+    this.clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata);
+    metadata.editor = {
+      ...editorMetadata,
+      modelPackageRuntime: {
+        ...runtimeMetadata,
+        warning: "",
+        parametricRootScaling: snapshotVector(this.createDefaultParametricRootScaling())
+      }
+    };
   }
 
   /** 按父子关系递归收集完整节点层级，覆盖 glTF 中常见的空 TransformNode。 */
@@ -8607,6 +8636,12 @@ export class BabylonEditorEngine {
     delete runtimeMetadata.opaqueRollerConveyorAutoRollerWidth;
     delete runtimeMetadata.opaqueRollerConveyorManualRollerCount;
     delete runtimeMetadata.opaqueRollerConveyorManualRollerWidth;
+  }
+
+  /** 克隆新实例时只清除几何基线，保留手动辊筒参数状态让副本外观跟随源模型。 */
+  private clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
+    delete runtimeMetadata.opaqueRollerConveyorBaseline;
+    delete runtimeMetadata.opaqueRollerConveyorAutoRollerCount;
   }
 
   /** 基线只能来自 GLB 原始节点，运行态克隆和脚本生成节点都不能参与。 */

@@ -36,6 +36,7 @@ const BASE_RECORDS = [
   ["stacker_error", "0"],
   ["move", "0"],
   ["action", "0"],
+  ["distancex", "260928"],
   ["special1", "0"],
   ["special2", "0"],
   ["stacker_electric Current", "0"],

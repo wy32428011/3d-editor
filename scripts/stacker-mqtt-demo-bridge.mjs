@@ -224,7 +224,7 @@ function createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhas
     { e: DEVICE_ID, p: "back_action", v: createLiftBitfield(Math.sin(liftPhase)) },
     { e: DEVICE_ID, p: "front_forkAction", v: createForkBitfield(forkAction) },
     { e: DEVICE_ID, p: "back_forkAction", v: createForkBitfield(forkAction) },
-    { e: DEVICE_ID, p: "distanceX", v: 0 },
+    { e: DEVICE_ID, p: "distancex", v: createTravelDistanceMillimeters(travelPhase) },
     { e: DEVICE_ID, p: "front_distanceY", v: 0 },
     { e: DEVICE_ID, p: "back_distanceY", v: 0 }
   ];
@@ -233,6 +233,11 @@ function createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhas
     frame.push({ e: DEVICE_ID, p: "cargo_action", v: cargoAction }, { e: DEVICE_ID, p: "cargo", v: DEMO_CARGO_ID });
   }
   return wrapDemoPayload(frame, ts);
+}
+
+/** 生成 Stacker 行走绝对距离，现场 distancex 使用毫米，范围控制在默认轨道模拟长度内。 */
+function createTravelDistanceMillimeters(travelPhase) {
+  return Math.round((1.4 + 1.2 * Math.sin(travelPhase)) * 1000);
 }
 
 /** 把周期函数转换为协议动作枚举：1 正向，2 反向，0 静止。 */

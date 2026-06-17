@@ -1,6 +1,7 @@
 import type { Scene } from "@babylonjs/core/scene";
 import { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
+import { Space } from "@babylonjs/core/Maths/math.axis";
 import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import type {
   ModelDataDrivenAxis,
@@ -28,8 +29,14 @@ const STACKER_DEMO_INTERVAL_MS = 250;
 const STACKER_DEMO_DEVICE_ID = "DDJ2";
 const STACKER_DEMO_CARGO_ID = "Box01";
 const STACKER_TRAVEL_FIELDS = ["travel_pos", "trackZ", "travelZ", "travel", "position.z", "pos.z", "location.z", "z"];
+const STACKER_TRAVEL_LIMIT_FIELDS = new Set([...STACKER_TRAVEL_FIELDS, "movement_x"].map((field) => field.toLowerCase()));
+const STACKER_DISTANCE_X_FIELD_COMPACT = "distancex";
 const STACKER_LIFT_FIELDS = ["lift_pos", "liftY", "lift", "platformY", "platform.y", "elevation"];
+const STACKER_LIFT_LIMIT_FIELDS = new Set([...STACKER_LIFT_FIELDS, "movement_y"].map((field) => field.toLowerCase()));
+const STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT = "frontdistancey";
+const STACKER_BACK_DISTANCE_Y_FIELD_COMPACT = "backdistancey";
 const STACKER_FORK_FIELDS = ["fork_extend", "forkExtend", "forkX", "fork.x", "fork.extend"];
+const STACKER_FORK_ACTION_FIELDS = ["front_movement_z", "back_movement_z", "forkState"];
 const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
 const STACKER_PLC_DEVICE_CODE_FIELD = "device_code";
 const CARGO_ACTION_FIELDS = ["cargo_action", "cargoAction", "cargo.action", "action"];
@@ -64,6 +71,10 @@ const STACKER_FORK_FALLBACK_PATTERN = /fork|叉|huocha|cha\d*/i;
 const MAX_CONFIGURED_FALLBACK_PATTERN_LENGTH = 160;
 const MAX_ACTION_DELTA_SECONDS = 1;
 const DEFAULT_ACTION_MAP_ENTRIES: Array<[string, number]> = [["0", 0], ["1", 1], ["2", -1]];
+const STACKER_FORK_ACTION_MAP_ENTRIES: Array<[string, number]> = [["3", 1], ["4", -1]];
+const DEFAULT_STACKER_FORK_ACTION_SPEED = 0.25;
+const DEFAULT_STACKER_FORK_EXTENSION_LIMIT = 0.75;
+const STACKER_FORK_FALLBACK_PATTERN_TEXT = "fork|叉|huocha|cha";
 
 type StackerMotionGroupKey = "travel" | "lift" | "fork" | "forkSide";
 
@@ -89,6 +100,16 @@ interface RuntimeMotionLimit {
   clearance: number;
 }
 
+/** Stacker 根节点位姿保护，使用进入预览时的轨道方向和行程范围限制 twinspawn 目标。 */
+interface StackerTrackConstraint {
+  horizontalAxis: Vector3;
+  horizontalNormal: Vector3;
+  baseAxisProjection: number;
+  baseNormalProjection: number;
+  minDelta?: number;
+  maxDelta?: number;
+}
+
 /** 节点在指定世界方向上的投影范围。 */
 interface ProjectedBounds {
   min: number;
@@ -108,6 +129,12 @@ type LegacyStackerMotionGroups = Record<StackerMotionGroupKey, RuntimeMotionGrou
 interface MotionRotationSnapshot {
   euler: Vector3;
   quaternion?: Quaternion;
+}
+
+/** 节点自转 pivot 快照，退出预览时恢复，避免运行态修改写回场景。 */
+interface MotionPivotSnapshot {
+  matrix: Matrix;
+  postMultiply: boolean;
 }
 
 /** 本地模拟预览使用的瞬时数据范围，不写入场景文件。 */
@@ -224,9 +251,11 @@ interface DataDrivenTargetState {
   motionBaseRotations: Map<number, MotionRotationSnapshot>;
   motionStartRotations: Map<number, MotionRotationSnapshot>;
   motionTargetRotations: Map<number, MotionRotationSnapshot>;
+  motionBasePivots: Map<number, MotionPivotSnapshot>;
   motionStartValues: Map<string, number>;
   motionValues: Map<string, number>;
   motionActionDirections: Map<string, number>;
+  stackerTrackConstraint: StackerTrackConstraint | null;
   cargoHandling: RuntimeCargoHandlingConfig | null;
   motionStartedAt: number;
   motionDurationMs: number;
@@ -507,10 +536,13 @@ export class SceneDataDrivenRuntime {
     const isStacker = legacyStackerGroups ? this.isStackerTarget(target, legacyStackerGroups) : false;
     const motionGroups = legacyStackerGroups ? this.createMotionGroups(target, isStacker, legacyStackerGroups) : [];
     const motionNodes = this.getMotionNodes(motionGroups);
+    const motionBasePivots = this.captureNodePivots(motionNodes);
+    this.applyRollerConveyorMotionPivots(target, motionGroups);
     const motionBasePositions = this.captureNodePositions(motionNodes);
     const motionBaseRotations = this.captureNodeRotations(motionNodes);
     const initialMotionValues = this.createInitialMotionValues(motionGroups);
     const rotationY = target.root.rotationQuaternion ? undefined : target.root.rotation.y;
+    const stackerTrackConstraint = isStacker ? this.createStackerTrackConstraint(target.root, motionGroups) : null;
     const state: DataDrivenTargetState = {
       target,
       isStacker,
@@ -529,9 +561,11 @@ export class SceneDataDrivenRuntime {
       motionBaseRotations,
       motionStartRotations: this.captureNodeRotations(motionNodes),
       motionTargetRotations: this.cloneNodeRotationSnapshots(motionBaseRotations),
+      motionBasePivots,
       motionStartValues: new Map(initialMotionValues),
       motionValues: initialMotionValues,
       motionActionDirections: this.createInitialMotionActionDirections(motionGroups),
+      stackerTrackConstraint,
       cargoHandling: this.createCargoHandlingConfig(target, isStacker, motionGroups),
       motionStartedAt: now,
       motionDurationMs: 0,
@@ -571,6 +605,69 @@ export class SceneDataDrivenRuntime {
     };
   }
 
+  /** 捕获节点 pivot，辊筒自转会临时把 pivot 改到几何中心。 */
+  private captureNodePivots(nodes: TransformNode[]): Map<number, MotionPivotSnapshot> {
+    return new Map(
+      nodes.map((node) => [
+        node.uniqueId,
+        {
+          matrix: node.getPivotMatrix().clone(),
+          postMultiply: node.isUsingPostMultiplyPivotMatrix()
+        }
+      ])
+    );
+  }
+
+  /** 恢复节点原始 pivot，避免预览态的自转中心配置污染编辑态或保存结果。 */
+  private restoreNodePivots(nodes: TransformNode[], pivots: Map<number, MotionPivotSnapshot>): void {
+    nodes.forEach((node) => {
+      const pivot = pivots.get(node.uniqueId);
+      if (pivot) {
+        node.setPivotMatrix(pivot.matrix, pivot.postMultiply);
+      }
+    });
+  }
+
+  /** opaque 辊道机的 GT 网格顶点使用绝对坐标，进入预览时把自转 pivot 放回每根辊筒几何中心。 */
+  private applyRollerConveyorMotionPivots(target: SceneDataDrivenTarget, motionGroups: RuntimeMotionGroup[]): void {
+    if (!this.isBoundedRollerConveyorTarget(target)) {
+      return;
+    }
+
+    const rollerNodes = this.dedupeTransformNodes(
+      motionGroups
+        .filter((group) => group.kind === "rotate" && group.target === "nodes")
+        .flatMap((group) => group.nodes)
+        .filter((node) => this.isRollerConveyorMotionNode(node))
+    );
+    rollerNodes.forEach((node) => this.setNodePivotToGeometryCenter(node));
+  }
+
+  /** 只处理 RollerConveyor 的 GT 辊筒和同源运行态克隆，避免影响其他输送设备的 rotate 组。 */
+  private isRollerConveyorMotionNode(node: TransformNode): boolean {
+    const nodeName = String(node.name ?? "");
+    const metadata = this.isRecord(node.metadata) ? node.metadata : {};
+    const sourceNodeName = typeof metadata.sourceNodeName === "string" ? metadata.sourceNodeName : "";
+    return /^GT\d+$/i.test(nodeName) || /^GT\d+$/i.test(sourceNodeName);
+  }
+
+  /** 将节点 pivot 设置为当前几何中心；没有可渲染几何时保持原 pivot。 */
+  private setNodePivotToGeometryCenter(node: TransformNode): void {
+    const bounds = this.getNodeWorldBounds(node);
+    if (!bounds) {
+      return;
+    }
+
+    const worldCenter = bounds.minimum.add(bounds.maximum).scaleInPlace(0.5);
+    node.computeWorldMatrix(true);
+    const localCenter = Vector3.TransformCoordinates(worldCenter, Matrix.Invert(node.getWorldMatrix()));
+    if (![localCenter.x, localCenter.y, localCenter.z].every(Number.isFinite)) {
+      return;
+    }
+
+    node.setPivotPoint(localCenter, Space.LOCAL);
+  }
+
   /** 退出预览时恢复所有已驱动模型的基线姿态。 */
   private restoreTargets(): void {
     const restoredRoots: TransformNode[] = [];
@@ -581,6 +678,7 @@ export class SceneDataDrivenRuntime {
       }
       this.restoreNodePositions(state.motionNodes, state.motionBasePositions);
       this.restoreNodeRotations(state.motionNodes, state.motionBaseRotations);
+      this.restoreNodePivots(state.motionNodes, state.motionBasePivots);
       restoredRoots.push(state.target.root);
     });
 
@@ -637,7 +735,10 @@ export class SceneDataDrivenRuntime {
     const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const fallbackDuration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
     const nextMotionValues = this.readMotionGroupValues(frame, state.motionGroups);
+    const nextDistanceMotionValues = this.readStackerDistanceMotionValues(frame, state);
+    this.mergeMotionValues(nextMotionValues, nextDistanceMotionValues);
     const nextActionDirections = this.readMotionGroupActionDirections(frame, state.motionGroups);
+    this.stopDistanceCalibratedActions(nextActionDirections, nextDistanceMotionValues);
     this.applyInterpolatedState(state, now);
     this.applyActionState(state, now, false);
     const currentMotionValues = this.createCurrentMotionValues(state, now);
@@ -698,7 +799,34 @@ export class SceneDataDrivenRuntime {
     if (z !== undefined) {
       position.z = z;
     }
-    return position;
+    return this.clampStackerRootTargetPosition(state, position);
+  }
+
+  /** 把 Stacker 整机位姿限制在进入预览时的轨道线上，避免 twinspawn 把主体推离上下轨道。 */
+  private clampStackerRootTargetPosition(state: DataDrivenTargetState, position: Vector3): Vector3 {
+    const constraint = state.stackerTrackConstraint;
+    if (!constraint) {
+      return position;
+    }
+
+    const next = position.clone();
+    const axisProjection = Vector3.Dot(next, constraint.horizontalAxis);
+    const normalProjection = constraint.baseNormalProjection;
+    let delta = axisProjection - constraint.baseAxisProjection;
+    if (constraint.minDelta !== undefined) {
+      delta = Math.max(constraint.minDelta, delta);
+    }
+    if (constraint.maxDelta !== undefined) {
+      delta = Math.min(constraint.maxDelta, delta);
+    }
+
+    const clampedAxisProjection = constraint.baseAxisProjection + delta;
+    const clampedHorizontal = constraint.horizontalAxis
+      .scale(clampedAxisProjection)
+      .addInPlace(constraint.horizontalNormal.scale(normalProjection));
+    next.x = clampedHorizontal.x;
+    next.z = clampedHorizontal.z;
+    return next;
   }
 
   /** 根据数据帧创建整机朝向，文档 twinspawn 的 r 和 yaw/rotationY 默认按角度解释。 */
@@ -1350,18 +1478,14 @@ export class SceneDataDrivenRuntime {
 
   /** 读取当前货叉伸出量，模型脚本自定义 fork 名称时也按字段名兜底识别。 */
   private readCurrentForkExtension(state: DataDrivenTargetState): number {
-    const directValue = state.motionValues.get("fork");
-    if (directValue !== undefined) {
-      return directValue;
-    }
-
+    let extension = 0;
     for (const group of state.motionGroups) {
       const key = group.key.toLowerCase();
-      if (key.includes("fork") && !key.includes("side")) {
-        return state.motionValues.get(group.key) ?? 0;
+      if ((key.includes("fork") && !key.includes("side")) || group.fields.some((field) => this.isStackerForkActionField(field))) {
+        extension = Math.max(extension, state.motionValues.get(group.key) ?? 0);
       }
     }
-    return 0;
+    return extension;
   }
 
   /** 按资产编号、节点名或 uniqueId 查找被取放的货箱根节点。 */
@@ -1878,6 +2002,12 @@ export class SceneDataDrivenRuntime {
       "movement_x",
       "movement_y",
       "movement_z",
+      "distancex",
+      "distanceX",
+      "DistanceX",
+      "distance_x",
+      "front_distanceY",
+      "back_distanceY",
       "front_movement_z",
       "back_movement_z",
       "front_action",
@@ -2030,6 +2160,115 @@ export class SceneDataDrivenRuntime {
     return group.valueMode === "target" && group.fields.length > 0 ? this.readNumber(frame, group.fields) : undefined;
   }
 
+  /** 汇总 Stacker 绝对距离校准值；同帧校准值优先于对应 action 积分。 */
+  private readStackerDistanceMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
+    const values = this.readStackerDistanceTravelMotionValues(frame, state);
+    this.mergeMotionValues(values, this.readStackerDistanceLiftMotionValues(frame, state));
+    return values;
+  }
+
+  /** 读取 Stacker 行走距离校验值，现场 distancex 使用毫米原值，运行时不做单位换算。 */
+  private readStackerDistanceTravelMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
+    const values = new Map<string, number>();
+    if (!state.isStacker) {
+      return values;
+    }
+
+    const distanceValue = this.readStackerDistanceXValue(frame);
+    if (distanceValue === undefined) {
+      return values;
+    }
+
+    const travelGroup = state.motionGroups.find((group) => this.isStackerTravelRuntimeMotionGroup(group));
+    if (!travelGroup) {
+      return values;
+    }
+
+    values.set(travelGroup.key, this.createStackerTravelValueFromDistance(distanceValue, travelGroup));
+    return values;
+  }
+
+  /** 读取 Stacker 前/后叉载台高度校准值，PLC 字段单位为毫米，场景内按米制高度驱动。 */
+  private readStackerDistanceLiftMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
+    const values = new Map<string, number>();
+    if (!state.isStacker) {
+      return values;
+    }
+
+    const distanceValue = this.readStackerDistanceYValue(frame);
+    if (distanceValue === undefined) {
+      return values;
+    }
+
+    const liftGroup = state.motionGroups.find((group) => this.isStackerLiftRuntimeMotionGroup(group));
+    if (!liftGroup) {
+      return values;
+    }
+
+    values.set(liftGroup.key, this.createStackerLiftValueFromDistance(distanceValue, liftGroup));
+    return values;
+  }
+
+  /** 在任意对象帧中查找 distancex 变体，兼容大小写和下划线写法。 */
+  private readStackerDistanceXValue(frame: DataFrame): number | undefined {
+    for (const [fieldName, fieldValue] of Object.entries(frame)) {
+      if (!this.isStackerDistanceXField(fieldName)) {
+        continue;
+      }
+
+      const numberValue = this.parseFiniteNumber(fieldValue);
+      if (Number.isFinite(numberValue)) {
+        return numberValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 优先使用前叉高度校准值，前叉缺失或非法时再用后叉值。 */
+  private readStackerDistanceYValue(frame: DataFrame): number | undefined {
+    return (
+      this.readStackerDistanceYValueByField(frame, STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT) ??
+      this.readStackerDistanceYValueByField(frame, STACKER_BACK_DISTANCE_Y_FIELD_COMPACT)
+    );
+  }
+
+  /** 读取指定前/后叉高度字段，兼容大小写和下划线写法。 */
+  private readStackerDistanceYValueByField(frame: DataFrame, compactFieldName: string): number | undefined {
+    for (const [fieldName, fieldValue] of Object.entries(frame)) {
+      if (this.normalizeProtocolFieldName(fieldName).replace(/[\s_]/g, "") !== compactFieldName) {
+        continue;
+      }
+
+      const numberValue = this.parseFiniteNumber(fieldValue);
+      if (Number.isFinite(numberValue)) {
+        return numberValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 将 PLC 上报的字符串或数字转换成有限数字。 */
+  private parseFiniteNumber(value: unknown): number {
+    return typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+  }
+
+  /** 判断字段是否是 Stacker X 向绝对距离，现场点位名为 distancex。 */
+  private isStackerDistanceXField(fieldName: string): boolean {
+    return this.normalizeProtocolFieldName(fieldName).replace(/[\s_]/g, "") === STACKER_DISTANCE_X_FIELD_COMPACT;
+  }
+
+  /** 根据距轨道起点的绝对距离生成 travel 运动组目标值，起点默认取当前限位 min 端。 */
+  private createStackerTravelValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
+    const travelOrigin = group.limits?.min ?? 0;
+    return travelOrigin + distanceValue;
+  }
+
+  /** 前/后叉 distanceY 是毫米绝对高度，进入米制场景前统一换算为 m。 */
+  private createStackerLiftValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
+    const liftOrigin = group.limits?.min ?? 0;
+    return liftOrigin + distanceValue / 1000;
+  }
+
   /** 读取 action 模式运动组绑定的原始枚举值，字符串和数字都按协议码处理。 */
   private readMotionGroupRawActionValue(frame: DataFrame, group: RuntimeMotionGroup): unknown {
     if (group.valueMode !== "action") {
@@ -2075,6 +2314,11 @@ export class SceneDataDrivenRuntime {
     return values;
   }
 
+  /** 合并同一帧的目标值，后写入的距离校验值优先于普通 target 字段。 */
+  private mergeMotionValues(target: Map<string, number>, source: Map<string, number>): void {
+    source.forEach((value, key) => target.set(key, value));
+  }
+
   /** 读取本帧命中的所有 action 模式方向，未上报字段沿用上一帧。 */
   private readMotionGroupActionDirections(frame: DataFrame, groups: RuntimeMotionGroup[]): Map<string, number> {
     const directions = new Map<string, number>();
@@ -2085,6 +2329,11 @@ export class SceneDataDrivenRuntime {
       }
     });
     return directions;
+  }
+
+  /** 绝对距离校准是对应运动组的权威位置；同帧命中时停止 action，避免校准后继续积分漂移。 */
+  private stopDistanceCalibratedActions(directions: Map<string, number>, distanceValues: Map<string, number>): void {
+    distanceValues.forEach((_value, key) => directions.set(key, 0));
   }
 
   /** 创建运动组目标值缓存，未上报字段按 0 解释为基线姿态。 */
@@ -2339,9 +2588,10 @@ export class SceneDataDrivenRuntime {
     const motion = target.dataDriven?.motion;
     if (motion) {
       const fixedNodeNames = target.dataDriven?.fixedNodes?.length ? target.dataDriven.fixedNodes : [];
-      return Object.entries(motion)
-        .map(([key, group]) =>
-          this.createRuntimeMotionGroup(
+      const groups = Object.entries(motion)
+        .map(([key, group]) => {
+          const useStackerTrackLimit = isStacker && this.isStackerTravelMotionDefinition(key, group);
+          return this.createRuntimeMotionGroup(
             key,
             target.root,
             group,
@@ -2350,14 +2600,28 @@ export class SceneDataDrivenRuntime {
             [],
             /$a/,
             fixedNodeNames,
-            isStacker && key === "travel" ? fixedNodeNames : [],
-            false
-          )
-        )
+            useStackerTrackLimit ? fixedNodeNames : [],
+            false,
+            useStackerTrackLimit
+          );
+        })
         .filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0));
+      if (isStacker && !this.hasStackerForkActionMotionGroup(groups)) {
+        this.appendStackerForkActionMotionGroup(groups, target.root, fixedNodeNames);
+      }
+      return groups;
     }
 
-    return isStacker ? Object.values(legacyStackerGroups).filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0)) : [];
+    if (!isStacker) {
+      return [];
+    }
+
+    const groups = Object.values(legacyStackerGroups).filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0));
+    if (!this.hasStackerForkActionMotionGroup(groups)) {
+      const fixedNodeNames = target.dataDriven?.fixedNodes?.length ? target.dataDriven.fixedNodes : STACKER_TRACK_NODE_NAMES;
+      this.appendStackerForkActionMotionGroup(groups, target.root, fixedNodeNames);
+    }
+    return groups;
   }
 
   /** 根据模型脚本或旧 Stacker 兜底规则创建四类 Stacker 运动组。 */
@@ -2376,7 +2640,8 @@ export class SceneDataDrivenRuntime {
         STACKER_TRAVEL_FALLBACK_PATTERN,
         fixedNodeNames,
         useLegacyFallback ? fixedNodeNames : [],
-        useLegacyFallback
+        useLegacyFallback,
+        true
       ),
       lift: this.createRuntimeMotionGroup(
         "lift",
@@ -2388,7 +2653,8 @@ export class SceneDataDrivenRuntime {
         STACKER_LIFT_FALLBACK_PATTERN,
         fixedNodeNames,
         [],
-        useLegacyFallback
+        useLegacyFallback,
+        false
       ),
       fork: this.createRuntimeMotionGroup(
         "fork",
@@ -2400,7 +2666,8 @@ export class SceneDataDrivenRuntime {
         STACKER_FORK_FALLBACK_PATTERN,
         fixedNodeNames,
         [],
-        useLegacyFallback
+        useLegacyFallback,
+        false
       ),
       forkSide: this.createRuntimeMotionGroup(
         "forkSide",
@@ -2412,9 +2679,59 @@ export class SceneDataDrivenRuntime {
         STACKER_FORK_FALLBACK_PATTERN,
         fixedNodeNames,
         [],
-        useLegacyFallback
+        useLegacyFallback,
+        false
       )
     };
+  }
+
+  /** 缺少模型包货叉动作组时，为 Stacker 追加协议兼容的伸缩动作组。 */
+  private appendStackerForkActionMotionGroup(groups: RuntimeMotionGroup[], root: TransformNode, fixedNodeNames: string[]): void {
+    const group = this.createStackerForkActionMotionGroup(root, fixedNodeNames);
+    if (group.nodes.length > 0) {
+      groups.push(group);
+    }
+  }
+
+  /** 创建 Stacker 默认货叉伸缩动作组，兼容现场 front/back_forkAction 归一后的标准字段。 */
+  private createStackerForkActionMotionGroup(root: TransformNode, fixedNodeNames: string[]): RuntimeMotionGroup {
+    const group: ModelDataDrivenMotionGroupDefinition = {
+      fields: STACKER_FORK_ACTION_FIELDS,
+      axis: "x",
+      nodes: STACKER_FORK_NODE_NAMES,
+      valueMode: "action",
+      speed: DEFAULT_STACKER_FORK_ACTION_SPEED,
+      actionMap: Object.fromEntries(STACKER_FORK_ACTION_MAP_ENTRIES),
+      fallbackPattern: STACKER_FORK_FALLBACK_PATTERN_TEXT,
+      limits: {
+        min: 0,
+        max: DEFAULT_STACKER_FORK_EXTENSION_LIMIT
+      }
+    };
+    return this.createRuntimeMotionGroup(
+      "forkAction",
+      root,
+      group,
+      [],
+      "x",
+      STACKER_FORK_NODE_NAMES,
+      STACKER_FORK_FALLBACK_PATTERN,
+      fixedNodeNames,
+      [],
+      false,
+      false
+    );
+  }
+
+  /** 判断是否已有可消费标准货叉动作字段的 action 组。 */
+  private hasStackerForkActionMotionGroup(groups: RuntimeMotionGroup[]): boolean {
+    return groups.some(
+      (group) =>
+        group.valueMode === "action" &&
+        group.kind === "translate" &&
+        group.target === "nodes" &&
+        group.fields.some((field) => this.isStackerForkActionField(field))
+    );
   }
 
   /** 创建一个运行时运动组；模型脚本存在时不再自动套用旧 Stacker 兜底节点。 */
@@ -2428,7 +2745,8 @@ export class SceneDataDrivenRuntime {
     fallbackPattern: RegExp,
     fixedNodeNames: string[],
     fallbackLimitNodeNames: string[],
-    useLegacyFallback: boolean
+    useLegacyFallback: boolean,
+    allowTrackBoundsLimitFallback: boolean
   ): RuntimeMotionGroup {
     const targetMode = group?.target ?? "nodes";
     const nodes = targetMode === "root" ? [] : this.findMotionGroupNodes(root, group, fallbackNodeNames, fallbackPattern, fixedNodeNames, useLegacyFallback);
@@ -2439,16 +2757,26 @@ export class SceneDataDrivenRuntime {
       axis: group?.axis ?? fallbackAxis,
       nodes,
       valueMode: group?.valueMode ?? "target",
-      actionMap: this.createRuntimeActionMap(group),
+      actionMap: this.createRuntimeActionMap(key, group),
       target: targetMode,
       speed: group?.speed,
-      limits: this.createRuntimeMotionLimit(root, nodes, group?.axis ?? fallbackAxis, group, targetMode === "nodes" ? fallbackLimitNodeNames : [])
+      limits: this.createRuntimeMotionLimit(
+        root,
+        nodes,
+        group?.axis ?? fallbackAxis,
+        group,
+        targetMode === "nodes" ? fallbackLimitNodeNames : [],
+        targetMode === "nodes" && allowTrackBoundsLimitFallback
+      )
     };
   }
 
   /** 创建 action 模式的协议枚举表，模型脚本可覆盖默认 0/1/2 方向。 */
-  private createRuntimeActionMap(group: ModelDataDrivenMotionGroupDefinition | undefined): Map<string, number> {
+  private createRuntimeActionMap(key: string, group: ModelDataDrivenMotionGroupDefinition | undefined): Map<string, number> {
     const map = new Map<string, number>(DEFAULT_ACTION_MAP_ENTRIES);
+    if (this.isStackerForkMotionDefinition(key, group)) {
+      STACKER_FORK_ACTION_MAP_ENTRIES.forEach(([actionKey, direction]) => map.set(actionKey, direction));
+    }
     Object.entries(group?.actionMap ?? {}).forEach(([key, value]) => {
       if (Number.isFinite(value)) {
         map.set(key, value);
@@ -2457,23 +2785,105 @@ export class SceneDataDrivenRuntime {
     return map;
   }
 
+  /** 判断运动组是否表达 Stacker 货叉伸缩，用于补齐 3/4 动作枚举。 */
+  private isStackerForkMotionDefinition(key: string, group: ModelDataDrivenMotionGroupDefinition | undefined): boolean {
+    const normalizedKey = key.toLowerCase();
+    return (
+      (normalizedKey.includes("fork") && !normalizedKey.includes("side")) ||
+      Boolean(group?.fields?.some((field) => this.isStackerForkActionField(field)))
+    );
+  }
+
+  /** 判断模型包声明的运动组是否是 Stacker 行走组，兼容自定义组名但复用标准行走字段。 */
+  private isStackerTravelMotionDefinition(key: string, group: ModelDataDrivenMotionGroupDefinition): boolean {
+    if ((group.kind ?? "translate") !== "translate") {
+      return false;
+    }
+    return key === "travel" || (group.fields ?? []).some((field) => this.isStackerTravelField(field));
+  }
+
+  /** 判断运行时运动组是否是 Stacker 行走组，用于 root 位姿约束复用同一条轨道边界。 */
+  private isStackerTravelRuntimeMotionGroup(group: RuntimeMotionGroup): boolean {
+    return group.kind === "translate" && (group.key === "travel" || group.fields.some((field) => this.isStackerTravelField(field)));
+  }
+
+  /** 判断点位字段是否表达 Stacker 沿轨道行走。 */
+  private isStackerTravelField(field: string): boolean {
+    return STACKER_TRAVEL_LIMIT_FIELDS.has(field.trim().toLowerCase());
+  }
+
+  /** 判断运行时运动组是否是 Stacker 载台升降组，用于 front/back_distanceY 绝对校准。 */
+  private isStackerLiftRuntimeMotionGroup(group: RuntimeMotionGroup): boolean {
+    return group.kind === "translate" && (group.key === "lift" || group.fields.some((field) => this.isStackerLiftField(field)));
+  }
+
+  /** 判断点位字段是否表达 Stacker 载台升降。 */
+  private isStackerLiftField(field: string): boolean {
+    return STACKER_LIFT_LIMIT_FIELDS.has(field.trim().toLowerCase());
+  }
+
+  /** 判断点位字段是否表达 Stacker 货叉伸缩动作。 */
+  private isStackerForkActionField(field: string): boolean {
+    const normalizedField = this.normalizeMatchValue(field);
+    return STACKER_FORK_ACTION_FIELDS.some((item) => this.normalizeMatchValue(item) === normalizedField);
+  }
+
+  /** 为 Stacker 整机 twinspawn 创建水平轨道约束，只限制 X/Z 平面，不改变高度。 */
+  private createStackerTrackConstraint(root: TransformNode, groups: RuntimeMotionGroup[]): StackerTrackConstraint | null {
+    const travelGroup = groups.find((group) => this.isStackerTravelRuntimeMotionGroup(group));
+    const limit = travelGroup?.limits;
+    if (!travelGroup || !limit || (limit.min === undefined && limit.max === undefined)) {
+      return null;
+    }
+
+    const horizontalAxis = this.normalizeHorizontalDirection(this.modelLocalAxisToWorldDirection(root, travelGroup.axis));
+    if (!horizontalAxis) {
+      return null;
+    }
+
+    const horizontalNormal = new Vector3(-horizontalAxis.z, 0, horizontalAxis.x);
+    const rootPosition = root.position.clone();
+    return {
+      horizontalAxis,
+      horizontalNormal,
+      baseAxisProjection: Vector3.Dot(rootPosition, horizontalAxis),
+      baseNormalProjection: Vector3.Dot(rootPosition, horizontalNormal),
+      minDelta: limit.min,
+      maxDelta: limit.max
+    };
+  }
+
+  /** 提取水平面方向并归一化，避免轨道保护误改垂直高度。 */
+  private normalizeHorizontalDirection(direction: Vector3): Vector3 | null {
+    const horizontal = new Vector3(direction.x, 0, direction.z);
+    const lengthSquared = horizontal.lengthSquared();
+    if (lengthSquared <= 1e-12) {
+      return null;
+    }
+    return horizontal.scale(1 / Math.sqrt(lengthSquared));
+  }
+
   /** 创建运动组行程限制，显式 min/max 优先，缺省端点由防撞或固定节点包围盒推导。 */
   private createRuntimeMotionLimit(
     root: TransformNode,
     movingNodes: TransformNode[],
     axis: ModelDataDrivenAxis,
     group: ModelDataDrivenMotionGroupDefinition | undefined,
-    fallbackLimitNodeNames: string[]
+    fallbackLimitNodeNames: string[],
+    allowTrackBoundsFallback: boolean
   ): RuntimeMotionLimit | undefined {
     const config = group?.limits;
     const blockerNodes = this.findMotionLimitBlockerNodes(root, config, fallbackLimitNodeNames);
     const clearance = this.readOptionalNonNegativeNumber(config?.clearance, 0);
+    const canUseTrackBoundsFallback = allowTrackBoundsFallback && !config?.blockerNodes?.length && fallbackLimitNodeNames.length > 0;
     let min = typeof config?.min === "number" && Number.isFinite(config.min) ? config.min : undefined;
     let max = typeof config?.max === "number" && Number.isFinite(config.max) ? config.max : undefined;
     if ((min === undefined || max === undefined) && blockerNodes.length > 0 && movingNodes.length > 0) {
       const worldAxis = this.modelLocalAxisToWorldDirection(root, axis);
       const movingBounds = this.projectNodesBoundsOnAxis(movingNodes, worldAxis);
-      const blockerBounds = this.projectMotionLimitInnerBounds(blockerNodes, worldAxis);
+      const blockerBounds =
+        this.projectMotionLimitInnerBounds(blockerNodes, worldAxis) ??
+        (canUseTrackBoundsFallback ? this.projectNodesBoundsOnAxis(blockerNodes, worldAxis) : null);
       if (movingBounds && blockerBounds) {
         min = min ?? blockerBounds.min + clearance - movingBounds.min;
         max = max ?? blockerBounds.max - clearance - movingBounds.max;
@@ -2587,15 +2997,23 @@ export class SceneDataDrivenRuntime {
     return this.dedupeTransformNodes(matches).filter((node) => !fixedNameSet.has(String(node.name ?? "")));
   }
 
-  /** 参数化运行态克隆保留源节点名，动画组需要把同源克隆一并纳入驱动。 */
+  /** 参数化和编辑器运行态克隆保留源节点名，辊筒动画组需要把同源克隆一并纳入驱动。 */
   private isGeneratedMotionCloneFromExactNode(node: TransformNode, exactNameSet: Set<string>): boolean {
     const metadata = this.isRecord(node.metadata) ? node.metadata : {};
-    if (metadata.generatedByMeshVertexModifyRuntime !== true || metadata.reason !== "rollerDensity") {
+    const sourceNodeName = typeof metadata.sourceNodeName === "string" ? metadata.sourceNodeName : "";
+    if (!exactNameSet.has(sourceNodeName)) {
       return false;
     }
 
-    const sourceNodeName = typeof metadata.sourceNodeName === "string" ? metadata.sourceNodeName : "";
-    return exactNameSet.has(sourceNodeName);
+    if (metadata.generatedByMeshVertexModifyRuntime === true) {
+      return metadata.reason === "rollerDensity";
+    }
+
+    if (metadata.generatedByParametricRuntime !== true || !/^GT\d+$/i.test(sourceNodeName)) {
+      return false;
+    }
+
+    return metadata.reason === "roller" || metadata.reason === "rollerDensity";
   }
 
   /** 配置 fallbackPattern 不执行正则，只按 | 分隔的安全关键字做包含匹配。 */

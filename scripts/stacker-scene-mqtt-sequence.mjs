@@ -279,6 +279,7 @@ function createSceneMessages(baseTimestamp) {
       topic: stackerJointTopic,
       payload: [
         { e: STACKER_ID, p: "movement_x", v: 1, ts: ts(7900) },
+        { e: STACKER_ID, p: "distancex", v: 1200, ts: ts(7900) },
         { e: STACKER_ID, p: "movement_y", v: 1, ts: ts(7900) }
       ]
     },
@@ -288,6 +289,7 @@ function createSceneMessages(baseTimestamp) {
       topic: stackerJointTopic,
       payload: [
         { e: STACKER_ID, p: "movement_x", v: 0, ts: ts(11900) },
+        { e: STACKER_ID, p: "distancex", v: 2200, ts: ts(11900) },
         { e: STACKER_ID, p: "movement_y", v: 0, ts: ts(11900) }
       ]
     },
