@@ -91,9 +91,9 @@ const poiSenderOutputLabels: Record<PoiSenderOutputType, string> = {
   websocket: "WebSocket",
   mqtt: "MQTT"
 };
-const stackerDemoDeviceId = "Stacker01";
+const stackerDemoDeviceId = "DDJ2";
 const stackerDemoEndpoint = "ws://127.0.0.1:18083/stacker";
-const stackerDemoTopic = "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
+const stackerDemoTopic = `dt/factory/logistics/stacker/${stackerDemoDeviceId}/twindatadriven/joint`;
 const defaultMqttTopic = DEFAULT_LOGISTICS_MQTT_DATA_CHANNEL;
 const defaultMqttWebSocketPath = "/mqtt";
 const tcpMqttPort = "1883";
@@ -1076,7 +1076,7 @@ function NodeDataDrivenEditor({
         <input
           className="inspector-input"
           disabled={nodeLocked}
-          placeholder="Stacker01"
+          placeholder="DDJ2"
           title="写入对象资产编号，用于匹配数据包中的设备号"
           value={selection.assetInfo.assetCode}
           onInput={(event) => onNodeChange({ assetInfo: { assetCode: event.currentTarget.value } })}

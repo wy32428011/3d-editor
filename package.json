@@ -10,6 +10,10 @@
     "electron:build": "tsc -p tsconfig.electron.json",
     "build": "tsc -b && vite build && npm run electron:build",
     "preview": "vite preview --host 0.0.0.0",
+    "demo:stacker-ddj2-plc": "node scripts/stacker-ddj2-plc-message.mjs",
+    "demo:stacker-ddj2-plc:dry-run": "node scripts/stacker-ddj2-plc-message.mjs --dry-run",
+    "demo:stacker-scene": "node scripts/stacker-scene-mqtt-sequence.mjs",
+    "demo:stacker-scene:dry-run": "node scripts/stacker-scene-mqtt-sequence.mjs --dry-run",
     "pack": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win nsis"

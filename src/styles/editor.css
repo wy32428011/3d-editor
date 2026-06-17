@@ -255,6 +255,11 @@ input {
   white-space: nowrap;
 }
 
+.scene-save-success {
+  max-width: min(240px, 18vw);
+  color: #bfe0a8;
+}
+
 .cad-import-progress {
   display: grid;
   gap: 4px;

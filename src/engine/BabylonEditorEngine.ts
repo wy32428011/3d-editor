@@ -10,6 +10,7 @@ import "@babylonjs/loaders/STL";
 import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { Camera } from "@babylonjs/core/Cameras/camera";
+import type { ICameraInput } from "@babylonjs/core/Cameras/cameraInputsManager";
 import { PointerEventTypes } from "@babylonjs/core/Events/pointerEvents";
 import { Engine } from "@babylonjs/core/Engines/engine";
 import { GizmoManager } from "@babylonjs/core/Gizmos/gizmoManager";
@@ -138,9 +139,9 @@ const HELPER_FLAG = "isEditorHelper";
 const ROOT_FLAG = "isEditorRoot";
 const DROP_SURFACE_FLAG = "isEditorDropSurface";
 const GROUP_NODE_TYPE = "group";
-const STACKER_DEMO_DEVICE_ID = "Stacker01";
+const STACKER_DEMO_DEVICE_ID = "DDJ2";
 const STACKER_DEMO_ENDPOINT = "ws://127.0.0.1:18083/stacker";
-const STACKER_DEMO_TOPIC = "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
+const STACKER_DEMO_TOPIC = `dt/factory/logistics/stacker/${STACKER_DEMO_DEVICE_ID}/twindatadriven/joint`;
 export const DEFAULT_SCENE_ENVIRONMENT_COLOR = "#26312d";
 const GRID_RENDER_ELEVATION_METERS = 0.015;
 const EDITOR_LENGTH_UNIT = "meter";
@@ -223,6 +224,7 @@ const CAMERA_FRAME_MARGIN = 1.45;
 const DEFAULT_CAMERA_FAR_CLIP_METERS = 10000;
 const MAX_CAMERA_FAR_CLIP_METERS = 1000000;
 const DEFAULT_CAMERA_WHEEL_PRECISION = 45;
+const CAMERA_WHEEL_PIXEL_NORMALIZE = 40;
 const DEFAULT_CAMERA_PANNING_SENSIBILITY = 55;
 const DEFAULT_CAMERA_ROTATION_SENSIBILITY = 1000;
 const MIN_CAMERA_INPUT_SENSIBILITY = 1;
@@ -503,6 +505,100 @@ interface PreviewCameraSnapshot {
   upperRadiusLimit: number | null;
 }
 
+/** 编辑相机滚轮输入：沿当前视线整体移动相机，允许直接穿过模型。 */
+class EditorCameraWheelDollyInput implements ICameraInput<ArcRotateCamera> {
+  public camera!: ArcRotateCamera;
+  public wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
+  public wheelDeltaPercentage = 0;
+  public zoomToMouseLocation = false;
+  private noPreventDefault = false;
+  private attached = false;
+  private readonly handleWheelEvent = (event: WheelEvent) => this.handleWheel(event);
+
+  /** 绑定承载 Babylon 的 canvas，滚轮只在视口内生效。 */
+  public constructor(private readonly canvas: HTMLCanvasElement) {}
+
+  /** 返回 Babylon 输入类名，便于调试输入管理器状态。 */
+  public getClassName(): string {
+    return "EditorCameraWheelDollyInput";
+  }
+
+  /** 复用 mousewheel 简名，让 camera.wheelPrecision 继续作用到本输入。 */
+  public getSimpleName(): string {
+    return "mousewheel";
+  }
+
+  /** 监听原生 wheel 事件，使用非 passive 监听以保留 preventDefault 能力。 */
+  public attachControl(noPreventDefault?: boolean): void {
+    this.noPreventDefault = Boolean(noPreventDefault);
+    if (this.attached) {
+      return;
+    }
+    this.attached = true;
+    this.canvas.addEventListener("wheel", this.handleWheelEvent, { passive: false });
+  }
+
+  /** 解绑 wheel 事件，避免视口销毁后残留监听。 */
+  public detachControl(): void {
+    if (!this.attached) {
+      return;
+    }
+    this.attached = false;
+    this.canvas.removeEventListener("wheel", this.handleWheelEvent);
+  }
+
+  /** 本输入即时处理滚轮，不需要逐帧惯性检查。 */
+  public checkInputs(): void {
+    return;
+  }
+
+  /** 将滚轮动作转换为视线方向位移，并保持原有浏览器默认行为策略。 */
+  private handleWheel(event: WheelEvent): void {
+    const wheelDelta = this.normalizeWheelDelta(event);
+    if (!Number.isFinite(wheelDelta) || wheelDelta === 0) {
+      return;
+    }
+
+    if (!this.noPreventDefault) {
+      event.preventDefault();
+    }
+
+    const distance = this.getDollyDistance(wheelDelta);
+    if (distance === 0) {
+      return;
+    }
+
+    this.moveCameraAlongView(distance);
+  }
+
+  /** 统一像素、行和页滚动单位，避免不同设备滚轮速度差异过大。 */
+  private normalizeWheelDelta(event: WheelEvent): number {
+    const modeScale =
+      event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? CAMERA_WHEEL_PIXEL_NORMALIZE
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? Math.max(this.canvas.clientHeight, CAMERA_WHEEL_PIXEL_NORMALIZE)
+          : 1;
+    return -event.deltaY * modeScale;
+  }
+
+  /** 按当前轨道半径和缩放灵敏度计算视线方向移动距离。 */
+  private getDollyDistance(wheelDelta: number): number {
+    const cameraRadius = Number.isFinite(this.camera.radius) ? Math.abs(this.camera.radius) : DEFAULT_CAMERA_RADIUS_METERS;
+    const radiusScale = Math.max(1, cameraRadius);
+    const precision = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.wheelPrecision || DEFAULT_CAMERA_WHEEL_PRECISION));
+    return (wheelDelta * radiusScale) / (precision * CAMERA_WHEEL_PIXEL_NORMALIZE);
+  }
+
+  /** 平移相机目标点并克隆当前 alpha/beta/radius，从而让相机整体前进或后退。 */
+  private moveCameraAlongView(distance: number): void {
+    const direction = this.camera.getForwardRay(1).direction.normalize();
+    const nextTarget = this.camera.target.add(direction.scale(distance));
+    this.camera.inertialRadiusOffset = 0;
+    this.camera.setTarget(nextTarget, false, true, true);
+  }
+}
+
 /** 预览模式启动的 AnimationGroup 快照，用于停止预览时回到初始姿态。 */
 interface PreviewAnimationGroupSnapshot {
   group: AnimationGroup;
@@ -650,6 +746,7 @@ export class BabylonEditorEngine {
   private primitiveSeed = 1;
   private poiSeed = 1;
   private transformSyncFrame = 0;
+  private transformGizmoDragging = false;
   private gridCoverageSizeMeters = EDITOR_GRID_SIZE_METERS;
   private gridCellSizeMeters = EDITOR_GRID_CELL_SIZE_METERS;
   private gridCenter = Vector3.Zero();
@@ -939,7 +1036,7 @@ export class BabylonEditorEngine {
       return null;
     }
 
-    const demoDeviceId = stackerTarget.dataDriven?.device?.defaultAssetCode?.trim() || STACKER_DEMO_DEVICE_ID;
+    const demoDeviceId = this.getNodeAssetInfo(targetRoot).assetCode.trim() || STACKER_DEMO_DEVICE_ID;
     this.updateNodeAssetInfo(targetRoot, { assetCode: demoDeviceId });
     const demoConfig = this.createStackerDemoDataDrivenSnapshot(targetRoot);
     this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata, {
@@ -1493,6 +1590,7 @@ export class BabylonEditorEngine {
     }
 
     this.selectedNode = node;
+    this.syncCameraOrbitTargetToSelection();
     this.ensureMoveToolForTransformSelection(node);
     this.applyHighlight();
     this.syncGizmoMode();
@@ -4362,6 +4460,9 @@ export class BabylonEditorEngine {
 
     const graphDirty = this.applyTransformUpdateToNode(node, update);
     this.refreshNodeWorldMatrices(node);
+    if (this.selectedNode?.uniqueId === node.uniqueId) {
+      this.syncCameraOrbitTargetToSelection();
+    }
     const snapshot = this.createTransformSnapshot(node);
     if (graphDirty) {
       this.refreshSceneGraph();
@@ -4449,10 +4550,10 @@ export class BabylonEditorEngine {
     );
     camera.metadata = { [HELPER_FLAG]: true };
     camera.doNotSerialize = true;
-    // 不设置最近半径限制，允许滚轮贴近并穿过模型观察内部结构。
+    // 不设置最近半径限制，并关闭碰撞，允许编辑相机直接穿过模型。
     camera.lowerRadiusLimit = null;
+    camera.checkCollisions = false;
     camera.upperRadiusLimit = DEFAULT_CAMERA_FAR_CLIP_METERS;
-    camera.wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
     camera.panningSensibility = DEFAULT_CAMERA_PANNING_SENSIBILITY;
     camera.angularSensibilityX = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
     camera.angularSensibilityY = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
@@ -4461,6 +4562,9 @@ export class BabylonEditorEngine {
     camera.maxZ = DEFAULT_CAMERA_FAR_CLIP_METERS;
     camera.fov = 0.92;
     camera.useInputToRestoreState = false;
+    camera.inputs.removeByType("ArcRotateCameraMouseWheelInput");
+    camera.inputs.add(new EditorCameraWheelDollyInput(this.canvas));
+    camera.wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
     this.scene.activeCamera = camera;
     camera.attachControl(this.canvas, true);
     return camera;
@@ -4498,10 +4602,49 @@ export class BabylonEditorEngine {
       }
 
       this.observedTransformGizmos.add(gizmo);
-      gizmo.onDragStartObservable.add(() => this.flushTransformSnapshotSync());
+      gizmo.onDragStartObservable.add(() => {
+        this.beginTransformGizmoDrag();
+        this.flushTransformSnapshotSync();
+      });
       gizmo.onDragObservable.add(() => this.scheduleTransformSnapshotSync());
-      gizmo.onDragEndObservable.add(() => this.flushTransformSnapshotSync());
+      gizmo.onDragEndObservable.add(() => {
+        this.endTransformGizmoDrag();
+        this.flushTransformSnapshotSync();
+      });
     });
+  }
+
+  /** Gizmo 抢占左键拖拽期间暂停相机输入，避免变换轴拖动同时带动镜头。 */
+  private beginTransformGizmoDrag(): void {
+    if (this.transformGizmoDragging) {
+      this.clearEditorCameraInertia();
+      return;
+    }
+
+    this.transformGizmoDragging = true;
+    this.clearEditorCameraInertia();
+    this.editorCamera.detachControl();
+  }
+
+  /** Gizmo 拖拽结束后恢复编辑相机输入，并丢弃拖拽期间残留的惯性。 */
+  private endTransformGizmoDrag(): void {
+    if (!this.transformGizmoDragging) {
+      this.clearEditorCameraInertia();
+      return;
+    }
+
+    this.clearEditorCameraInertia();
+    this.editorCamera.attachControl(this.canvas, true);
+    this.transformGizmoDragging = false;
+  }
+
+  /** 清空 ArcRotateCamera 的惯性偏移，避免重新绑定输入后延续旧拖拽速度。 */
+  private clearEditorCameraInertia(): void {
+    this.editorCamera.inertialAlphaOffset = 0;
+    this.editorCamera.inertialBetaOffset = 0;
+    this.editorCamera.inertialRadiusOffset = 0;
+    this.editorCamera.inertialPanningX = 0;
+    this.editorCamera.inertialPanningY = 0;
   }
 
   /** 合并高频拖拽事件，最多每帧向 React 推送一次属性快照。 */
@@ -4533,6 +4676,7 @@ export class BabylonEditorEngine {
     }
 
     this.selectedNode.computeWorldMatrix(true);
+    this.syncCameraOrbitTargetToSelection();
     this.emitSelectionSnapshot();
   }
 
@@ -5940,6 +6084,20 @@ export class BabylonEditorEngine {
         return;
       }
 
+      if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
+        const mesh = pointerInfo.pickInfo?.pickedMesh;
+        if (!mesh || mesh.metadata?.[HELPER_FLAG]) {
+          this.syncCameraOrbitTargetToSelection();
+          return;
+        }
+
+        const root = this.findSelectableRoot(mesh);
+        if (!this.isNodeLocked(root)) {
+          this.syncCameraOrbitTargetToNode(root);
+        }
+        return;
+      }
+
       if (pointerInfo.type === PointerEventTypes.POINTERDOUBLETAP) {
         const mesh = pointerInfo.pickInfo?.pickedMesh;
         if (!mesh || mesh.metadata?.[HELPER_FLAG]) {
@@ -6993,11 +7151,29 @@ export class BabylonEditorEngine {
 
     this.selectedNodeIds = new Set(selectableNodes.map((node) => node.uniqueId));
     this.selectedNode = nextPrimary;
+    this.syncCameraOrbitTargetToSelection();
     this.ensureMoveToolForTransformSelection(nextPrimary);
     this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
     this.refreshSceneGraph();
+  }
+
+  /** 根据当前主选中对象同步 ArcRotateCamera 轨道中心，避免左键旋转继续绕世界原点。 */
+  private syncCameraOrbitTargetToSelection(): void {
+    this.syncCameraOrbitTargetToNode(this.selectedNode);
+  }
+
+  /** 将相机旋转中心切到指定节点中心，并保持当前相机位置不跳变。 */
+  private syncCameraOrbitTargetToNode(node: TransformNode | null): void {
+    if (!node || this.previewMode || this.transformGizmoDragging || node.metadata?.[HELPER_FLAG]) {
+      return;
+    }
+
+    this.refreshNodeWorldMatrices(node);
+    const bounds = this.getNodeWorldBounds(node);
+    const orbitTarget = bounds?.center ?? node.getAbsolutePosition();
+    this.editorCamera.setTarget(orbitTarget, false, true, false);
   }
 
   /** 选中可变换对象时自动进入移动工具，保证 X/Y/Z 方向轴立即绑定到可编辑根节点。 */

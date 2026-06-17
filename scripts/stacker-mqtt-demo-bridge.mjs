@@ -4,13 +4,16 @@ import net from "node:net";
 
 const MQTT_HOST = process.env.STACKER_DEMO_MQTT_HOST ?? "192.168.60.154";
 const MQTT_PORT = Number(process.env.STACKER_DEMO_MQTT_PORT ?? 1883);
-const MQTT_TOPIC = process.env.STACKER_DEMO_TOPIC ?? "dt/factory/logistics/stacker/Stacker01/twindatadriven/joint";
 const WS_HOST = process.env.STACKER_DEMO_WS_HOST ?? "127.0.0.1";
 const WS_PORT = Number(process.env.STACKER_DEMO_WS_PORT ?? 18083);
 const WS_PATH = process.env.STACKER_DEMO_WS_PATH ?? "/stacker";
-const DEVICE_ID = process.env.STACKER_DEMO_DEVICE_ID ?? "Stacker01";
+const DEVICE_ID = process.env.STACKER_DEMO_DEVICE_ID ?? "DDJ2";
+const MQTT_TOPIC = process.env.STACKER_DEMO_TOPIC ?? `dt/factory/logistics/stacker/${DEVICE_ID}/twindatadriven/joint`;
+const DEMO_DEVICE_CODE = process.env.STACKER_DEMO_DEVICE_CODE ?? "1";
 const DEMO_CARGO_ID = process.env.STACKER_DEMO_CARGO_ID ?? "Box01";
 const PUBLISH_INTERVAL_MS = Number(process.env.STACKER_DEMO_INTERVAL_MS ?? 500);
+const DEMO_PROTOCOL = normalizeDemoProtocol(process.env.STACKER_DEMO_PROTOCOL ?? "plc");
+const PAYLOAD_WRAP = normalizePayloadWrap(process.env.STACKER_DEMO_PAYLOAD_WRAP ?? "data");
 const MQTT_KEEP_ALIVE_SECONDS = 30;
 const ONCE_MODE = process.argv.includes("--once") || process.env.STACKER_DEMO_ONCE === "1";
 
@@ -26,6 +29,18 @@ let mqttReadBuffer = Buffer.alloc(0);
 let isShuttingDown = false;
 let startedAt = Date.now();
 let publishCount = 0;
+
+/** 归一化 demo 协议模式，默认按现场 DDJ2 PLC 点位输出。 */
+function normalizeDemoProtocol(value) {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "standard" || normalized === "legacy" ? "standard" : "plc";
+}
+
+/** 归一化 payload 外层包装，none 可恢复旧裸数组格式。 */
+function normalizePayloadWrap(value) {
+  const normalized = value.trim().toLowerCase();
+  return ["none", "data", "payload", "message"].includes(normalized) ? normalized : "data";
+}
 
 /** 编码 MQTT UTF-8 字符串，前两个字节保存字符串长度。 */
 function encodeMqttString(value) {
@@ -177,13 +192,16 @@ function handleCompleteMqttPacket(packet, fixedHeaderLength, remainingLength) {
 }
 
 /** 根据时间生成可视化明显的 Stacker 动作帧，并在伸叉端点发送货箱取放事件。 */
-function createStackerFrame() {
+function createStackerFrame(ts = Date.now()) {
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
   const travelPhase = elapsedSeconds * 0.65;
   const liftPhase = elapsedSeconds * 1.1;
   const cargoPhase = Math.sin(liftPhase + Math.PI / 3);
   const forkAction = createMovementAction(cargoPhase);
-  const ts = Date.now();
+  if (DEMO_PROTOCOL === "plc") {
+    return createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhase);
+  }
+
   const frame = [
     { e: DEVICE_ID, p: "movement_x", v: createMovementAction(Math.sin(travelPhase)), ts },
     { e: DEVICE_ID, p: "movement_y", v: createMovementAction(Math.sin(liftPhase)), ts },
@@ -197,6 +215,26 @@ function createStackerFrame() {
   return frame;
 }
 
+/** 按现场 PLC 点位表生成 DDJ2 报文，运行时会再归一成标准动作字段。 */
+function createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhase) {
+  const frame = [
+    { e: DEVICE_ID, p: "device_code", v: DEMO_DEVICE_CODE },
+    { e: DEVICE_ID, p: "action", v: createTravelBitfield(Math.sin(travelPhase)) },
+    { e: DEVICE_ID, p: "front_action", v: createLiftBitfield(Math.sin(liftPhase)) },
+    { e: DEVICE_ID, p: "back_action", v: createLiftBitfield(Math.sin(liftPhase)) },
+    { e: DEVICE_ID, p: "front_forkAction", v: createForkBitfield(forkAction) },
+    { e: DEVICE_ID, p: "back_forkAction", v: createForkBitfield(forkAction) },
+    { e: DEVICE_ID, p: "distanceX", v: 0 },
+    { e: DEVICE_ID, p: "front_distanceY", v: 0 },
+    { e: DEVICE_ID, p: "back_distanceY", v: 0 }
+  ];
+  const cargoAction = cargoPhase > 0.92 ? "pickup" : cargoPhase < -0.92 ? "drop" : "";
+  if (cargoAction) {
+    frame.push({ e: DEVICE_ID, p: "cargo_action", v: cargoAction }, { e: DEVICE_ID, p: "cargo", v: DEMO_CARGO_ID });
+  }
+  return wrapDemoPayload(frame, ts);
+}
+
 /** 把周期函数转换为协议动作枚举：1 正向，2 反向，0 静止。 */
 function createMovementAction(value) {
   if (value > 0.2) {
@@ -208,9 +246,50 @@ function createMovementAction(value) {
   return 0;
 }
 
+/** 把前进/后退转换为 PLC action 位域：bit0 前进，bit1 后退。 */
+function createTravelBitfield(value) {
+  return createMovementAction(value);
+}
+
+/** 把上升/下降转换为 PLC front_action/back_action 位域：bit2 上升，bit3 下降。 */
+function createLiftBitfield(value) {
+  const action = createMovementAction(value);
+  if (action === 1) {
+    return 1 << 2;
+  }
+  if (action === 2) {
+    return 1 << 3;
+  }
+  return 0;
+}
+
+/** 把伸叉/缩叉转换为 PLC forkAction 位域：bit1 伸叉，bit2 缩叉。 */
+function createForkBitfield(action) {
+  if (action === 1) {
+    return 1 << 1;
+  }
+  if (action === 2) {
+    return 1 << 2;
+  }
+  return 0;
+}
+
+/** 按现场附件格式包装 payload，必要时可通过环境变量恢复裸数组。 */
+function wrapDemoPayload(payload, ts) {
+  if (PAYLOAD_WRAP === "none") {
+    return payload;
+  }
+  return {
+    [PAYLOAD_WRAP]: payload,
+    ts: new Date(ts).toISOString()
+  };
+}
+
 /** 发布并广播一帧 demo 数据。 */
 function publishDemoFrame() {
-  const payloadText = JSON.stringify(createStackerFrame());
+  const ts = Date.now();
+  const payload = createStackerFrame(ts);
+  const payloadText = JSON.stringify(PAYLOAD_WRAP === "none" || DEMO_PROTOCOL === "plc" ? payload : wrapDemoPayload(payload, ts));
   if (mqttReady) {
     mqttSocket.write(createPublishPacket(MQTT_TOPIC, payloadText));
   }

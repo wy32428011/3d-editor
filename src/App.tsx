@@ -48,6 +48,9 @@ import type {
   TransformUpdate
 } from "./types/editor";
 
+/** 保存成功提示保留时长，避免状态条长期占用项目条。 */
+const SAVE_SUCCESS_NOTICE_MS = 3000;
+
 interface PersistedProjectAssetFiles {
   projectFiles: Map<File, string>;
   failedFiles: Set<File>;
@@ -1081,6 +1084,8 @@ export function App() {
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [projectErrorExpanded, setProjectErrorExpanded] = useState(false);
+  const [saveInProgress, setSaveInProgress] = useState(false);
+  const [saveSuccessMessage, setSaveSuccessMessage] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [cadImportProgress, setCadImportProgress] = useState<CadDxfLineProgress | null>(null);
   const [cadImportActive, setCadImportActive] = useState(false);
@@ -1103,6 +1108,9 @@ export function App() {
 
   const activeScene = activeProject?.scenes.find((scene) => scene.id === activeSceneId) ?? activeProject?.scenes[0] ?? null;
   const activeSceneRef = useRef<{ projectPath: string | null; sceneId: string | null }>({ projectPath: null, sceneId: null });
+  const sceneDataDrivenRef = useRef<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
+  const saveInProgressRef = useRef(false);
+  const saveSuccessTimerRef = useRef<number | null>(null);
   const sceneRenameRequestRef = useRef(0);
   const cadImportRequestRef = useRef(0);
   const cadImportActiveRef = useRef(false);
@@ -1110,6 +1118,11 @@ export function App() {
   const cadRestoreActiveRef = useRef(false);
   const cadRestoreWarningRef = useRef<string | null>(null);
   const hierarchySelectionAnchorRef = useRef<number | null>(null);
+  /** 同步场景级数据源状态和保存前快照，避免 React 异步渲染导致保存读到旧 MQTT 配置。 */
+  const syncSceneDataDrivenState = useCallback((nextSceneDataDriven: SceneDataDrivenSnapshot) => {
+    sceneDataDrivenRef.current = nextSceneDataDriven;
+    setSceneDataDriven(nextSceneDataDriven);
+  }, []);
   const selectedNode = inspectorTarget?.type === "node" ? inspectorTarget.node : null;
   const selectedHierarchyNode = useMemo(
     () => (selectedNode ? nodes.find((node) => node.id === selectedNode.id) ?? null : null),
@@ -1207,8 +1220,15 @@ export function App() {
 
     return inspectorTarget;
   }, [activeScene?.name, inspectorTarget, sceneDataDriven]);
-  const projectSaveBlocked = Boolean(activeProject && (sceneLoading || sceneLoadFailed || previewMode || cadImportActive || cadRestoreActive));
-  const saveDisabledReason = cadImportActive
+  const projectSaveBlocked = Boolean(
+    activeProject && (!activeScene || sceneLoading || sceneLoadFailed || previewMode || cadImportActive || cadRestoreActive)
+  );
+  const saveBlocked = projectSaveBlocked || saveInProgress;
+  const saveDisabledReason = saveInProgress
+    ? "场景保存中"
+    : activeProject && !activeScene
+    ? "当前项目没有可保存的场景"
+    : cadImportActive
     ? "CAD 图纸导入完成后才能保存场景"
     : cadRestoreActive
     ? "CAD 图纸恢复完成后才能保存场景"
@@ -1245,9 +1265,9 @@ export function App() {
     setInspectorTarget(target);
     if (target.type === "scene") {
       setSceneEnvironmentColor(target.scene.environment.backgroundColor);
-      setSceneDataDriven(target.scene.dataDriven);
+      syncSceneDataDrivenState(target.scene.dataDriven);
     }
-  }, []);
+  }, [syncSceneDataDrivenState]);
 
   const callbacks: EditorEngineCallbacks = useMemo(
     () => ({
@@ -1280,6 +1300,38 @@ export function App() {
     setProjectErrorExpanded(false);
   }, [projectError]);
 
+  /** 展示短暂保存成功提示，并清理上一轮提示计时器。 */
+  const showSaveSuccessMessage = useCallback((message: string) => {
+    if (saveSuccessTimerRef.current !== null) {
+      window.clearTimeout(saveSuccessTimerRef.current);
+    }
+
+    setSaveSuccessMessage(message);
+    saveSuccessTimerRef.current = window.setTimeout(() => {
+      setSaveSuccessMessage(null);
+      saveSuccessTimerRef.current = null;
+    }, SAVE_SUCCESS_NOTICE_MS);
+  }, []);
+
+  /** 清理保存成功提示和对应计时器，场景切换时避免旧状态残留。 */
+  const clearSaveSuccessMessage = useCallback(() => {
+    if (saveSuccessTimerRef.current !== null) {
+      window.clearTimeout(saveSuccessTimerRef.current);
+      saveSuccessTimerRef.current = null;
+    }
+
+    setSaveSuccessMessage(null);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (saveSuccessTimerRef.current !== null) {
+        window.clearTimeout(saveSuccessTimerRef.current);
+      }
+    },
+    []
+  );
+
   /** 激活项目并同步默认场景选择。 */
   const activateProject = useCallback((project: DesktopProjectRecord | null) => {
     const nextSceneId = project?.activeSceneId ?? project?.scenes[0]?.id ?? null;
@@ -1288,6 +1340,7 @@ export function App() {
     setActiveProject(project);
     setActiveSceneId(nextSceneId);
     setProjectError(null);
+    clearSaveSuccessMessage();
     setCadImportProgress(null);
     setCadImportActive(false);
     setCadRestoreProgress(null);
@@ -1298,7 +1351,7 @@ export function App() {
     cadImportRequestRef.current += 1;
     cadRestoreRequestRef.current += 1;
     setSceneLoadFailed(false);
-  }, []);
+  }, [clearSaveSuccessMessage]);
 
   /** 保存当前项目和场景上下文，异步 IPC 返回时用它避免旧响应覆盖新界面。 */
   useEffect(() => {
@@ -1314,6 +1367,7 @@ export function App() {
       }
 
       engine?.cancelCadRestore();
+      clearSaveSuccessMessage();
       cadRestoreActiveRef.current = false;
       cadRestoreWarningRef.current = null;
       setCadRestoreActive(false);
@@ -1322,7 +1376,7 @@ export function App() {
       activeSceneRef.current = { projectPath: activeProject?.path ?? null, sceneId };
       setActiveSceneId(sceneId);
     },
-    [activeProject?.path, engine]
+    [activeProject?.path, clearSaveSuccessMessage, engine]
   );
 
   /** 切换项目场景时退出预览，避免旧场景动画状态泄漏到新场景。 */
@@ -1384,7 +1438,7 @@ export function App() {
       setEngine(nextEngine);
       setEngineSceneId(nextEngine ? activeSceneId : null);
       setSceneEnvironmentColor(sceneSnapshot?.environment.backgroundColor ?? DEFAULT_SCENE_ENVIRONMENT_COLOR);
-      setSceneDataDriven(sceneSnapshot?.dataDriven ?? DEFAULT_SCENE_DATA_DRIVEN);
+      syncSceneDataDrivenState(sceneSnapshot?.dataDriven ?? DEFAULT_SCENE_DATA_DRIVEN);
       if (!nextEngine) {
         setInspectorTarget(null);
         setNodes([]);
@@ -1392,7 +1446,7 @@ export function App() {
         setStats(initialStats);
       }
     },
-    [activeSceneId]
+    [activeSceneId, syncSceneDataDrivenState]
   );
 
   useEffect(() => {
@@ -1507,7 +1561,7 @@ export function App() {
         if (!cancelled) {
           const sceneSnapshot = engine.getSceneInspectorSnapshot();
           setSceneEnvironmentColor(sceneSnapshot.environment.backgroundColor);
-          setSceneDataDriven(sceneSnapshot.dataDriven);
+          syncSceneDataDrivenState(sceneSnapshot.dataDriven);
         }
         if (!cancelled) {
           setSceneLoadFailed(false);
@@ -1535,7 +1589,7 @@ export function App() {
         setCadRestoreProgress(null);
       }
     };
-  }, [activeProject?.path, activeScene?.id, engine, engineSceneId]);
+  }, [activeProject?.path, activeScene?.id, engine, engineSceneId, syncSceneDataDrivenState]);
 
   /** 从工具栏创建基础对象，默认落在世界原点附近。 */
   const handleAddPrimitive = useCallback(
@@ -2307,7 +2361,7 @@ export function App() {
 
   /** 保存当前 Babylon 场景，项目场景读取失败时禁止覆盖磁盘文件。 */
   const handleSave = useCallback(async () => {
-    if (!engine) {
+    if (!engine || saveInProgressRef.current) {
       return;
     }
 
@@ -2336,37 +2390,76 @@ export function App() {
       return;
     }
 
-    if (activeProject && activeScene && window.electronApp?.projects) {
-      const projectPath = activeProject.path;
-      const sceneId = activeScene.id;
-      try {
-        const textureAssetId = createSceneTextureAssetId(sceneId);
-        const serializedScene = await engine.serializeProjectScene({
-          persistExternalTexture: (fileName, data) =>
-            window.electronApp!.projects.saveAssetFile(projectPath, textureAssetId, fileName, data)
-        });
-        const project = await window.electronApp.projects.saveScene(projectPath, sceneId, serializedScene);
-        const currentContext = activeSceneRef.current;
-        if (currentContext.projectPath === projectPath) {
-          setActiveProject(project);
-        }
-        if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
-          setActiveSceneId(sceneId);
-        }
-        await refreshRecentProjects();
-        return;
-      } catch (error) {
-        const currentContext = activeSceneRef.current;
-        if (currentContext.projectPath !== projectPath || currentContext.sceneId !== sceneId) {
+    if (activeProject && !activeScene) {
+      setProjectError("当前项目没有可保存的场景，请先创建或切换到有效场景。");
+      return;
+    }
+
+    saveInProgressRef.current = true;
+    setSaveInProgress(true);
+    setSaveSuccessMessage(null);
+
+    try {
+      // 保存前显式同步全局数据源配置，避免工具栏弹窗的最新 MQTT 草稿停留在 React 状态中。
+      const syncedSceneSnapshot = engine.updateSceneInspector({ dataDriven: sceneDataDrivenRef.current });
+      syncSceneDataDrivenState(syncedSceneSnapshot.dataDriven);
+
+      if (activeProject && activeScene) {
+        const projectPath = activeProject.path;
+        const sceneId = activeScene.id;
+        const projectsApi = window.electronApp?.projects;
+        if (!projectsApi) {
+          setProjectError("当前不在 Electron 桌面环境，无法保存项目场景。");
           return;
         }
 
-        setProjectError(getErrorMessage(error, "保存场景到项目失败。"));
+        try {
+          const textureAssetId = createSceneTextureAssetId(sceneId);
+          const serializedScene = await engine.serializeProjectScene({
+            persistExternalTexture: (fileName, data) => projectsApi.saveAssetFile(projectPath, textureAssetId, fileName, data)
+          });
+          const project = await projectsApi.saveScene(projectPath, sceneId, serializedScene);
+          const currentContext = activeSceneRef.current;
+          if (currentContext.projectPath === projectPath) {
+            setActiveProject(project);
+          }
+          if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
+            setActiveSceneId(sceneId);
+          }
+          await refreshRecentProjects();
+          const latestContext = activeSceneRef.current;
+          if (latestContext.projectPath === projectPath && latestContext.sceneId === sceneId) {
+            setProjectError(null);
+            showSaveSuccessMessage("保存完成");
+          }
+          return;
+        } catch (error) {
+          const currentContext = activeSceneRef.current;
+          if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
+            setProjectError(getErrorMessage(error, "保存场景到项目失败。"));
+          }
+          return;
+        }
       }
-    }
 
-    engine.saveScene();
-  }, [activeProject, activeScene, engine, previewMode, refreshRecentProjects, sceneLoadFailed, sceneLoading]);
+      engine.saveScene();
+      setProjectError(null);
+      showSaveSuccessMessage("保存完成");
+    } finally {
+      saveInProgressRef.current = false;
+      setSaveInProgress(false);
+    }
+  }, [
+    activeProject,
+    activeScene,
+    engine,
+    previewMode,
+    refreshRecentProjects,
+    sceneLoadFailed,
+    sceneLoading,
+    showSaveSuccessMessage,
+    syncSceneDataDrivenState
+  ]);
 
   /** 发布当前编辑器构建产物，成功后由 Electron 打开 dist 目录。 */
   const handlePublish = useCallback(async () => {
@@ -2446,7 +2539,7 @@ export function App() {
         name: activeScene?.name ?? nextSceneSnapshot.name
       };
       setSceneEnvironmentColor(namedSceneSnapshot.environment.backgroundColor);
-      setSceneDataDriven(namedSceneSnapshot.dataDriven);
+      syncSceneDataDrivenState(namedSceneSnapshot.dataDriven);
       setInspectorTarget((current) => {
         if (current?.type !== "scene") {
           return current;
@@ -2455,7 +2548,7 @@ export function App() {
         return { type: "scene", scene: namedSceneSnapshot };
       });
     },
-    [activeScene?.name, engine, sceneLoadFailed, sceneLoading]
+    [activeScene?.name, engine, sceneLoadFailed, sceneLoading, syncSceneDataDrivenState]
   );
 
   /** 启动 Stacker 内置模拟预览，不依赖外部 MQTT/WebSocket 数据源。 */
@@ -2475,7 +2568,7 @@ export function App() {
       setProjectError(null);
       const nextSceneSnapshot = engine.getSceneInspectorSnapshot();
       setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
-      setSceneDataDriven(nextSceneSnapshot.dataDriven);
+      syncSceneDataDrivenState(nextSceneSnapshot.dataDriven);
       setInspectorTarget((current) => {
         if (current?.type !== "node") {
           return current;
@@ -2485,7 +2578,7 @@ export function App() {
       });
       setPreviewMode(true);
     },
-    [engine]
+    [engine, syncSceneDataDrivenState]
   );
 
   /** 从右侧场景属性面板提交场景配置，按字段分发到项目清单或 Babylon 场景 metadata。 */
@@ -2546,10 +2639,10 @@ export function App() {
       }
 
       setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
-      setSceneDataDriven(nextSceneSnapshot.dataDriven);
+      syncSceneDataDrivenState(nextSceneSnapshot.dataDriven);
       setInspectorTarget({ type: "scene", scene: nextSceneSnapshot });
     },
-    [activeProject, activeScene, engine, refreshRecentProjects]
+    [activeProject, activeScene, engine, refreshRecentProjects, syncSceneDataDrivenState]
   );
 
   /** 从右侧场景属性面板初始化当前场景，执行前要求用户确认以避免误清空。 */
@@ -2564,7 +2657,7 @@ export function App() {
 
     const nextSceneSnapshot = engine.initializeEditableScene();
     setSceneEnvironmentColor(nextSceneSnapshot.environment.backgroundColor);
-    setSceneDataDriven(nextSceneSnapshot.dataDriven);
+    syncSceneDataDrivenState(nextSceneSnapshot.dataDriven);
     setInspectorTarget({
       type: "scene",
       scene: {
@@ -2572,7 +2665,7 @@ export function App() {
         name: activeScene?.name ?? nextSceneSnapshot.name
       }
     });
-  }, [activeScene?.name, engine]);
+  }, [activeScene?.name, engine, syncSceneDataDrivenState]);
 
   /** 切换场景预览模式，交给 Babylon 引擎取景完整场景并播放动画。 */
   const handleTogglePreview = useCallback(() => {
@@ -2602,8 +2695,11 @@ export function App() {
     try {
       const project = await window.electronApp?.projects.createScene(activeProject.path, sceneName);
       if (project) {
+        const nextSceneId = project.activeSceneId ?? project.scenes[0]?.id ?? null;
+        clearSaveSuccessMessage();
+        activeSceneRef.current = { projectPath: project.path, sceneId: nextSceneId };
         setActiveProject(project);
-        setActiveSceneId(project.activeSceneId);
+        setActiveSceneId(nextSceneId);
         setSceneName("New Scene");
         setSceneDialogOpen(false);
         await refreshRecentProjects();
@@ -2611,7 +2707,7 @@ export function App() {
     } catch (error) {
       setProjectError(getErrorMessage(error, "创建场景失败。"));
     }
-  }, [activeProject, engine, refreshRecentProjects, sceneName]);
+  }, [activeProject, clearSaveSuccessMessage, engine, refreshRecentProjects, sceneName]);
 
   const activeCadProgress = cadImportProgress ?? cadRestoreProgress;
   const cadImportPercent = getCadImportProgressPercent(activeCadProgress);
@@ -2707,7 +2803,7 @@ export function App() {
         dataSourceConfigDisabled={dataSourceConfigDisabled}
         dataSourceConfigDisabledReason={dataSourceConfigDisabledReason}
         onSave={handleSave}
-        saveDisabled={projectSaveBlocked}
+        saveDisabled={saveBlocked}
         saveDisabledReason={saveDisabledReason}
         onPublish={handlePublish}
         publishDisabled={publishDisabled}
@@ -2776,6 +2872,12 @@ export function App() {
           </div>
         )}
         {sceneLoading && <span className="scene-status">读取场景中</span>}
+        {saveInProgress && <span className="scene-status">保存中</span>}
+        {saveSuccessMessage && !saveInProgress && (
+          <span className="scene-status scene-save-success" role="status">
+            {saveSuccessMessage}
+          </span>
+        )}
         {projectError && (
           <>
             <button

@@ -25,20 +25,23 @@ const MAX_DATA_MESSAGE_BYTES = 1024 * 1024;
 const MAX_FRAMES_PER_MESSAGE = 200;
 const DATA_CONNECTION_STALE_MS = 5000;
 const STACKER_DEMO_INTERVAL_MS = 250;
-const STACKER_DEMO_DEVICE_ID = "Stacker01";
+const STACKER_DEMO_DEVICE_ID = "DDJ2";
 const STACKER_DEMO_CARGO_ID = "Box01";
 const STACKER_TRAVEL_FIELDS = ["travel_pos", "trackZ", "travelZ", "travel", "position.z", "pos.z", "location.z", "z"];
 const STACKER_LIFT_FIELDS = ["lift_pos", "liftY", "lift", "platformY", "platform.y", "elevation"];
 const STACKER_FORK_FIELDS = ["fork_extend", "forkExtend", "forkX", "fork.x", "fork.extend"];
 const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
+const STACKER_PLC_DEVICE_CODE_FIELD = "device_code";
 const CARGO_ACTION_FIELDS = ["cargo_action", "cargoAction", "cargo.action", "action"];
-const CARGO_TARGET_FIELDS = ["cargo", "cargoId", "cargoCode", "box", "boxId", "boxCode", "targetCargo"];
+const CARGO_TARGET_FIELDS = ["cargo", "cargoId", "cargoCode", "payload", "box", "boxId", "boxCode", "targetCargo"];
 const CARGO_DROP_TARGET_FIELDS = ["target", "dropTarget", "targetLocator", "locator", "locatorAssetCode", "slot"];
 const CARGO_PICKUP_VALUES = ["pickup", "pick", "attach", "load", "carry", "take", "取货", "吸附", "装载"];
 const CARGO_DROP_VALUES = ["drop", "detach", "unload", "release", "put", "放货", "释放", "卸载"];
 const DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION = 0.45;
 const DEFAULT_CARGO_PICKUP_MAX_DISTANCE = 2.5;
 const DEFAULT_CARGO_ANCHOR_OFFSET = new Vector3(0, 0.32, 0);
+// 辊筒模型只声明自转速度时，用该米/秒速度推进已绑定货箱。
+const DEFAULT_CONVEYOR_CARGO_SPEED = 2;
 const STACKER_TRACK_NODE_NAMES = ["guidaoshang.1", "guidaoxia.2"];
 const STACKER_TRAVEL_NODE_NAMES = [
   "dingbuhuagui2.3",
@@ -140,6 +143,24 @@ interface CargoAttachmentState {
   updatedAt: number;
 }
 
+/** 输送线载荷关系按动作语义推进货箱，不要求数据侧持续发送货箱坐标。 */
+interface CargoTransportState {
+  carrierRootId: number;
+  cargoRoot: TransformNode;
+  cargoCode: string;
+  axis: ModelDataDrivenAxis;
+  speed: number;
+  updatedAt: number;
+  blockedDirection?: number;
+  blockedBoundary?: "start" | "end";
+}
+
+/** 货箱沿输送方向投影后的可用范围。 */
+interface CargoTransportAxisRange {
+  minimum: number;
+  maximum: number;
+}
+
 const DEFAULT_STACKER_SIMULATION_SETTINGS: StackerSimulationSettings = {
   deviceId: STACKER_DEMO_DEVICE_ID,
   intervalMs: STACKER_DEMO_INTERVAL_MS,
@@ -226,6 +247,7 @@ export class SceneDataDrivenRuntime {
   private connection: DataConnection | null = null;
   private readonly targetStates = new Map<number, DataDrivenTargetState>();
   private readonly cargoAttachments = new Map<number, CargoAttachmentState>();
+  private readonly cargoTransports = new Map<number, CargoTransportState>();
   private simulationConfig: SceneDataDrivenSnapshot | null = null;
   private connectionGeneration = 0;
   private lastMessageAt = 0;
@@ -288,7 +310,7 @@ export class SceneDataDrivenRuntime {
     const target = this.options.getTargets().find((item) => this.canDriveStackerTarget(item));
     const simulation = target?.dataDriven?.simulation;
     return {
-      deviceId: target?.dataDriven?.device?.defaultAssetCode?.trim() || DEFAULT_STACKER_SIMULATION_SETTINGS.deviceId,
+      deviceId: target?.matchFields.assetCode?.trim() || DEFAULT_STACKER_SIMULATION_SETTINGS.deviceId,
       intervalMs: this.readSimulationNumber(simulation, "intervalMs", DEFAULT_STACKER_SIMULATION_SETTINGS.intervalMs, 16),
       travelRange: this.readSimulationNumber(simulation, "travelRange", DEFAULT_STACKER_SIMULATION_SETTINGS.travelRange, 0),
       liftBase: this.readSimulationNumber(simulation, "liftBase", DEFAULT_STACKER_SIMULATION_SETTINGS.liftBase),
@@ -323,6 +345,7 @@ export class SceneDataDrivenRuntime {
       this.restoreTargets();
     }
     this.cargoAttachments.clear();
+    this.cargoTransports.clear();
     this.targetStates.clear();
     this.running = false;
     this.lastMessageAt = 0;
@@ -349,12 +372,17 @@ export class SceneDataDrivenRuntime {
     const actionFramesAreStale = this.areActionFramesStale();
     const changedRoots: TransformNode[] = [];
     this.targetStates.forEach((state) => {
+      if (this.isRuntimeDrivenCargoRoot(state.target.root)) {
+        return;
+      }
+
       const interpolatedChanged = this.applyInterpolatedState(state, now);
       const actionChanged = this.applyActionState(state, now, actionFramesAreStale);
       if (interpolatedChanged || actionChanged) {
         changedRoots.push(state.target.root);
       }
       changedRoots.push(...this.updateCargoAttachmentsForState(state, now));
+      changedRoots.push(...this.updateCargoTransportsForState(state, now, actionFramesAreStale));
     });
     return this.dedupeTransformNodes(changedRoots);
   }
@@ -601,6 +629,10 @@ export class SceneDataDrivenRuntime {
       return;
     }
 
+    if (this.isRuntimeDrivenCargoRoot(target.root)) {
+      return;
+    }
+
     const state = this.ensureTargetState(target, now);
     const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const fallbackDuration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
@@ -636,6 +668,7 @@ export class SceneDataDrivenRuntime {
       this.applyInterpolatedState(state, now + 1);
     }
     const changedCargoRoots = this.applyCargoActionFrame(state, frame, now);
+    this.applyCargoTransportFrame(state, frame, now);
     if (changedCargoRoots.length > 0) {
       this.options.onTargetsChanged(changedCargoRoots, now);
     }
@@ -899,10 +932,24 @@ export class SceneDataDrivenRuntime {
 
     if (cargoConfig.dropValues.has(normalizedAction)) {
       const dropTargetCode = this.readString(frame, cargoConfig.targetFields);
-      return this.dropCargoFromFork(state, cargoCode, dropTargetCode);
+      return this.dropCargoFromFork(state, cargoCode, dropTargetCode, now);
     }
 
     return [];
+  }
+
+  /** 处理输送线负载绑定帧，货箱后续由输送线动作自动推进。 */
+  private applyCargoTransportFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
+    if (!this.isCargoTransportCarrier(state) || !this.isPayloadBindingFrame(frame)) {
+      return;
+    }
+
+    const cargoCode = this.readString(frame, CARGO_TARGET_FIELDS);
+    if (!cargoCode) {
+      return;
+    }
+
+    this.bindCargoToTransportCarrier(state, cargoCode, now);
   }
 
   /** 尝试把指定货箱吸附到当前 Stacker 货叉吸附点。 */
@@ -929,6 +976,7 @@ export class SceneDataDrivenRuntime {
       return;
     }
 
+    this.detachCargoFromTransport(cargoTarget.root);
     const attachment: CargoAttachmentState = {
       carrierRootId: state.target.root.uniqueId,
       cargoRoot: cargoTarget.root,
@@ -938,6 +986,7 @@ export class SceneDataDrivenRuntime {
     };
     this.cargoAttachments.set(cargoTarget.root.uniqueId, attachment);
     this.setNodeAbsolutePosition(cargoTarget.root, anchorPosition);
+    this.syncCargoTargetStateToCurrentPose(cargoTarget.root, now);
   }
 
   /** 判断当前帧是否来自规范的负载绑定消息，可直接同步载体与货箱关系。 */
@@ -951,7 +1000,12 @@ export class SceneDataDrivenRuntime {
   }
 
   /** 解除指定货箱或当前 Stacker 所有货箱的运行态吸附关系，带 target 时先放入定位框。 */
-  private dropCargoFromFork(state: DataDrivenTargetState, cargoCode: string | undefined, dropTargetCode: string | undefined): TransformNode[] {
+  private dropCargoFromFork(
+    state: DataDrivenTargetState,
+    cargoCode: string | undefined,
+    dropTargetCode: string | undefined,
+    now: number
+  ): TransformNode[] {
     const normalizedCargoCode = cargoCode ? this.normalizeMatchValue(cargoCode) : undefined;
     const dropTarget = dropTargetCode ? this.findCargoDropTarget(dropTargetCode) : null;
     if (dropTargetCode && !dropTarget) {
@@ -971,6 +1025,7 @@ export class SceneDataDrivenRuntime {
         this.moveCargoToDropTarget(attachment.cargoRoot, dropTarget.root);
         changedCargoRoots.push(attachment.cargoRoot);
       }
+      this.syncCargoTargetStateToCurrentPose(attachment.cargoRoot, now);
       this.cargoAttachments.delete(nodeId);
     });
     return changedCargoRoots;
@@ -998,8 +1053,299 @@ export class SceneDataDrivenRuntime {
         attachment.updatedAt = now;
         changedCargoRoots.push(attachment.cargoRoot);
       }
+      this.syncCargoTargetStateToCurrentPose(attachment.cargoRoot, now);
     });
     return changedCargoRoots;
+  }
+
+  /** 将货箱绑定到输送线，由输送线 movement_x 动作推进。 */
+  private bindCargoToTransportCarrier(state: DataDrivenTargetState, cargoCode: string, now: number): void {
+    const cargoTarget = this.findCargoTarget(cargoCode, state.target.root);
+    if (!cargoTarget || this.isAttachedCargoRoot(cargoTarget.root)) {
+      return;
+    }
+
+    this.cargoTransports.set(cargoTarget.root.uniqueId, {
+      carrierRootId: state.target.root.uniqueId,
+      cargoRoot: cargoTarget.root,
+      cargoCode: this.normalizeMatchValue(cargoCode),
+      axis: this.resolveCargoTransportAxis(state),
+      speed: this.resolveCargoTransportSpeed(state),
+      updatedAt: now
+    });
+    this.syncCargoTargetStateToCurrentPose(cargoTarget.root, now);
+  }
+
+  /** Stacker 接管货箱前解除输送线绑定，避免两个载体同时驱动同一货箱。 */
+  private detachCargoFromTransport(cargoRoot: TransformNode): void {
+    this.cargoTransports.delete(cargoRoot.uniqueId);
+  }
+
+  /** 输送线运行期间按设备本地轴推进已绑定货箱。 */
+  private updateCargoTransportsForState(state: DataDrivenTargetState, now: number, stale: boolean): TransformNode[] {
+    if (!this.isCargoTransportCarrier(state)) {
+      return [];
+    }
+
+    const changedCargoRoots: TransformNode[] = [];
+    [...this.cargoTransports.values()].forEach((transport) => {
+      if (transport.carrierRootId !== state.target.root.uniqueId) {
+        return;
+      }
+      if (transport.cargoRoot.isDisposed() || this.isAttachedCargoRoot(transport.cargoRoot)) {
+        this.cargoTransports.delete(transport.cargoRoot.uniqueId);
+        return;
+      }
+
+      const direction = stale ? 0 : this.resolveCargoTransportDirection(state);
+      const elapsedSeconds = Math.min(MAX_ACTION_DELTA_SECONDS, Math.max(0, (now - transport.updatedAt) / 1000));
+      transport.updatedAt = now;
+      if (direction === 0 || elapsedSeconds <= 0) {
+        return;
+      }
+
+      if (transport.blockedDirection !== undefined && Math.sign(direction) === Math.sign(transport.blockedDirection)) {
+        return;
+      }
+      if (transport.blockedDirection !== undefined && Math.sign(direction) !== Math.sign(transport.blockedDirection)) {
+        transport.blockedDirection = undefined;
+        transport.blockedBoundary = undefined;
+      }
+
+      const worldDelta = this.createCargoTransportWorldDelta(state, transport, direction, elapsedSeconds);
+      if (worldDelta.lengthSquared() <= 0) {
+        return;
+      }
+      const nextPosition = transport.cargoRoot.getAbsolutePosition().add(worldDelta);
+      if (this.setNodeAbsolutePosition(transport.cargoRoot, nextPosition)) {
+        changedCargoRoots.push(transport.cargoRoot);
+      }
+      this.syncCargoTargetStateToCurrentPose(transport.cargoRoot, now);
+    });
+    return changedCargoRoots;
+  }
+
+  /** 判断目标是否是可承载货箱的输送线类设备。 */
+  private isCargoTransportCarrier(state: DataDrivenTargetState): boolean {
+    if (!this.findCargoTransportMotionGroup(state)) {
+      return false;
+    }
+
+    const devType = this.normalizeMatchValue(state.target.dataDriven?.device?.devType ?? "");
+    if (devType === "conveyor") {
+      return true;
+    }
+
+    const values = this.getCargoMatchValues(state.target).map((value) => this.normalizeMatchValue(value));
+    return values.some((value) => value.includes("conveyor") || value.includes("roller") || value.includes("chain"));
+  }
+
+  /** 生成输送线本帧货箱位移，辊道机额外按输送段范围夹紧。 */
+  private createCargoTransportWorldDelta(
+    state: DataDrivenTargetState,
+    transport: CargoTransportState,
+    direction: number,
+    elapsedSeconds: number
+  ): Vector3 {
+    const rawDistance = direction * transport.speed * elapsedSeconds;
+    const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, transport.axis);
+    if (axisDirection.lengthSquared() <= 0) {
+      return Vector3.Zero();
+    }
+
+    const distance = this.isBoundedRollerConveyorTarget(state.target)
+      ? this.clampBoundedCargoTransportDistance(state, transport, axisDirection, rawDistance)
+      : rawDistance;
+    return Math.abs(distance) <= 0 ? Vector3.Zero() : axisDirection.scale(distance);
+  }
+
+  /** 辊道机货箱按当前辊筒输送段夹紧，整箱到末端后等待反向或重绑信号。 */
+  private clampBoundedCargoTransportDistance(
+    state: DataDrivenTargetState,
+    transport: CargoTransportState,
+    axisDirection: Vector3,
+    rawDistance: number
+  ): number {
+    const direction = Math.sign(rawDistance);
+    if (direction === 0) {
+      return 0;
+    }
+
+    const trackRange = this.createCargoTransportTrackRange(state, axisDirection);
+    const cargoRange = this.createNodeProjectionRange(transport.cargoRoot, axisDirection);
+    if (!trackRange || !cargoRange) {
+      return rawDistance;
+    }
+
+    const trackLength = trackRange.maximum - trackRange.minimum;
+    const cargoLength = cargoRange.maximum - cargoRange.minimum;
+    if (trackLength <= 0 || cargoLength > trackLength) {
+      transport.blockedDirection = direction;
+      transport.blockedBoundary = direction > 0 ? "end" : "start";
+      return 0;
+    }
+
+    const nextMinimum = cargoRange.minimum + rawDistance;
+    const nextMaximum = cargoRange.maximum + rawDistance;
+    if (direction > 0 && nextMaximum > trackRange.maximum) {
+      transport.blockedDirection = direction;
+      transport.blockedBoundary = "end";
+      return Math.max(0, trackRange.maximum - cargoRange.maximum);
+    }
+    if (direction < 0 && nextMinimum < trackRange.minimum) {
+      transport.blockedDirection = direction;
+      transport.blockedBoundary = "start";
+      return Math.min(0, trackRange.minimum - cargoRange.minimum);
+    }
+
+    transport.blockedDirection = undefined;
+    transport.blockedBoundary = undefined;
+    return rawDistance;
+  }
+
+  /** 计算辊道机当前有效输送段；优先使用辊筒运动节点，缺失时回退整机几何。 */
+  private createCargoTransportTrackRange(state: DataDrivenTargetState, axisDirection: Vector3): CargoTransportAxisRange | null {
+    const motionGroup = this.findCargoTransportMotionGroup(state);
+    const ranges = (motionGroup?.nodes ?? [])
+      .map((node) => this.createNodeProjectionRange(node, axisDirection))
+      .filter((range): range is CargoTransportAxisRange => Boolean(range));
+    if (ranges.length > 0) {
+      return this.mergeProjectionRanges(ranges);
+    }
+
+    return this.createNodeProjectionRange(state.target.root, axisDirection);
+  }
+
+  /** 将节点真实网格包围盒直接投影到输送方向，避免旋转后世界 AABB 放大输送范围。 */
+  private createNodeProjectionRange(node: TransformNode, axisDirection: Vector3): CargoTransportAxisRange | null {
+    const projectedBounds = this.projectNodesBoundsOnAxis([node], axisDirection);
+    if (!projectedBounds) {
+      return null;
+    }
+
+    return { minimum: projectedBounds.min, maximum: projectedBounds.max };
+  }
+
+  /** 合并多个投影范围，得到整体输送段或货箱占用段。 */
+  private mergeProjectionRanges(ranges: CargoTransportAxisRange[]): CargoTransportAxisRange | null {
+    if (ranges.length === 0) {
+      return null;
+    }
+
+    const minimum = Math.min(...ranges.map((range) => range.minimum));
+    const maximum = Math.max(...ranges.map((range) => range.maximum));
+    return Number.isFinite(minimum) && Number.isFinite(maximum) && maximum >= minimum ? { minimum, maximum } : null;
+  }
+
+  /** 辊道机需要有界输送，防止绑定货箱越过输送段首尾。 */
+  private isBoundedRollerConveyorTarget(target: SceneDataDrivenTarget): boolean {
+    const matchValues = this.dedupeStrings([
+      target.dataDriven?.device?.defaultAssetCode,
+      target.matchFields.assetCode,
+      target.matchFields.modelKey,
+      target.matchFields.deviceId,
+      target.matchFields.name,
+      target.matchFields.sourceFile,
+      target.matchFields.sourceFileStem
+    ]).map((value) => this.normalizeMatchValue(value));
+
+    return matchValues.some((value) => value === "rollerconveyor01" || value.includes("rollerconveyor"));
+  }
+
+  /** 读取输送线当前动作方向，优先使用 movement_x 对应的 action 运动组。 */
+  private resolveCargoTransportDirection(state: DataDrivenTargetState): number {
+    const group = this.findCargoTransportMotionGroup(state);
+    if (!group) {
+      return 0;
+    }
+
+    const direction = state.motionActionDirections.get(group.key) ?? 0;
+    return Number.isFinite(direction) ? Math.sign(direction) : 0;
+  }
+
+  /** 货箱沿输送线本地轴移动，默认 movement_x 对应模型本地 X 轴。 */
+  private resolveCargoTransportAxis(state: DataDrivenTargetState): ModelDataDrivenAxis {
+    const group = this.findCargoTransportMotionGroup(state);
+    if (!group) {
+      return "x";
+    }
+
+    if (group.target === "root" && group.kind === "translate") {
+      return group.axis;
+    }
+    return this.resolveAxisFromMotionFields(group.fields);
+  }
+
+  /** 输送线载货速度优先复用平移运动组速度，辊筒旋转类模型使用运行态默认速度。 */
+  private resolveCargoTransportSpeed(state: DataDrivenTargetState): number {
+    const group = this.findCargoTransportMotionGroup(state);
+    if (group?.kind === "translate" && group.speed && group.speed > 0) {
+      return group.speed;
+    }
+    return DEFAULT_CONVEYOR_CARGO_SPEED;
+  }
+
+  /** 查找最适合表达输送线前进/后退的 action 运动组。 */
+  private findCargoTransportMotionGroup(state: DataDrivenTargetState): RuntimeMotionGroup | undefined {
+    const actionGroups = state.motionGroups.filter((group) => group.valueMode === "action");
+    return (
+      actionGroups.find((group) => this.motionGroupUsesField(group, "movement_x")) ??
+      actionGroups.find((group) => this.motionGroupUsesField(group, "rotation")) ??
+      actionGroups[0]
+    );
+  }
+
+  /** 判断运动组字段是否包含指定点位名。 */
+  private motionGroupUsesField(group: RuntimeMotionGroup, fieldName: string): boolean {
+    const normalizedField = this.normalizeMatchValue(fieldName);
+    return group.fields.some((field) => this.normalizeMatchValue(field) === normalizedField);
+  }
+
+  /** 按 movement_x/y/z 点位名推导货箱输送轴，rotation 仍按 X 方向作为输送线默认流向。 */
+  private resolveAxisFromMotionFields(fields: string[]): ModelDataDrivenAxis {
+    const normalizedFields = fields.map((field) => this.normalizeMatchValue(field));
+    if (normalizedFields.includes("movement_y")) {
+      return "y";
+    }
+    if (normalizedFields.includes("movement_z")) {
+      return "z";
+    }
+    return "x";
+  }
+
+  /** 判断指定根节点当前是否作为货箱被载体吸附，吸附期间不再消费自身位姿帧。 */
+  private isAttachedCargoRoot(root: TransformNode): boolean {
+    return this.cargoAttachments.has(root.uniqueId);
+  }
+
+  /** 判断指定根节点是否正由 Stacker 或输送线运行态关系驱动。 */
+  private isRuntimeDrivenCargoRoot(root: TransformNode): boolean {
+    return this.isAttachedCargoRoot(root) || this.cargoTransports.has(root.uniqueId);
+  }
+
+  /** 把货箱自身数据驱动状态同步到当前姿态，避免吸附或放货后被旧 twinspawn 目标拉回。 */
+  private syncCargoTargetStateToCurrentPose(cargoRoot: TransformNode, now: number): void {
+    const cargoState = this.targetStates.get(cargoRoot.uniqueId);
+    if (!cargoState) {
+      return;
+    }
+
+    const currentPosition = cargoRoot.position.clone();
+    cargoState.rootStartPosition = currentPosition.clone();
+    cargoState.rootTargetPosition = currentPosition.clone();
+    if (cargoState.rootStartRotationY !== undefined && cargoState.rootTargetRotationY !== undefined && !cargoRoot.rotationQuaternion) {
+      cargoState.rootStartRotationY = cargoRoot.rotation.y;
+      cargoState.rootTargetRotationY = cargoRoot.rotation.y;
+    }
+    cargoState.motionStartedAt = now;
+    cargoState.motionDurationMs = 0;
+    cargoState.motionStartValues = new Map(cargoState.motionValues);
+    cargoState.motionActionDirections.forEach((_direction, key) => cargoState.motionActionDirections.set(key, 0));
+    cargoState.motionActionUpdatedAt = now;
+    cargoState.motionStartPositions = this.captureNodePositions(cargoState.motionNodes);
+    cargoState.motionTargetPositions = this.captureNodePositions(cargoState.motionNodes);
+    cargoState.motionStartRotations = this.captureNodeRotations(cargoState.motionNodes);
+    cargoState.motionTargetRotations = this.captureNodeRotations(cargoState.motionNodes);
   }
 
   /** 读取当前货叉伸出量，模型脚本自定义 fork 名称时也按字段名兜底识别。 */
@@ -1319,18 +1665,110 @@ export class SceneDataDrivenRuntime {
     return frame;
   }
 
-  /** 将规范点位中的负载绑定别名映射到现有货箱字段，复用运行态吸附能力。 */
+  /** 将规范点位、现场 PLC 点位映射到运行时可消费的标准字段。 */
   private applyDocumentPointAlias(frame: Record<string, unknown>, pointName: string, pointValue: unknown): void {
-    if (pointName !== "payload") {
+    this.applyDocumentFieldAlias(frame, pointName, pointValue);
+  }
+
+  /** 扫描整帧字段，兼容已经是对象形态的现场 PLC 报文。 */
+  private applyDocumentFrameAliases(frame: Record<string, unknown>): void {
+    Object.entries(frame).forEach(([fieldName, fieldValue]) => this.applyDocumentFieldAlias(frame, fieldName, fieldValue));
+  }
+
+  /** 将单个点位别名写入标准字段，原始点位仍保留给业务层展示。 */
+  private applyDocumentFieldAlias(frame: Record<string, unknown>, pointName: string, pointValue: unknown): void {
+    const normalizedPointName = this.normalizeProtocolFieldName(pointName);
+    const compactPointName = normalizedPointName.replace(/[\s_]/g, "");
+    if (normalizedPointName === "payload") {
+      if (frame.cargo === undefined) {
+        frame.cargo = pointValue;
+      }
+      if (frame.cargoId === undefined) {
+        frame.cargoId = pointValue;
+      }
       return;
     }
 
-    if (frame.cargo === undefined) {
-      frame.cargo = pointValue;
+    if (normalizedPointName === STACKER_PLC_DEVICE_CODE_FIELD.toLowerCase() || compactPointName === "devicecode") {
+      if (frame[STACKER_PLC_DEVICE_CODE_FIELD] === undefined) {
+        frame[STACKER_PLC_DEVICE_CODE_FIELD] = pointValue;
+      }
+      if (frame.deviceCode === undefined) {
+        frame.deviceCode = pointValue;
+      }
+      return;
     }
-    if (frame.cargoId === undefined) {
-      frame.cargoId = pointValue;
+
+    if (normalizedPointName === "action") {
+      this.writeMotionAlias(frame, "movement_x", this.readBitfieldAction(pointValue, [0], [1]));
+      return;
     }
+
+    if (compactPointName === "frontaction" || compactPointName === "backaction") {
+      this.writeMotionAlias(frame, "movement_y", this.readBitfieldAction(pointValue, [2], [3]));
+      return;
+    }
+
+    if (compactPointName === "frontforkaction") {
+      this.writeMotionAlias(frame, "front_movement_z", this.readBitfieldAction(pointValue, [1, 3], [2, 4]));
+      return;
+    }
+
+    if (compactPointName === "backforkaction") {
+      this.writeMotionAlias(frame, "back_movement_z", this.readBitfieldAction(pointValue, [1, 3], [2, 4]));
+    }
+  }
+
+  /** 规范化协议字段名，只用于别名判断，不改变原始 payload 字段。 */
+  private normalizeProtocolFieldName(value: string): string {
+    return value.trim().replace(/-/g, "_").toLowerCase();
+  }
+
+  /** 把 PLC 位信号转换成运行时动作枚举：1 正向，2 反向，0 停止或冲突。 */
+  private readBitfieldAction(value: unknown, positiveBits: number[], negativeBits: number[]): number | undefined {
+    const bitfield = this.readBitfieldNumber(value);
+    if (bitfield === undefined) {
+      return undefined;
+    }
+
+    const positive = positiveBits.some((bit) => (bitfield & (1 << bit)) !== 0);
+    const negative = negativeBits.some((bit) => (bitfield & (1 << bit)) !== 0);
+    if (positive && !negative) {
+      return 1;
+    }
+    if (negative && !positive) {
+      return 2;
+    }
+    return 0;
+  }
+
+  /** 读取 PLC Byte 位域，非法值不参与动作别名转换。 */
+  private readBitfieldNumber(value: unknown): number | undefined {
+    const numberValue = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+    if (!Number.isFinite(numberValue) || numberValue < 0) {
+      return undefined;
+    }
+    return Math.trunc(numberValue);
+  }
+
+  /** 写入动作别名；0 不覆盖后续同帧非 0 动作，避免前后叉空信号挡住真实动作。 */
+  private writeMotionAlias(frame: Record<string, unknown>, fieldName: string, action: number | undefined): void {
+    if (action === undefined) {
+      return;
+    }
+
+    const current = frame[fieldName];
+    if (current === undefined || (this.isZeroActionValue(current) && action !== 0)) {
+      frame[fieldName] = action;
+    }
+  }
+
+  /** 判断当前动作值是否是停止态，用于同帧多个 PLC 信号的优先级合并。 */
+  private isZeroActionValue(value: unknown): boolean {
+    if (typeof value === "number") {
+      return value === 0;
+    }
+    return typeof value === "string" && value.trim() === "0";
   }
 
   /** 判断对象是否符合文档 twindatadriven/joint 的单点位格式。 */
@@ -1343,7 +1781,7 @@ export class SceneDataDrivenRuntime {
 
   /** 读取文档 joint 消息中的设备编号，兼容 Excel 常用 deviceCode 和旧 e 字段。 */
   private readJointDeviceId(record: Record<string, unknown>): string | undefined {
-    for (const key of ["e", "deviceCode", "devId", "deviceId", "deviceID", "assetCode"]) {
+    for (const key of ["e", "deviceCode", STACKER_PLC_DEVICE_CODE_FIELD, "devId", "deviceId", "deviceID", "assetCode"]) {
       const value = record[key];
       if (typeof value === "string" && value.trim()) {
         return value.trim();
@@ -1423,6 +1861,7 @@ export class SceneDataDrivenRuntime {
   private createFrameWithMqttDefaults(value: Record<string, unknown>, metadata: LogisticsMqttTopicMetadata | null): DataFrame {
     const frame: DataFrame = { ...value };
     applyLogisticsMqttFrameDefaults(frame, metadata);
+    this.applyDocumentFrameAliases(frame);
     return frame;
   }
 
@@ -1441,9 +1880,14 @@ export class SceneDataDrivenRuntime {
       "movement_z",
       "front_movement_z",
       "back_movement_z",
+      "front_action",
+      "back_action",
+      "front_forkAction",
+      "back_forkAction",
       "forkState",
       "rotation",
       "move",
+      "action",
       "folding",
       "flip",
       "fork",
@@ -1492,6 +1936,7 @@ export class SceneDataDrivenRuntime {
       ...targets.map((target) => target.dataDriven?.device?.deviceIdField),
       "e",
       "deviceCode",
+      STACKER_PLC_DEVICE_CODE_FIELD,
       "devId",
       "deviceId",
       "deviceID",
@@ -1555,6 +2000,7 @@ export class SceneDataDrivenRuntime {
       config.deviceIdField,
       "e",
       "deviceCode",
+      STACKER_PLC_DEVICE_CODE_FIELD,
       "devId",
       "deviceId",
       "deviceID",
@@ -2130,13 +2576,26 @@ export class SceneDataDrivenRuntime {
     const fixedNameSet = new Set(fixedNodeNames);
     const exactNameSet = new Set(exactNames);
     const exactMatches = nodes.filter((node) => exactNameSet.has(String(node.name ?? "")));
+    const generatedExactMatches =
+      exactMatches.length > 0 ? nodes.filter((node) => this.isGeneratedMotionCloneFromExactNode(node, exactNameSet)) : [];
     const matches =
       exactMatches.length > 0
-        ? exactMatches
+        ? [...exactMatches, ...generatedExactMatches]
         : group
           ? nodes.filter((node) => this.matchesConfiguredFallbackPattern(String(node.name ?? ""), group.fallbackPattern))
           : nodes.filter((node) => fallbackPattern.test(String(node.name ?? "")));
     return this.dedupeTransformNodes(matches).filter((node) => !fixedNameSet.has(String(node.name ?? "")));
+  }
+
+  /** 参数化运行态克隆保留源节点名，动画组需要把同源克隆一并纳入驱动。 */
+  private isGeneratedMotionCloneFromExactNode(node: TransformNode, exactNameSet: Set<string>): boolean {
+    const metadata = this.isRecord(node.metadata) ? node.metadata : {};
+    if (metadata.generatedByMeshVertexModifyRuntime !== true || metadata.reason !== "rollerDensity") {
+      return false;
+    }
+
+    const sourceNodeName = typeof metadata.sourceNodeName === "string" ? metadata.sourceNodeName : "";
+    return exactNameSet.has(sourceNodeName);
   }
 
   /** 配置 fallbackPattern 不执行正则，只按 | 分隔的安全关键字做包含匹配。 */
