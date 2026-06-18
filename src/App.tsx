@@ -1095,6 +1095,8 @@ export function App() {
   const [sceneLoadFailed, setSceneLoadFailed] = useState(false);
   const [sceneDialogOpen, setSceneDialogOpen] = useState(false);
   const [dataSourceDialogOpen, setDataSourceDialogOpen] = useState(false);
+  const [dataSourceSaveInProgress, setDataSourceSaveInProgress] = useState(false);
+  const [dataSourceSaveMessage, setDataSourceSaveMessage] = useState<string | null>(null);
   const [sceneContextMenu, setSceneContextMenu] = useState<SceneContextMenuState | null>(null);
   const [modelArrayDialog, setModelArrayDialog] = useState<ModelArrayDialogState | null>(null);
   const [treeExpansionCommand, setTreeExpansionCommand] = useState<HierarchyExpansionCommand | null>(null);
@@ -1110,6 +1112,7 @@ export function App() {
   const activeSceneRef = useRef<{ projectPath: string | null; sceneId: string | null }>({ projectPath: null, sceneId: null });
   const sceneDataDrivenRef = useRef<SceneDataDrivenSnapshot>(DEFAULT_SCENE_DATA_DRIVEN);
   const saveInProgressRef = useRef(false);
+  const dataSourceSaveInProgressRef = useRef(false);
   const saveSuccessTimerRef = useRef<number | null>(null);
   const sceneRenameRequestRef = useRef(0);
   const cadImportRequestRef = useRef(0);
@@ -1223,9 +1226,11 @@ export function App() {
   const projectSaveBlocked = Boolean(
     activeProject && (!activeScene || sceneLoading || sceneLoadFailed || previewMode || cadImportActive || cadRestoreActive)
   );
-  const saveBlocked = projectSaveBlocked || saveInProgress;
+  const saveBlocked = projectSaveBlocked || saveInProgress || dataSourceSaveInProgress;
   const saveDisabledReason = saveInProgress
     ? "场景保存中"
+    : dataSourceSaveInProgress
+      ? "数据源配置保存中"
     : activeProject && !activeScene
     ? "当前项目没有可保存的场景"
     : cadImportActive
@@ -1239,6 +1244,16 @@ export function App() {
       : sceneLoadFailed
         ? "当前场景加载失败，已阻止保存"
         : undefined;
+  const undoDisabled = !engine?.canUndoSceneLayout() || sceneLoading || cadImportActive || cadRestoreActive;
+  const undoDisabledReason = sceneLoading
+    ? "场景读取完成后才能撤销"
+    : cadImportActive
+    ? "CAD 图纸导入完成后才能撤销"
+    : cadRestoreActive
+    ? "CAD 图纸恢复完成后才能撤销"
+    : previewMode
+    ? "预览模式中不能撤销场景布局"
+    : "暂无可撤销的场景布局操作";
   const publishDisabledReason = publishing
     ? "场景正在发布，请等待完成"
     : !window.electronApp?.publish?.buildAndOpenDist
@@ -1351,6 +1366,7 @@ export function App() {
     cadImportRequestRef.current += 1;
     cadRestoreRequestRef.current += 1;
     setSceneLoadFailed(false);
+    setDataSourceSaveMessage(null);
   }, [clearSaveSuccessMessage]);
 
   /** 保存当前项目和场景上下文，异步 IPC 返回时用它避免旧响应覆盖新界面。 */
@@ -1562,6 +1578,7 @@ export function App() {
           const sceneSnapshot = engine.getSceneInspectorSnapshot();
           setSceneEnvironmentColor(sceneSnapshot.environment.backgroundColor);
           syncSceneDataDrivenState(sceneSnapshot.dataDriven);
+          setDataSourceSaveMessage(null);
         }
         if (!cancelled) {
           setSceneLoadFailed(false);
@@ -2250,6 +2267,19 @@ export function App() {
     engine?.deleteSelected();
   }, [engine]);
 
+  /** 撤销最近一次场景布局编辑，恢复对象层级、变换和可见锁定状态。 */
+  const handleUndoSceneLayout = useCallback(async () => {
+    if (!engine?.canUndoSceneLayout()) {
+      return;
+    }
+
+    const undone = await engine.undoSceneLayout();
+    if (!undone) {
+      setProjectError("撤销场景布局失败，请确认当前场景仍可编辑。");
+      setProjectErrorExpanded(false);
+    }
+  }, [engine]);
+
   useEffect(() => {
     /** 响应场景快捷键，并避开输入框内的文本编辑场景。 */
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2266,6 +2296,14 @@ export function App() {
       const normalizedKey = event.key.toLowerCase();
       const isPlainSystemShortcut = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
       const hasSystemModifier = event.ctrlKey || event.metaKey || event.altKey;
+      if (isPlainSystemShortcut && normalizedKey === "z") {
+        if (engine.canUndoSceneLayout()) {
+          event.preventDefault();
+          void handleUndoSceneLayout();
+        }
+        return;
+      }
+
       if (isPlainSystemShortcut && normalizedKey === "c") {
         if (engine.copySelected()) {
           event.preventDefault();
@@ -2337,7 +2375,7 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canEditSelectedBatch, engine, runTreeExpansionCommand, selectedHierarchyNode, selectedNode]);
+  }, [canEditSelectedBatch, engine, handleUndoSceneLayout, runTreeExpansionCommand, selectedHierarchyNode, selectedNode]);
 
   /** 从属性面板按当前快照节点 ID 提交对象变换、材质或 metadata 更新，避免引擎选中状态短暂失配。 */
   const handleInspectorChange = useCallback(
@@ -2359,9 +2397,43 @@ export function App() {
     [engine, selectedNode]
   );
 
+  /** 把当前项目场景写回磁盘，统一复用场景保存和数据源配置保存的落盘流程。 */
+  const saveActiveProjectSceneToDisk = useCallback(
+    async (projectPath: string, sceneId: string, successMessage: string) => {
+      if (!engine) {
+        throw new Error("场景引擎尚未准备好，无法保存项目场景。");
+      }
+
+      const projectsApi = window.electronApp?.projects;
+      if (!projectsApi) {
+        throw new Error("当前不在 Electron 桌面环境，无法保存项目场景。");
+      }
+
+      const textureAssetId = createSceneTextureAssetId(sceneId);
+      const serializedScene = await engine.serializeProjectScene({
+        persistExternalTexture: (fileName, data) => projectsApi.saveAssetFile(projectPath, textureAssetId, fileName, data)
+      });
+      const project = await projectsApi.saveScene(projectPath, sceneId, serializedScene);
+      const currentContext = activeSceneRef.current;
+      if (currentContext.projectPath === projectPath) {
+        setActiveProject(project);
+      }
+      if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
+        setActiveSceneId(sceneId);
+      }
+      await refreshRecentProjects();
+      const latestContext = activeSceneRef.current;
+      if (latestContext.projectPath === projectPath && latestContext.sceneId === sceneId) {
+        setProjectError(null);
+        showSaveSuccessMessage(successMessage);
+      }
+    },
+    [engine, refreshRecentProjects, showSaveSuccessMessage]
+  );
+
   /** 保存当前 Babylon 场景，项目场景读取失败时禁止覆盖磁盘文件。 */
   const handleSave = useCallback(async () => {
-    if (!engine || saveInProgressRef.current) {
+    if (!engine || saveInProgressRef.current || dataSourceSaveInProgressRef.current) {
       return;
     }
 
@@ -2407,31 +2479,9 @@ export function App() {
       if (activeProject && activeScene) {
         const projectPath = activeProject.path;
         const sceneId = activeScene.id;
-        const projectsApi = window.electronApp?.projects;
-        if (!projectsApi) {
-          setProjectError("当前不在 Electron 桌面环境，无法保存项目场景。");
-          return;
-        }
-
         try {
-          const textureAssetId = createSceneTextureAssetId(sceneId);
-          const serializedScene = await engine.serializeProjectScene({
-            persistExternalTexture: (fileName, data) => projectsApi.saveAssetFile(projectPath, textureAssetId, fileName, data)
-          });
-          const project = await projectsApi.saveScene(projectPath, sceneId, serializedScene);
-          const currentContext = activeSceneRef.current;
-          if (currentContext.projectPath === projectPath) {
-            setActiveProject(project);
-          }
-          if (currentContext.projectPath === projectPath && currentContext.sceneId === sceneId) {
-            setActiveSceneId(sceneId);
-          }
-          await refreshRecentProjects();
-          const latestContext = activeSceneRef.current;
-          if (latestContext.projectPath === projectPath && latestContext.sceneId === sceneId) {
-            setProjectError(null);
-            showSaveSuccessMessage("保存完成");
-          }
+          await saveActiveProjectSceneToDisk(projectPath, sceneId, "保存完成");
+          setDataSourceSaveMessage(null);
           return;
         } catch (error) {
           const currentContext = activeSceneRef.current;
@@ -2454,7 +2504,7 @@ export function App() {
     activeScene,
     engine,
     previewMode,
-    refreshRecentProjects,
+    saveActiveProjectSceneToDisk,
     sceneLoadFailed,
     sceneLoading,
     showSaveSuccessMessage,
@@ -2538,6 +2588,7 @@ export function App() {
         ...nextSceneSnapshot,
         name: activeScene?.name ?? nextSceneSnapshot.name
       };
+      setDataSourceSaveMessage(null);
       setSceneEnvironmentColor(namedSceneSnapshot.environment.backgroundColor);
       syncSceneDataDrivenState(namedSceneSnapshot.dataDriven);
       setInspectorTarget((current) => {
@@ -2731,6 +2782,16 @@ export function App() {
           ? "CAD 图纸恢复完成后才能配置数据源"
           : undefined;
   const dataSourceConfigDisabled = Boolean(dataSourceConfigDisabledReason);
+  const dataSourceSaveDisabledReason = dataSourceSaveInProgress
+    ? "数据源配置保存中"
+    : saveInProgress
+      ? "场景保存中"
+      : !activeProject || !activeScene
+        ? "请先打开或创建项目场景"
+        : previewMode
+          ? "停止预览后才能保存数据源配置"
+          : dataSourceConfigDisabledReason;
+  const dataSourceSaveDisabled = Boolean(dataSourceSaveDisabledReason);
 
   /** 场景切换、加载失败或 CAD 忙状态出现时关闭数据源弹窗，避免继续写入旧场景配置。 */
   useEffect(() => {
@@ -2738,6 +2799,61 @@ export function App() {
       setDataSourceDialogOpen(false);
     }
   }, [dataSourceConfigDisabled]);
+
+  /** 保存统一数据源配置到当前项目场景文件，重新打开项目后会从 metadata 恢复。 */
+  const handleSaveDataSourceConfig = useCallback(async () => {
+    if (dataSourceSaveInProgressRef.current) {
+      return;
+    }
+
+    if (saveInProgressRef.current) {
+      setProjectError("场景保存中");
+      return;
+    }
+
+    if (dataSourceSaveDisabledReason) {
+      setProjectError(dataSourceSaveDisabledReason);
+      return;
+    }
+
+    if (!engine || !activeProject || !activeScene) {
+      setProjectError("请先打开或创建项目场景。");
+      return;
+    }
+
+    const projectPath = activeProject.path;
+    const sceneId = activeScene.id;
+    dataSourceSaveInProgressRef.current = true;
+    setDataSourceSaveInProgress(true);
+    setDataSourceSaveMessage(null);
+
+    try {
+      // 保存前先把 React 中最新快照同步到 Babylon metadata，保证弹窗最后一次编辑不会丢。
+      const syncedSceneSnapshot = engine.updateSceneInspector({ dataDriven: sceneDataDrivenRef.current });
+      syncSceneDataDrivenState(syncedSceneSnapshot.dataDriven);
+      await saveActiveProjectSceneToDisk(projectPath, sceneId, "数据源配置已保存");
+      const latestContext = activeSceneRef.current;
+      if (latestContext.projectPath === projectPath && latestContext.sceneId === sceneId) {
+        setDataSourceSaveMessage("数据源配置已保存，重新打开项目会自动恢复。");
+      }
+    } catch (error) {
+      const latestContext = activeSceneRef.current;
+      if (latestContext.projectPath === projectPath && latestContext.sceneId === sceneId) {
+        setDataSourceSaveMessage(null);
+        setProjectError(getErrorMessage(error, "保存数据源配置失败。"));
+      }
+    } finally {
+      dataSourceSaveInProgressRef.current = false;
+      setDataSourceSaveInProgress(false);
+    }
+  }, [
+    activeProject,
+    activeScene,
+    dataSourceSaveDisabledReason,
+    engine,
+    saveActiveProjectSceneToDisk,
+    syncSceneDataDrivenState
+  ]);
 
   const contextTarget = sceneContextMenu?.target ?? null;
   const contextTreeTargetId = contextTarget?.kind === "Group" && contextTarget.hasChildren ? contextTarget.id : undefined;
@@ -2802,6 +2918,9 @@ export function App() {
         onOpenDataSourceConfig={() => setDataSourceDialogOpen(true)}
         dataSourceConfigDisabled={dataSourceConfigDisabled}
         dataSourceConfigDisabledReason={dataSourceConfigDisabledReason}
+        onUndo={() => void handleUndoSceneLayout()}
+        undoDisabled={undoDisabled}
+        undoDisabledReason={undoDisabledReason}
         onSave={handleSave}
         saveDisabled={saveBlocked}
         saveDisabledReason={saveDisabledReason}
@@ -3213,10 +3332,24 @@ export function App() {
                 status={dataConnectionStatus}
                 onChange={handleSceneDataDrivenChange}
               />
+              {dataSourceSaveMessage && (
+                <div className="data-source-save-status" role="status">
+                  {dataSourceSaveMessage}
+                </div>
+              )}
             </div>
             <div className="modal-actions">
-              <button className="command-button" type="button" onClick={() => setDataSourceDialogOpen(false)}>
-                完成
+              <button className="icon-text-button" type="button" onClick={() => setDataSourceDialogOpen(false)}>
+                关闭
+              </button>
+              <button
+                className="command-button"
+                type="button"
+                title={dataSourceSaveDisabledReason}
+                disabled={dataSourceSaveDisabled}
+                onClick={() => void handleSaveDataSourceConfig()}
+              >
+                {dataSourceSaveInProgress ? "保存中" : "保存配置"}
               </button>
             </div>
           </section>

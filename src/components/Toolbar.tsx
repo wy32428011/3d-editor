@@ -18,6 +18,7 @@ import {
   Save,
   Scaling,
   Square,
+  Undo2,
   Upload,
   type LucideIcon
 } from "lucide-react";
@@ -37,6 +38,9 @@ interface ToolbarProps {
   onOpenDataSourceConfig: () => void;
   dataSourceConfigDisabled?: boolean;
   dataSourceConfigDisabledReason?: string;
+  onUndo: () => void;
+  undoDisabled?: boolean;
+  undoDisabledReason?: string;
   onSave: () => void;
   saveDisabled?: boolean;
   saveDisabledReason?: string;
@@ -109,6 +113,9 @@ export function Toolbar({
   onOpenDataSourceConfig,
   dataSourceConfigDisabled = false,
   dataSourceConfigDisabledReason,
+  onUndo,
+  undoDisabled = false,
+  undoDisabledReason,
   onSave,
   saveDisabled = false,
   saveDisabledReason,
@@ -190,6 +197,15 @@ export function Toolbar({
       </div>
 
       <div className="toolbar-group" aria-label="文件">
+        <button
+          className="icon-button"
+          title={undoDisabled ? undoDisabledReason ?? "暂无可撤销的场景布局操作" : "撤销场景布局（Ctrl+Z）"}
+          type="button"
+          disabled={undoDisabled}
+          onClick={onUndo}
+        >
+          <Undo2 size={18} />
+        </button>
         <button className="icon-button" title="导入资源" type="button" onClick={openFilePicker}>
           <Upload size={18} />
         </button>

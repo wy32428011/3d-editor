@@ -19,10 +19,14 @@ interface RightPointerState {
   x: number;
   y: number;
   dragged: boolean;
+  cameraNavigation: boolean;
 }
 
 const RIGHT_BUTTON = 2;
 const CONTEXT_MENU_DRAG_THRESHOLD = 6;
+const RIGHT_POINTER_STALE_MS = 800;
+
+type PointerLike = Pick<PointerEvent, "altKey" | "button" | "clientX" | "clientY">;
 
 /** 中央视口承载 Babylon canvas，并处理文件拖拽和内置资产拖拽。 */
 export function ViewportCanvas({
@@ -39,6 +43,7 @@ export function ViewportCanvas({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<BabylonEditorEngine | null>(null);
   const rightPointerRef = useRef<RightPointerState | null>(null);
+  const rightPointerCleanupTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) {
@@ -119,40 +124,99 @@ export function ViewportCanvas({
   };
 
   /** 记录右键按下位置，用于区分菜单点击和右键拖动画面。 */
-  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+  const handlePointerDown = (event: PointerLike) => {
     if (event.button !== RIGHT_BUTTON) {
       return;
     }
 
+    clearRightPointerCleanupTimer();
     rightPointerRef.current = {
       x: event.clientX,
       y: event.clientY,
-      dragged: false
+      dragged: false,
+      cameraNavigation: event.altKey
     };
+    // 新一轮右键操作开始时先关闭旧菜单；普通右键单击随后会由 contextmenu 重新打开命中对象菜单。
+    onModelContextMenu(null, { x: event.clientX, y: event.clientY });
   };
 
-  /** 超过阈值的右键移动视为相机平移，不再弹出模型菜单。 */
-  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+  /** 超过阈值的右键移动视为相机导航，不再弹出模型菜单。 */
+  const handlePointerMove = (event: PointerLike) => {
     const pointer = rightPointerRef.current;
     if (!pointer) {
       return;
     }
 
     const distance = Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y);
-    if (distance > CONTEXT_MENU_DRAG_THRESHOLD) {
+    if (distance > CONTEXT_MENU_DRAG_THRESHOLD && !pointer.dragged) {
       pointer.dragged = true;
+      onModelContextMenu(null, { x: event.clientX, y: event.clientY });
     }
   };
 
-  /** 右键菜单只在未拖拽且命中可编辑场景对象时打开。 */
+  /** contextmenu 可能被 Alt+右键缩放抑制，延迟清理避免右键状态残留到下一次操作。 */
+  const scheduleRightPointerCleanup = (event: PointerLike) => {
+    if (event.button !== RIGHT_BUTTON) {
+      return;
+    }
+
+    clearRightPointerCleanupTimer();
+    rightPointerCleanupTimerRef.current = window.setTimeout(() => {
+      rightPointerRef.current = null;
+      rightPointerCleanupTimerRef.current = null;
+    }, RIGHT_POINTER_STALE_MS);
+  };
+
+  /** 取消或失焦时没有后续菜单事件，直接清理右键状态。 */
+  const clearRightPointerState = () => {
+    clearRightPointerCleanupTimer();
+    rightPointerRef.current = null;
+  };
+
+  /** 清理右键状态的延迟任务，避免重复计时器持有旧闭包。 */
+  const clearRightPointerCleanupTimer = () => {
+    if (rightPointerCleanupTimerRef.current === null) {
+      return;
+    }
+
+    window.clearTimeout(rightPointerCleanupTimerRef.current);
+    rightPointerCleanupTimerRef.current = null;
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    // Babylon 会在 canvas 上捕获指针，原生监听能稳定收到右键拖拽的移动事件。
+    canvas.addEventListener("pointerdown", handlePointerDown);
+    canvas.addEventListener("pointermove", handlePointerMove);
+    canvas.addEventListener("pointerup", scheduleRightPointerCleanup);
+    canvas.addEventListener("pointercancel", clearRightPointerState);
+    window.addEventListener("blur", clearRightPointerState);
+    return () => {
+      canvas.removeEventListener("pointerdown", handlePointerDown);
+      canvas.removeEventListener("pointermove", handlePointerMove);
+      canvas.removeEventListener("pointerup", scheduleRightPointerCleanup);
+      canvas.removeEventListener("pointercancel", clearRightPointerState);
+      window.removeEventListener("blur", clearRightPointerState);
+      clearRightPointerCleanupTimer();
+    };
+  }, [onModelContextMenu]);
+
+  /** 右键菜单只在编辑态、未拖拽、非 Alt+右键缩放且命中可编辑场景对象时打开。 */
   const handleContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
+    clearRightPointerCleanupTimer();
     const pointer = rightPointerRef.current;
     const dragged =
       pointer?.dragged ||
       (pointer ? Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) > CONTEXT_MENU_DRAG_THRESHOLD : false);
+    const cameraNavigation =
+      previewMode || pointer?.cameraNavigation || event.altKey || Boolean(engineRef.current?.hasActiveOrRecentCameraNavigation());
     rightPointerRef.current = null;
-    if (dragged) {
+    if (dragged || cameraNavigation) {
       onModelContextMenu(null, { x: event.clientX, y: event.clientY });
       return;
     }
@@ -168,10 +232,11 @@ export function ViewportCanvas({
       onContextMenu={handleContextMenu}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
     >
-      <canvas ref={canvasRef} className="viewport-canvas" />
+      <canvas
+        ref={canvasRef}
+        className="viewport-canvas"
+      />
     </main>
   );
 }

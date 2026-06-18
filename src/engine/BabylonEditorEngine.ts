@@ -138,6 +138,7 @@ import type {
 const HELPER_FLAG = "isEditorHelper";
 const ROOT_FLAG = "isEditorRoot";
 const DROP_SURFACE_FLAG = "isEditorDropSurface";
+const CLONE_SOURCE_TOKEN_KEY = "__editorCloneSourceToken";
 const GROUP_NODE_TYPE = "group";
 const STACKER_DEMO_DEVICE_ID = "DDJ2";
 const STACKER_DEMO_ENDPOINT = "ws://127.0.0.1:18083/stacker";
@@ -154,6 +155,10 @@ const SELECTION_OUTLINE_COLOR = "#63d7ff";
 const SELECTION_OUTLINE_THICKNESS = 1.8;
 const SELECTION_OUTLINE_TEXTURE_RATIO = 0.5;
 const CAD_LINE_CHUNK_PERSIST_CONCURRENCY = 2;
+const SCENE_UNDO_HISTORY_LIMIT = 20;
+const SCENE_UNDO_MAX_MESHES = 1200;
+const SCENE_UNDO_MAX_VERTICES = 500000;
+const SCENE_UNDO_MAX_SERIALIZED_BYTES = 16 * 1024 * 1024;
 const IMPORTED_MODEL_NORMALIZED_UNIT_POLICY = "imported-model-source-units-normalized-to-meters";
 const GRID_MAJOR_LINE_EVERY_CELLS = 5;
 const MAX_GRID_LINE_COUNT_PER_AXIS = 160;
@@ -229,6 +234,15 @@ const DEFAULT_CAMERA_PANNING_SENSIBILITY = 55;
 const DEFAULT_CAMERA_ROTATION_SENSIBILITY = 1000;
 const MIN_CAMERA_INPUT_SENSIBILITY = 1;
 const MAX_CAMERA_INPUT_SENSIBILITY = 100000;
+const CAMERA_POINTER_PAN_PIXEL_SCALE = 20;
+const CAMERA_POINTER_DOLLY_PIXEL_SCALE = 8;
+const CAMERA_POINTER_DRAG_THRESHOLD = 6;
+const CAMERA_NAVIGATION_SHIFT_MULTIPLIER = 3;
+const CAMERA_MIN_BETA = 0.01;
+const CAMERA_MAX_BETA = Math.PI - CAMERA_MIN_BETA;
+const LEFT_MOUSE_BUTTON = 0;
+const MIDDLE_MOUSE_BUTTON = 1;
+const RIGHT_MOUSE_BUTTON = 2;
 
 /** 提取引擎内部异步错误消息，避免跨 worker/IPC 的非 Error 异常丢失上下文。 */
 function getEngineErrorMessage(error: unknown, fallback: string): string {
@@ -362,6 +376,9 @@ interface SerializedSceneLoadOptions {
   loadCadLineChunks?: (requests: CadLineChunkLoadRequest[]) => Promise<CadLineChunkLoadResult[]>;
   loadExternalTextures?: (requests: ProjectExternalTextureLoadRequest[]) => Promise<ProjectExternalTextureLoadResult[]>;
   onCadRestoreProgress?: (progress: CadDxfLineProgress) => void;
+  preserveEditorCamera?: boolean;
+  preserveAssetFileCache?: boolean;
+  resetUndoHistory?: boolean;
 }
 
 /** CAD 侧车 chunk manifest，只保存小型索引信息，真实线段在 .cadlines.bin 中。 */
@@ -505,6 +522,66 @@ interface PreviewCameraSnapshot {
   upperRadiusLimit: number | null;
 }
 
+type EditorCameraPointerAction = "orbit" | "pan" | "dolly" | "look";
+
+interface EditorCameraPointerState {
+  pointerId: number;
+  action: EditorCameraPointerAction;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  moved: boolean;
+  navigationStarted: boolean;
+}
+
+interface EditorCameraPointerNavigationOptions {
+  onNavigationStart?: (action: EditorCameraPointerAction) => void;
+  onNavigationEnd?: (action: EditorCameraPointerAction, moved: boolean) => void;
+}
+
+/** 根据 ArcRotateCamera 当前配置计算一次沿视线方向移动的距离。 */
+function getEditorCameraDollyDistance(camera: ArcRotateCamera, wheelDelta: number): number {
+  const cameraRadius = Number.isFinite(camera.radius) ? Math.abs(camera.radius) : DEFAULT_CAMERA_RADIUS_METERS;
+  const radiusScale = Math.max(1, cameraRadius);
+  const precision = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(camera.wheelPrecision || DEFAULT_CAMERA_WHEEL_PRECISION));
+  return (wheelDelta * radiusScale) / (precision * CAMERA_WHEEL_PIXEL_NORMALIZE);
+}
+
+/** 沿当前视线整体平移相机和目标点，保留可穿过模型的编辑观察体验。 */
+function moveEditorCameraAlongView(camera: ArcRotateCamera, distance: number): void {
+  const direction = camera.getForwardRay(1).direction.normalize();
+  const worldDelta = direction.scale(distance);
+  translateEditorCamera(camera, worldDelta);
+}
+
+/** 关闭 ArcRotateCamera 的惯性偏移，让自定义鼠标输入保持 Unity 式即时响应。 */
+function clearEditorCameraInertia(camera: ArcRotateCamera): void {
+  camera.inertialAlphaOffset = 0;
+  camera.inertialBetaOffset = 0;
+  camera.inertialRadiusOffset = 0;
+  camera.inertialPanningX = 0;
+  camera.inertialPanningY = 0;
+}
+
+/** 平移 ArcRotateCamera 的观察中心，同时恢复球坐标参数，避免 target 变化被反解成转向。 */
+function translateEditorCamera(camera: ArcRotateCamera, worldDelta: Vector3): void {
+  const alpha = camera.alpha;
+  const beta = camera.beta;
+  const radius = camera.radius;
+  clearEditorCameraInertia(camera);
+  camera.target.addInPlace(worldDelta);
+  camera.position.addInPlace(worldDelta);
+  camera.alpha = alpha;
+  camera.beta = beta;
+  camera.radius = radius;
+}
+
+/** 关闭 Babylon 9 ArcRotateCameraMovement 的默认输入映射，避免绕过自定义 Unity 鼠标输入。 */
+function disableEditorCameraDefaultMovementInputs(camera: ArcRotateCamera): void {
+  camera.movement.input.inputMap = [];
+}
+
 /** 编辑相机滚轮输入：沿当前视线整体移动相机，允许直接穿过模型。 */
 class EditorCameraWheelDollyInput implements ICameraInput<ArcRotateCamera> {
   public camera!: ArcRotateCamera;
@@ -559,11 +636,11 @@ class EditorCameraWheelDollyInput implements ICameraInput<ArcRotateCamera> {
       return;
     }
 
-    if (!this.noPreventDefault) {
-      event.preventDefault();
-    }
+    // 滚轮已被编辑相机消费，始终阻止浏览器/Electron 触发页面滚动或缩放。
+    event.preventDefault();
 
-    const distance = this.getDollyDistance(wheelDelta);
+    const speedMultiplier = event.shiftKey ? CAMERA_NAVIGATION_SHIFT_MULTIPLIER : 1;
+    const distance = this.getDollyDistance(wheelDelta * speedMultiplier);
     if (distance === 0) {
       return;
     }
@@ -584,18 +661,343 @@ class EditorCameraWheelDollyInput implements ICameraInput<ArcRotateCamera> {
 
   /** 按当前轨道半径和缩放灵敏度计算视线方向移动距离。 */
   private getDollyDistance(wheelDelta: number): number {
-    const cameraRadius = Number.isFinite(this.camera.radius) ? Math.abs(this.camera.radius) : DEFAULT_CAMERA_RADIUS_METERS;
-    const radiusScale = Math.max(1, cameraRadius);
-    const precision = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.wheelPrecision || DEFAULT_CAMERA_WHEEL_PRECISION));
-    return (wheelDelta * radiusScale) / (precision * CAMERA_WHEEL_PIXEL_NORMALIZE);
+    return getEditorCameraDollyDistance(this.camera, wheelDelta);
   }
 
   /** 平移相机目标点并克隆当前 alpha/beta/radius，从而让相机整体前进或后退。 */
   private moveCameraAlongView(distance: number): void {
-    const direction = this.camera.getForwardRay(1).direction.normalize();
-    const nextTarget = this.camera.target.add(direction.scale(distance));
-    this.camera.inertialRadiusOffset = 0;
-    this.camera.setTarget(nextTarget, false, true, true);
+    moveEditorCameraAlongView(this.camera, distance);
+  }
+}
+
+/** Unity Scene View 风格鼠标输入：Alt+左键环绕、中键平移、Alt+右键缩放、右键观察。 */
+class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
+  public camera!: ArcRotateCamera;
+  public angularSensibilityX = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
+  public angularSensibilityY = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
+  public panningSensibility = DEFAULT_CAMERA_PANNING_SENSIBILITY;
+  private noPreventDefault = false;
+  private attached = false;
+  private activePointer: EditorCameraPointerState | null = null;
+  private readonly pointerEventOptions: AddEventListenerOptions = { capture: true };
+  private readonly handlePointerDownEvent = (event: PointerEvent) => this.handlePointerDown(event);
+  private readonly handlePointerMoveEvent = (event: PointerEvent) => this.handlePointerMove(event);
+  private readonly handlePointerUpEvent = (event: PointerEvent) => this.handlePointerUp(event);
+  private readonly handleLostFocusEvent = () => this.endActiveNavigation();
+
+  /** 绑定 canvas 和导航回调，输入本身不依赖 React 状态。 */
+  public constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly options: EditorCameraPointerNavigationOptions = {}
+  ) {}
+
+  /** 返回 Babylon 输入类名，便于调试输入管理器状态。 */
+  public getClassName(): string {
+    return "EditorCameraUnityPointerInput";
+  }
+
+  /** 复用 pointers 简名，让 ArcRotateCamera 的兼容灵敏度 setter 继续作用到本输入。 */
+  public getSimpleName(): string {
+    return "pointers";
+  }
+
+  /** 监听指针事件，并通过 pointer capture 保证拖出画布后仍能收到释放事件。 */
+  public attachControl(noPreventDefault?: boolean): void {
+    this.noPreventDefault = Boolean(noPreventDefault);
+    if (this.attached) {
+      return;
+    }
+
+    this.attached = true;
+    this.canvas.addEventListener("pointerdown", this.handlePointerDownEvent, this.pointerEventOptions);
+    this.canvas.addEventListener("pointermove", this.handlePointerMoveEvent, this.pointerEventOptions);
+    this.canvas.addEventListener("pointerup", this.handlePointerUpEvent, this.pointerEventOptions);
+    this.canvas.addEventListener("pointercancel", this.handlePointerUpEvent, this.pointerEventOptions);
+    window.addEventListener("blur", this.handleLostFocusEvent);
+  }
+
+  /** 解绑所有事件并结束可能未释放的拖拽状态。 */
+  public detachControl(): void {
+    if (!this.attached) {
+      return;
+    }
+
+    this.endActiveNavigation();
+    this.attached = false;
+    this.canvas.removeEventListener("pointerdown", this.handlePointerDownEvent, this.pointerEventOptions);
+    this.canvas.removeEventListener("pointermove", this.handlePointerMoveEvent, this.pointerEventOptions);
+    this.canvas.removeEventListener("pointerup", this.handlePointerUpEvent, this.pointerEventOptions);
+    this.canvas.removeEventListener("pointercancel", this.handlePointerUpEvent, this.pointerEventOptions);
+    window.removeEventListener("blur", this.handleLostFocusEvent);
+  }
+
+  /** 本输入直接修改相机状态，不需要逐帧累积。 */
+  public checkInputs(): void {
+    return;
+  }
+
+  /** 根据 Unity Scene View 鼠标语义开始一次导航操作。 */
+  private handlePointerDown(event: PointerEvent): void {
+    const action = this.resolveAction(event);
+    if (!action) {
+      return;
+    }
+
+    this.endActiveNavigation();
+    this.activePointer = {
+      pointerId: event.pointerId,
+      action,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      moved: false,
+      navigationStarted: action !== "look"
+    };
+    this.trySetPointerCapture(event.pointerId);
+    if (this.activePointer.navigationStarted) {
+      this.options.onNavigationStart?.(action);
+    }
+    this.preventDefaultForNavigationStart(event, action);
+  }
+
+  /** 把指针位移转换为环绕、平移、缩放或右键观察。 */
+  private handlePointerMove(event: PointerEvent): void {
+    const pointer = this.activePointer;
+    if (!pointer || event.pointerId !== pointer.pointerId) {
+      return;
+    }
+
+    const totalDistance = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
+    if (!pointer.moved && totalDistance > CAMERA_POINTER_DRAG_THRESHOLD) {
+      pointer.moved = true;
+      this.ensureNavigationStarted(pointer);
+    }
+
+    if (pointer.action === "look" && !pointer.moved) {
+      return;
+    }
+
+    const deltaX = event.clientX - pointer.lastX;
+    const deltaY = event.clientY - pointer.lastY;
+    if (deltaX === 0 && deltaY === 0) {
+      return;
+    }
+
+    pointer.lastX = event.clientX;
+    pointer.lastY = event.clientY;
+    const speedMultiplier = this.getPointerSpeedMultiplier(event);
+    if (pointer.action === "orbit") {
+      this.orbitAroundTarget(deltaX, deltaY, speedMultiplier);
+    } else if (pointer.action === "pan") {
+      this.panCamera(deltaX, deltaY, speedMultiplier);
+    } else if (pointer.action === "dolly") {
+      this.dollyCamera(deltaY, speedMultiplier);
+    } else {
+      this.lookAroundFromCurrentPosition(deltaX, deltaY, speedMultiplier);
+    }
+
+    this.preventDefaultForActiveNavigation(event, pointer.action);
+  }
+
+  /** 指针释放后清理导航状态。 */
+  private handlePointerUp(event: PointerEvent): void {
+    const pointer = this.activePointer;
+    if (!pointer || event.pointerId !== pointer.pointerId) {
+      return;
+    }
+
+    this.releasePointerCapture(event.pointerId);
+    this.endActiveNavigation();
+    this.preventDefaultForActiveNavigation(event, pointer.action);
+  }
+
+  /** 按鼠标键和 Alt 修饰键解析 Unity Scene View 的导航动作。 */
+  private resolveAction(event: PointerEvent): EditorCameraPointerAction | null {
+    if (event.button === LEFT_MOUSE_BUTTON && event.altKey) {
+      return "orbit";
+    }
+
+    if (event.button === MIDDLE_MOUSE_BUTTON) {
+      return "pan";
+    }
+
+    if (event.button === RIGHT_MOUSE_BUTTON && event.altKey) {
+      return "dolly";
+    }
+
+    if (event.button === RIGHT_MOUSE_BUTTON) {
+      return "look";
+    }
+
+    return null;
+  }
+
+  /** Alt+左键围绕当前 target 环绕，裸左键保留给选择和 Gizmo。 */
+  private orbitAroundTarget(deltaX: number, deltaY: number, speedMultiplier: number): void {
+    this.rotateCameraAngles(deltaX, deltaY, speedMultiplier);
+  }
+
+  /** 中键拖拽沿屏幕平面平移视口，比例随当前观察半径缩放。 */
+  private panCamera(deltaX: number, deltaY: number, speedMultiplier: number): void {
+    const scale = this.getPanDistancePerPixel() * speedMultiplier;
+    if (scale === 0) {
+      return;
+    }
+
+    const right = this.getCameraRightDirection();
+    const up = this.getCameraUpDirection(right);
+    const worldDelta = right.scale(-deltaX * scale).add(up.scale(deltaY * scale));
+    this.moveCameraTarget(worldDelta);
+  }
+
+  /** Alt+右键上下拖拽复用滚轮 dolly 算法，保持可穿模缩放语义一致。 */
+  private dollyCamera(deltaY: number, speedMultiplier: number): void {
+    const distance = getEditorCameraDollyDistance(this.camera, -deltaY * CAMERA_POINTER_DOLLY_PIXEL_SCALE * speedMultiplier);
+    if (distance !== 0) {
+      moveEditorCameraAlongView(this.camera, distance);
+    }
+  }
+
+  /** 右键拖拽以相机当前位置为轴观察四周，保留右键单击菜单。 */
+  private lookAroundFromCurrentPosition(deltaX: number, deltaY: number, speedMultiplier: number): void {
+    const cameraPosition = this.camera.position.clone();
+    this.rotateCameraAngles(deltaX, deltaY, speedMultiplier);
+    const orbitOffset = this.getOrbitOffsetFromAngles();
+    const nextTarget = cameraPosition.subtract(orbitOffset);
+    this.camera.setTarget(nextTarget, false, true, false);
+  }
+
+  /** 按相机旋转灵敏度更新 alpha/beta，并夹紧 beta 避免翻转。 */
+  private rotateCameraAngles(deltaX: number, deltaY: number, speedMultiplier: number): void {
+    clearEditorCameraInertia(this.camera);
+    const sensitivityX = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.angularSensibilityX || DEFAULT_CAMERA_ROTATION_SENSIBILITY));
+    const sensitivityY = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.angularSensibilityY || DEFAULT_CAMERA_ROTATION_SENSIBILITY));
+    this.camera.alpha += (-deltaX * speedMultiplier) / sensitivityX;
+    this.camera.beta = Math.min(CAMERA_MAX_BETA, Math.max(CAMERA_MIN_BETA, this.camera.beta + (-deltaY * speedMultiplier) / sensitivityY));
+  }
+
+  /** Unity Scene View 中按住 Shift 会加快鼠标导航速度。 */
+  private getPointerSpeedMultiplier(event: PointerEvent): number {
+    return event.shiftKey ? CAMERA_NAVIGATION_SHIFT_MULTIPLIER : 1;
+  }
+
+  /** 计算当前半径下每像素平移的世界距离。 */
+  private getPanDistancePerPixel(): number {
+    const radius = Number.isFinite(this.camera.radius) ? Math.max(1, Math.abs(this.camera.radius)) : DEFAULT_CAMERA_RADIUS_METERS;
+    const sensitivity = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.panningSensibility || DEFAULT_CAMERA_PANNING_SENSIBILITY));
+    const panSpeed = Math.max(MIN_CAMERA_PAN_SPEED_SCALE, this.camera.movement.panSpeed || MIN_CAMERA_PAN_SPEED_SCALE);
+    return (radius * panSpeed) / (sensitivity * CAMERA_POINTER_PAN_PIXEL_SCALE);
+  }
+
+  /** 计算屏幕右方向；极端俯仰时回退到世界 X 轴。 */
+  private getCameraRightDirection(): Vector3 {
+    const forward = this.camera.getForwardRay(1).direction.normalize();
+    const right = Vector3.Cross(forward, this.camera.upVector);
+    return right.lengthSquared() > 0.000001 ? right.normalize() : new Vector3(1, 0, 0);
+  }
+
+  /** 根据右方向和视线方向计算屏幕上方向。 */
+  private getCameraUpDirection(right: Vector3): Vector3 {
+    const forward = this.camera.getForwardRay(1).direction.normalize();
+    const up = Vector3.Cross(right, forward);
+    return up.lengthSquared() > 0.000001 ? up.normalize() : new Vector3(0, 1, 0);
+  }
+
+  /** 平移 target 并克隆当前角度和半径，使相机位置同步平移。 */
+  private moveCameraTarget(worldDelta: Vector3): void {
+    if (worldDelta.lengthSquared() <= 0.000000001) {
+      return;
+    }
+
+    translateEditorCamera(this.camera, worldDelta);
+  }
+
+  /** 使用 Babylon ArcRotateCamera 的默认球坐标公式得到当前位置相对 target 的偏移。 */
+  private getOrbitOffsetFromAngles(): Vector3 {
+    const radius = Number.isFinite(this.camera.radius) ? Math.max(0.0001, Math.abs(this.camera.radius)) : DEFAULT_CAMERA_RADIUS_METERS;
+    const cosAlpha = Math.cos(this.camera.alpha);
+    const sinAlpha = Math.sin(this.camera.alpha);
+    const cosBeta = Math.cos(this.camera.beta);
+    const sinBeta = Math.sin(this.camera.beta) || 0.0001;
+    return new Vector3(radius * cosAlpha * sinBeta, radius * cosBeta, radius * sinAlpha * sinBeta);
+  }
+
+  /** 在浏览器允许时捕获指针，减少拖出 canvas 导致状态丢失的概率。 */
+  private trySetPointerCapture(pointerId: number): void {
+    try {
+      this.canvas.setPointerCapture(pointerId);
+    } catch {
+      return;
+    }
+  }
+
+  /** 释放指针捕获；释放失败通常表示浏览器已经自动清理。 */
+  private releasePointerCapture(pointerId: number): void {
+    try {
+      if (this.canvas.hasPointerCapture(pointerId)) {
+        this.canvas.releasePointerCapture(pointerId);
+      }
+    } catch {
+      return;
+    }
+  }
+
+  /** 结束当前导航并通知引擎恢复拾取。 */
+  private endActiveNavigation(): void {
+    const pointer = this.activePointer;
+    if (!pointer) {
+      return;
+    }
+
+    this.releasePointerCapture(pointer.pointerId);
+    this.activePointer = null;
+    if (pointer.navigationStarted) {
+      this.options.onNavigationEnd?.(pointer.action, pointer.moved);
+    }
+  }
+
+  /** 右键观察超过拖拽阈值后才真正进入相机导航，避免普通右键轻微抖动误杀菜单。 */
+  private ensureNavigationStarted(pointer: EditorCameraPointerState): void {
+    if (pointer.navigationStarted) {
+      return;
+    }
+
+    pointer.navigationStarted = true;
+    this.options.onNavigationStart?.(pointer.action);
+  }
+
+  /** 按 Babylon attachControl 的 noPreventDefault 约定阻止浏览器默认拖拽行为。 */
+  private preventDefault(event: PointerEvent): void {
+    if (!this.noPreventDefault) {
+      event.preventDefault();
+    }
+  }
+
+  /** 中键和 Alt 导航没有编辑菜单语义，需要强制屏蔽浏览器自动滚动和系统菜单。 */
+  private preventDefaultForNavigationStart(event: PointerEvent, action: EditorCameraPointerAction): void {
+    if (action === "look") {
+      return;
+    }
+
+    this.suppressNavigationEvent(event);
+  }
+
+  /** Alt 和中键导航优先级高于 Gizmo，需要阻止后续 Babylon 指针处理抢占。 */
+  private preventDefaultForActiveNavigation(event: PointerEvent, action: EditorCameraPointerAction): void {
+    if (action === "look") {
+      this.preventDefault(event);
+      return;
+    }
+
+    this.suppressNavigationEvent(event);
+  }
+
+  /** 拦截当前 DOM 事件，确保 Unity 导航不会同时触发 Babylon 默认 movement 或 Gizmo 拖拽。 */
+  private suppressNavigationEvent(event: PointerEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
   }
 }
 
@@ -705,6 +1107,33 @@ interface ModelPackageReplacementTemplate {
   animationGroups: AnimationGroup[];
 }
 
+/** 场景布局撤销快照，保存为序列化后的纯数据，避免持有 Babylon 节点引用。 */
+interface SceneUndoSnapshot {
+  label: string;
+  serializedScene: Record<string, unknown>;
+  byteLength: number;
+  createdAt: number;
+}
+
+/** 当前会话中的资产文件缓存，用于撤销重载场景后保留可继续拖入的源文件。 */
+interface AssetFileCacheSnapshot {
+  assetFiles: Map<string, File>;
+  assetDependencyFiles: Map<string, File[]>;
+}
+
+/** 临时写入源节点 metadata 的克隆映射标记，克隆完成后会立即恢复。 */
+interface CloneSourceTokenSnapshot {
+  node: Node;
+  hadToken: boolean;
+  previousToken: unknown;
+}
+
+/** 一次克隆操作的源节点标记结果，用于建立稳定的源-副本映射。 */
+interface CloneSourceTokenMarkResult {
+  sourceByToken: Map<string, Node>;
+  snapshots: CloneSourceTokenSnapshot[];
+}
+
 /** 管理 Babylon.js 运行时、编辑器交互、资产导入与场景序列化。 */
 export class BabylonEditorEngine {
   private readonly canvas: HTMLCanvasElement;
@@ -720,6 +1149,7 @@ export class BabylonEditorEngine {
   private readonly assetDependencyFiles = new Map<string, File[]>();
   private readonly modelPackageScriptTexts = new Map<string, Map<string, string>>();
   private readonly modelPackageRuntimeHandles = new Map<number, ModelPackageRuntimeHandle>();
+  private readonly cloneSourceNodeMaps = new WeakMap<TransformNode, WeakMap<Node, Node>>();
   private readonly sceneDataDrivenRuntime: SceneDataDrivenRuntime;
   private readonly sceneBusinessRuntime: SceneBusinessRuntime;
   private readonly sceneInstrumentation: SceneInstrumentation;
@@ -741,12 +1171,17 @@ export class BabylonEditorEngine {
   private clipboardBaseName = "";
   private clipboardPasteCount = 0;
   private readonly clipboardPasteOffset = new Vector3(0.5, 0, 0.5);
+  private cloneTokenSeed = 1;
+  private readonly sceneUndoStack: SceneUndoSnapshot[] = [];
+  private sceneUndoRestoring = false;
   private statsStamp = 0;
   private dataDrivenSelectionSyncStamp = 0;
   private primitiveSeed = 1;
   private poiSeed = 1;
   private transformSyncFrame = 0;
   private transformGizmoDragging = false;
+  private cameraNavigationActive = false;
+  private lastCameraNavigationEndTime = 0;
   private gridCoverageSizeMeters = EDITOR_GRID_SIZE_METERS;
   private gridCellSizeMeters = EDITOR_GRID_CELL_SIZE_METERS;
   private gridCenter = Vector3.Zero();
@@ -858,6 +1293,7 @@ export class BabylonEditorEngine {
     this.gridGlowLayer.dispose();
     this.selectionOutlineLayer.dispose();
     this.gizmoManager.dispose();
+    this.editorCamera.detachControl();
     this.scene.dispose();
     this.engine.dispose();
   }
@@ -879,6 +1315,110 @@ export class BabylonEditorEngine {
   public setTool(tool: EditorTool): void {
     this.currentTool = tool;
     this.syncGizmoMode();
+  }
+
+  /** 当前是否有可撤销的场景布局变更。 */
+  public canUndoSceneLayout(): boolean {
+    return this.sceneUndoStack.length > 0 && !this.previewMode && !this.sceneUndoRestoring;
+  }
+
+  /** 撤销最近一次场景布局变更，恢复对象层级、变换、显隐、锁定和材质等可序列化状态。 */
+  public async undoSceneLayout(): Promise<boolean> {
+    if (!this.canUndoSceneLayout()) {
+      return false;
+    }
+
+    const snapshot = this.sceneUndoStack.pop();
+    if (!snapshot) {
+      return false;
+    }
+
+    this.sceneUndoRestoring = true;
+    try {
+      await this.loadSerializedScene(snapshot.serializedScene, {
+        preserveEditorCamera: true,
+        preserveAssetFileCache: true,
+        resetUndoHistory: false
+      });
+      this.scene.render();
+      return true;
+    } catch {
+      this.sceneUndoStack.push(snapshot);
+      return false;
+    } finally {
+      this.sceneUndoRestoring = false;
+    }
+  }
+
+  /** 在执行布局变更前压入场景快照，失败或超大场景会跳过而不阻断编辑操作。 */
+  private recordSceneUndoSnapshot(label: string, options: { coalesceMs?: number } = {}): boolean {
+    if (this.previewMode || this.sceneUndoRestoring || !this.isSceneUndoSnapshotAllowed()) {
+      return false;
+    }
+
+    const now = performance.now();
+    const latestSnapshot = this.sceneUndoStack[this.sceneUndoStack.length - 1];
+    if (options.coalesceMs && latestSnapshot?.label === label && now - latestSnapshot.createdAt <= options.coalesceMs) {
+      return true;
+    }
+
+    const cameraSnapshot = this.captureEditorCameraSnapshot();
+    let serialized: Record<string, unknown>;
+    try {
+      serialized = this.createUndoSerializedScene();
+    } catch {
+      this.restoreEditorCameraSnapshot(cameraSnapshot);
+      return false;
+    }
+
+    this.restoreEditorCameraSnapshot(cameraSnapshot);
+    const byteLength = this.estimateSerializedSceneByteLength(serialized);
+    if (byteLength > SCENE_UNDO_MAX_SERIALIZED_BYTES) {
+      return false;
+    }
+
+    this.sceneUndoStack.push({
+      label,
+      serializedScene: serialized,
+      byteLength,
+      createdAt: now
+    });
+    if (this.sceneUndoStack.length > SCENE_UNDO_HISTORY_LIMIT) {
+      this.sceneUndoStack.splice(0, this.sceneUndoStack.length - SCENE_UNDO_HISTORY_LIMIT);
+    }
+    return true;
+  }
+
+  /** 撤销快照只面向轻量布局编辑，避免在超大 CAD 或高模场景里占用过多内存。 */
+  private isSceneUndoSnapshotAllowed(): boolean {
+    const meshes = this.scene.meshes.filter((mesh) => !mesh.metadata?.[HELPER_FLAG]);
+    if (meshes.length > SCENE_UNDO_MAX_MESHES) {
+      return false;
+    }
+
+    const vertices = meshes.reduce((total, mesh) => total + mesh.getTotalVertices(), 0);
+    return vertices <= SCENE_UNDO_MAX_VERTICES;
+  }
+
+  /** 生成撤销用序列化场景，保留资产 metadata，但不会写项目侧车文件。 */
+  private createUndoSerializedScene(): Record<string, unknown> {
+    const serialized = this.serializeScene() as Record<string, unknown>;
+    return this.createLoadableSerializedScene(serialized);
+  }
+
+  /** 估算快照大小，优先使用 Blob.size，缺失时退回字符串长度。 */
+  private estimateSerializedSceneByteLength(serializedScene: Record<string, unknown>): number {
+    const text = JSON.stringify(serializedScene);
+    try {
+      return new Blob([text]).size;
+    } catch {
+      return text.length;
+    }
+  }
+
+  /** 清空撤销栈，通常用于加载新场景后避免撤销回旧项目。 */
+  private clearSceneUndoHistory(): void {
+    this.sceneUndoStack.splice(0, this.sceneUndoStack.length);
   }
 
   /** 开关性能预览模式，在流畅度和编辑精度之间切换。 */
@@ -989,6 +1529,7 @@ export class BabylonEditorEngine {
       this.exitPreviewMode();
     }
 
+    this.recordSceneUndoSnapshot("初始化场景");
     this.clearEditableScene(false);
     this.createPrimitive("cube", new Vector3(-1.8, 0.5, 0));
     this.createPrimitive("sphere", new Vector3(1.8, 0.75, 0));
@@ -1063,6 +1604,8 @@ export class BabylonEditorEngine {
     this.applyHighlight(null);
     this.syncGizmoMode();
     this.frameEditableSceneInView(this.selectedNode);
+    this.clearEditorCameraInertia();
+    this.attachEditorCameraControl();
     this.startPreviewAnimations();
     if (this.pendingStackerDemoSimulation) {
       this.sceneDataDrivenRuntime.startStackerDemoSimulation(this.createStackerDemoDataDrivenSnapshot());
@@ -1402,6 +1945,11 @@ export class BabylonEditorEngine {
 
   /** 记录 ArcRotateCamera 的关键取景参数，避免预览取景破坏用户编辑视角。 */
   private capturePreviewCameraSnapshot(): PreviewCameraSnapshot {
+    return this.captureEditorCameraSnapshot();
+  }
+
+  /** 捕获编辑相机关键参数，供预览和撤销恢复后保留用户当前视角。 */
+  private captureEditorCameraSnapshot(): PreviewCameraSnapshot {
     return {
       alpha: this.editorCamera.alpha,
       beta: this.editorCamera.beta,
@@ -1420,16 +1968,21 @@ export class BabylonEditorEngine {
       return;
     }
 
-    this.editorCamera.alpha = this.previewCameraSnapshot.alpha;
-    this.editorCamera.beta = this.previewCameraSnapshot.beta;
-    this.editorCamera.radius = this.previewCameraSnapshot.radius;
-    this.editorCamera.target.copyFrom(this.previewCameraSnapshot.target);
-    this.editorCamera.minZ = this.previewCameraSnapshot.minZ;
-    this.editorCamera.maxZ = this.previewCameraSnapshot.maxZ;
-    this.editorCamera.lowerRadiusLimit = this.previewCameraSnapshot.lowerRadiusLimit;
-    this.editorCamera.upperRadiusLimit = this.previewCameraSnapshot.upperRadiusLimit;
-    this.editorCamera.attachControl(this.canvas, true);
+    this.restoreEditorCameraSnapshot(this.previewCameraSnapshot);
     this.previewCameraSnapshot = null;
+  }
+
+  /** 恢复编辑相机状态，避免场景内容恢复时把用户视角一起回滚。 */
+  private restoreEditorCameraSnapshot(snapshot: PreviewCameraSnapshot): void {
+    this.editorCamera.alpha = snapshot.alpha;
+    this.editorCamera.beta = snapshot.beta;
+    this.editorCamera.radius = snapshot.radius;
+    this.editorCamera.target.copyFrom(snapshot.target);
+    this.editorCamera.minZ = snapshot.minZ;
+    this.editorCamera.maxZ = snapshot.maxZ;
+    this.editorCamera.lowerRadiusLimit = snapshot.lowerRadiusLimit;
+    this.editorCamera.upperRadiusLimit = snapshot.upperRadiusLimit;
+    this.attachEditorCameraControl();
   }
 
   /** 播放当前场景内的 AnimationGroup，旧场景没有分组时回退播放节点直接动画。 */
@@ -1638,6 +2191,12 @@ export class BabylonEditorEngine {
       return;
     }
 
+    const currentVisible = node instanceof TransformNode ? this.getNodeVisibility(node) : node.isEnabled();
+    if (currentVisible === visible) {
+      return;
+    }
+
+    this.recordSceneUndoSnapshot("切换对象显隐");
     if (node instanceof TransformNode) {
       this.updateNodeVisibility(node, visible);
       this.refreshNodeWorldMatrices(node);
@@ -1660,6 +2219,7 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    this.recordSceneUndoSnapshot("切换对象显隐");
     const nextVisible = !this.getNodeVisibility(primaryNode);
     nodes.forEach((node) => {
       this.updateNodeVisibility(node, nextVisible);
@@ -1679,6 +2239,7 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    this.recordSceneUndoSnapshot("切换对象锁定");
     const nextLocked = !this.isNodeSelfLocked(primaryNode);
     nodes.forEach((node) => this.mergeNodeEditorMetadata(node, { locked: nextLocked }));
     this.emitSelectionSnapshot();
@@ -1725,6 +2286,7 @@ export class BabylonEditorEngine {
       return;
     }
 
+    this.recordSceneUndoSnapshot("删除对象");
     this.selectNode(null);
     nodes.forEach((node) => {
       this.cleanupPoiRuntimeInHierarchy(node);
@@ -1742,6 +2304,7 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    this.recordSceneUndoSnapshot("对象分组");
     const firstParent = nodes[0].parent instanceof TransformNode ? nodes[0].parent : null;
     const sameParent = nodes.every((node) => node.parent === firstParent);
     const previousParent = sameParent ? firstParent : null;
@@ -1771,6 +2334,7 @@ export class BabylonEditorEngine {
     }
 
     if (this.isEditorGroup(node)) {
+      this.recordSceneUndoSnapshot("对象解组");
       const targetParent = node.parent instanceof TransformNode ? node.parent : null;
       const children = this.getVisibleChildren(node).filter((child): child is TransformNode => child instanceof TransformNode);
       children.forEach((child) => {
@@ -1857,6 +2421,7 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    this.recordSceneUndoSnapshot("粘贴对象");
     const pasteName = this.createUniqueCopyName(this.clipboardBaseName);
     const pastedNode = this.cloneEditableNode(this.clipboardTemplateNode, pasteName);
     if (!pastedNode) {
@@ -1969,6 +2534,7 @@ export class BabylonEditorEngine {
     const sourceAssetCode = this.getNodeAssetInfo(sourceRoot).assetCode.trim();
     const clones: TransformNode[] = [];
     let sourceRuntimeStopped = false;
+    this.recordSceneUndoSnapshot("创建模型阵列");
 
     try {
       this.cleanupPoiRuntimeInHierarchy(sourceRoot);
@@ -2030,6 +2596,7 @@ export class BabylonEditorEngine {
 
   /** 创建基础几何体或灯光，并放置到指定位置。 */
   public addPrimitive(kind: PrimitiveKind, position = Vector3.Zero()): TransformNode {
+    this.recordSceneUndoSnapshot("创建基础对象");
     const node = this.createPrimitive(kind, position);
     this.selectNode(node);
     this.refreshSceneGraph();
@@ -2038,6 +2605,7 @@ export class BabylonEditorEngine {
 
   /** 创建 POI 点位组件，并放置到指定地面落点。 */
   public addPoi(kind: PoiKind, position = Vector3.Zero()): TransformNode {
+    this.recordSceneUndoSnapshot("创建 POI");
     const node = this.createPoi(kind, position);
     this.selectNode(node);
     this.refreshSceneGraph();
@@ -2046,6 +2614,7 @@ export class BabylonEditorEngine {
 
   /** 创建逻辑分组节点，分组只负责组织树结构和批量高亮，不作为可变换模型使用。 */
   public createGroup(): TransformNode {
+    this.recordSceneUndoSnapshot("创建分组");
     const group = new TransformNode(this.createUniqueGroupName(), this.scene);
     group.metadata = {
       [ROOT_FLAG]: true,
@@ -2066,6 +2635,11 @@ export class BabylonEditorEngine {
       return;
     }
 
+    if (this.isNodeSelfLocked(node) === locked) {
+      return;
+    }
+
+    this.recordSceneUndoSnapshot("切换对象锁定");
     this.mergeNodeEditorMetadata(node, { locked });
     if (this.selectedNode?.uniqueId === node.uniqueId || (this.selectedNode && this.isNodeAncestor(node, this.selectedNode))) {
       this.emitSelectionSnapshot();
@@ -2095,6 +2669,11 @@ export class BabylonEditorEngine {
       return;
     }
 
+    if ((node.parent instanceof TransformNode ? node.parent : null) === targetParent) {
+      return;
+    }
+
+    this.recordSceneUndoSnapshot("移动对象分组");
     node.setParent(targetParent);
     node.metadata = {
       ...this.asMetadataObject(node.metadata),
@@ -2163,17 +2742,20 @@ export class BabylonEditorEngine {
       return false;
     }
 
+    const matchingRoots = this.getSceneModelPackageRoots().filter((root) => {
+      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
+      return instance.assetId === assetId && instance.packageId === manifest.packageId;
+    });
+    if (matchingRoots.length > 0) {
+      this.recordSceneUndoSnapshot("刷新模型包");
+    }
+
     this.replaceModelPackageScriptTexts(manifest.packageId, textFiles);
     asset.modelPackage = manifest;
     asset.name = manifest.displayName;
     asset.projectFiles = [...new Set([asset.projectFile, ...manifest.files.map((file) => file.projectFile)].filter((file): file is string => Boolean(file)))];
 
-    this.getSceneModelPackageRoots().forEach((root) => {
-      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
-      if (instance.assetId !== assetId || instance.packageId !== manifest.packageId) {
-        return;
-      }
-
+    matchingRoots.forEach((root) => {
       this.stopModelPackageRuntime(root, false);
       const values = this.getModelPackageValues(root, manifest);
       this.applyModelPackageRuntimeWithDynamicFallbacks(root, manifest, "load", values);
@@ -2204,6 +2786,11 @@ export class BabylonEditorEngine {
       throw new Error(`模型包主文件不是可导入模型：${primaryFile.name}`);
     }
 
+    const matchingRoots = this.getSceneModelPackageRoots().filter((root) => {
+      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
+      return instance.assetId === assetId && instance.packageId === manifest.packageId;
+    });
+
     const projectFileMap = new Map<string, ModelPackageProjectFile>();
     manifest.files.forEach((file) => projectFileMap.set(file.relativePath, file));
     const primaryProjectFile = projectFileMap.get(manifest.primaryModelFile)?.projectFile;
@@ -2214,10 +2801,10 @@ export class BabylonEditorEngine {
       return false;
     }
 
-    const matchingRoots = this.getSceneModelPackageRoots().filter((root) => {
-      const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
-      return instance.assetId === assetId && instance.packageId === manifest.packageId;
-    });
+    if (matchingRoots.length > 0) {
+      this.recordSceneUndoSnapshot("替换模型包");
+    }
+
     const snapshots = matchingRoots.map((root) => this.captureModelPackageReplacementSnapshot(root, assetId, manifest));
     const preparedReplacements: PreparedModelPackageReplacement[] = [];
     const hadPreviousScriptTexts = this.modelPackageScriptTexts.has(manifest.packageId);
@@ -2345,6 +2932,7 @@ export class BabylonEditorEngine {
     }
 
     const file = this.assetFiles.get(assetId);
+    this.recordSceneUndoSnapshot("实例化资源");
     const clonedNode = asset.modelPackage && file
       ? null
       : this.instantiateAssetFromSceneTemplate(asset, position);
@@ -2387,6 +2975,10 @@ export class BabylonEditorEngine {
   /** 用户直接把文件拖入视口时，立即创建场景对象并同步登记资产。 */
   public async importFiles(files: FileList | File[], position = Vector3.Zero(), projectFiles = new Map<File, string>()): Promise<void> {
     const fileArray = Array.from(files);
+    const willMutateScene = fileArray.some((file) => this.isSceneFile(this.getFileExtension(file.name)));
+    if (willMutateScene) {
+      this.recordSceneUndoSnapshot("导入模型文件");
+    }
     this.registerFilesForLocalImport(fileArray);
     for (const file of fileArray) {
       const extension = this.getFileExtension(file.name);
@@ -2428,6 +3020,7 @@ export class BabylonEditorEngine {
       throw new Error(`模型包主文件不是可导入模型：${primaryFile.name}`);
     }
 
+    this.recordSceneUndoSnapshot("导入模型包");
     this.registerFilesForLocalImport(files);
     const projectFileMap = new Map<string, ModelPackageProjectFile>();
     manifest.files.forEach((file) => projectFileMap.set(file.relativePath, file));
@@ -2593,6 +3186,7 @@ export class BabylonEditorEngine {
       throw new Error("请选择 .dxf 格式的 CAD 图纸。");
     }
 
+    this.recordSceneUndoSnapshot("导入 CAD 图纸");
     const root = this.createCadDrawingRoot(file.name, options.sourcePath);
     try {
       const chunkManifests: CadLineChunkManifest[] = [];
@@ -3662,6 +4256,7 @@ export class BabylonEditorEngine {
       this.exitPreviewMode();
     }
 
+    const sceneInspector = this.createSceneInspectorSnapshot();
     this.sceneBusinessRuntime.stop(true);
     this.stopAllModelPackageRuntimes(true);
     try {
@@ -3670,7 +4265,10 @@ export class BabylonEditorEngine {
       serialized.metadata = this.withMetricSceneMetadata(serialized.metadata, {
         savedAt: new Date().toISOString(),
         assets: this.getSerializableAssets(),
-        sceneEnvironment: { backgroundColor: this.getSceneEnvironmentColor() }
+        sceneEnvironment: { backgroundColor: this.getSceneEnvironmentColor() },
+        sceneCamera: sceneInspector.camera,
+        sceneEditorSettings: sceneInspector.editorSettings,
+        sceneDataDriven: sceneInspector.dataDriven
       });
       return serialized;
     } finally {
@@ -3689,6 +4287,7 @@ export class BabylonEditorEngine {
       this.exitPreviewMode();
     }
 
+    const sceneInspector = this.createSceneInspectorSnapshot();
     const previousSerializeBuffers = Texture.SerializeBuffers;
     const previousForceSerializeBuffers = Texture.ForceSerializeBuffers;
     this.sceneBusinessRuntime.stop(true);
@@ -3706,6 +4305,9 @@ export class BabylonEditorEngine {
         savedAt: new Date().toISOString(),
         assets: this.getSerializableAssets(),
         sceneEnvironment: { backgroundColor: this.getSceneEnvironmentColor() },
+        sceneCamera: sceneInspector.camera,
+        sceneEditorSettings: sceneInspector.editorSettings,
+        sceneDataDriven: sceneInspector.dataDriven,
         projectExternalTextures,
         projectTextureSerialization: {
           version: 1,
@@ -3728,6 +4330,8 @@ export class BabylonEditorEngine {
       return;
     }
 
+    const cameraSnapshot = options.preserveEditorCamera ? this.captureEditorCameraSnapshot() : null;
+    const assetFileCacheSnapshot = options.preserveAssetFileCache ? this.captureAssetFileCacheSnapshot() : null;
     this.cancelCadRestore();
     if (this.previewMode) {
       this.exitPreviewMode();
@@ -3747,8 +4351,11 @@ export class BabylonEditorEngine {
         const container = await LoadAssetContainerAsync(sceneUrl, this.scene, { pluginExtension: ".babylon" });
         this.clearEditableScene();
         container.addAllToScene();
-        this.applySceneEnvironmentColor(this.getSerializedSceneEnvironmentColor(loadableScene) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR, false);
-        this.scene.metadata = this.withMetricSceneMetadata(this.scene.metadata);
+        const backgroundColor = this.getSerializedSceneEnvironmentColor(loadableScene) ?? DEFAULT_SCENE_ENVIRONMENT_COLOR;
+        this.applySceneEnvironmentColor(backgroundColor, false);
+        this.scene.metadata = this.withMetricSceneMetadata(loadableScene.metadata, {
+          sceneEnvironment: { backgroundColor }
+        });
         const sceneInspector = this.createSceneInspectorSnapshot();
         this.applySceneCameraSettings(sceneInspector.camera);
         this.applySceneEditorSettings(sceneInspector.editorSettings);
@@ -3758,12 +4365,23 @@ export class BabylonEditorEngine {
         this.restoreProjectExternalTextureFileRegistration(projectTextureFileRegistration);
       }
       this.scene.activeCamera = this.editorCamera;
-      this.editorCamera.attachControl(this.canvas, true);
+      this.attachEditorCameraControl();
+      if (cameraSnapshot) {
+        this.restoreEditorCameraSnapshot(cameraSnapshot);
+      }
       await this.prepareLoadedScene(loadableScene, options);
+      if (assetFileCacheSnapshot) {
+        this.restoreAssetFileCacheSnapshot(assetFileCacheSnapshot);
+      }
       const selectedNode = this.selectFirstEditableNode();
-      this.frameEditableSceneInView(selectedNode);
+      if (!cameraSnapshot) {
+        this.frameEditableSceneInView(selectedNode);
+      }
       this.refreshSceneGraph();
       this.callbacks.onStatsChange(this.collectStats());
+      if (options.resetUndoHistory !== false) {
+        this.clearSceneUndoHistory();
+      }
     } finally {
       this.sceneBusinessRuntime.start();
     }
@@ -3780,6 +4398,34 @@ export class BabylonEditorEngine {
     const loadableScene = JSON.parse(JSON.stringify(serializedScene)) as Record<string, unknown>;
     this.stripEditorRuntimeSerialization(loadableScene);
     return loadableScene;
+  }
+
+  /** 捕获当前资产源文件和依赖文件缓存，撤销重载后只恢复仍存在于快照资产列表中的条目。 */
+  private captureAssetFileCacheSnapshot(): AssetFileCacheSnapshot {
+    return {
+      assetFiles: new Map(this.assetFiles),
+      assetDependencyFiles: new Map([...this.assetDependencyFiles.entries()].map(([assetId, files]) => [assetId, [...files]]))
+    };
+  }
+
+  /** 撤销重载场景后按资产 ID 恢复文件缓存，避免一次撤销让资产库卡片失去源文件。 */
+  private restoreAssetFileCacheSnapshot(snapshot: AssetFileCacheSnapshot): void {
+    const filesByAssetId = new Map<string, File[]>();
+    this.assets.forEach((asset) => {
+      const mainFile = snapshot.assetFiles.get(asset.id);
+      const dependencyFiles = snapshot.assetDependencyFiles.get(asset.id) ?? [];
+      const files = this.dedupeFiles([...dependencyFiles, ...(mainFile ? [mainFile] : [])]);
+      if (files.length > 0) {
+        filesByAssetId.set(asset.id, files);
+      }
+    });
+
+    if (filesByAssetId.size === 0) {
+      return;
+    }
+
+    this.restoreAssetFiles(filesByAssetId);
+    this.registerFilesForLocalImport([...filesByAssetId.values()].flat());
   }
 
   /** 从运行时材质贴图提取可持久化图片，并逐个写入项目侧车文件。 */
@@ -4466,6 +5112,9 @@ export class BabylonEditorEngine {
       return this.createTransformSnapshot(node);
     }
 
+    if (this.hasTransformUpdatePayload(update)) {
+      this.recordSceneUndoSnapshot("更新对象属性", { coalesceMs: 700 });
+    }
     const graphDirty = this.applyTransformUpdateToNode(node, update);
     this.refreshNodeWorldMatrices(node);
     if (this.selectedNode?.uniqueId === node.uniqueId) {
@@ -4546,6 +5195,24 @@ export class BabylonEditorEngine {
     return graphDirty;
   }
 
+  /** 判断属性面板更新是否包含会改变对象布局或可见状态的字段。 */
+  private hasTransformUpdatePayload(update: TransformUpdate): boolean {
+    return (
+      update.name !== undefined ||
+      update.position !== undefined ||
+      update.rotation !== undefined ||
+      update.scaling !== undefined ||
+      update.visible !== undefined ||
+      update.materialColor !== undefined ||
+      update.cadOpacity !== undefined ||
+      update.assetInfo !== undefined ||
+      update.meshVertexModify !== undefined ||
+      update.locatorAnimationConnection !== undefined ||
+      update.poi !== undefined ||
+      update.dynamicParameter !== undefined
+    );
+  }
+
   /** 创建编辑器视口相机，提供类似 Unity Scene View 的轨道操作体验。 */
   private createEditorCamera(): ArcRotateCamera {
     const camera = new ArcRotateCamera(
@@ -4566,15 +5233,33 @@ export class BabylonEditorEngine {
     camera.angularSensibilityX = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
     camera.angularSensibilityY = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
     camera.movement.panSpeed = MIN_CAMERA_PAN_SPEED_SCALE;
+    disableEditorCameraDefaultMovementInputs(camera);
     camera.minZ = 0.05;
     camera.maxZ = DEFAULT_CAMERA_FAR_CLIP_METERS;
     camera.fov = 0.92;
     camera.useInputToRestoreState = false;
+    // 编辑器只保留显式实现的 Unity 风格导航，避免 Babylon 默认键盘输入产生隐藏相机行为。
+    camera.inputs.removeByType("ArcRotateCameraKeyboardMoveInput");
+    camera.inputs.removeByType("ArcRotateCameraPointersInput");
     camera.inputs.removeByType("ArcRotateCameraMouseWheelInput");
+    camera.inputs.add(
+      new EditorCameraUnityPointerInput(this.canvas, {
+        onNavigationStart: () => {
+          this.cameraNavigationActive = true;
+        },
+        onNavigationEnd: (action, moved) => {
+          this.cameraNavigationActive = false;
+          if (moved || action !== "look") {
+            this.lastCameraNavigationEndTime = performance.now();
+          }
+        }
+      })
+    );
     camera.inputs.add(new EditorCameraWheelDollyInput(this.canvas));
     camera.wheelPrecision = DEFAULT_CAMERA_WHEEL_PRECISION;
     this.scene.activeCamera = camera;
     camera.attachControl(this.canvas, true);
+    disableEditorCameraDefaultMovementInputs(camera);
     return camera;
   }
 
@@ -4629,6 +5314,7 @@ export class BabylonEditorEngine {
       return;
     }
 
+    this.recordSceneUndoSnapshot("拖拽变换对象");
     this.transformGizmoDragging = true;
     this.clearEditorCameraInertia();
     this.editorCamera.detachControl();
@@ -4642,8 +5328,14 @@ export class BabylonEditorEngine {
     }
 
     this.clearEditorCameraInertia();
-    this.editorCamera.attachControl(this.canvas, true);
+    this.attachEditorCameraControl();
     this.transformGizmoDragging = false;
+  }
+
+  /** 绑定编辑相机输入后立刻关闭 Babylon 默认 movement 映射，保证只有自定义 Unity 输入生效。 */
+  private attachEditorCameraControl(): void {
+    this.editorCamera.attachControl(this.canvas, true);
+    disableEditorCameraDefaultMovementInputs(this.editorCamera);
   }
 
   /** 清空 ArcRotateCamera 的惯性偏移，避免重新绑定输入后延续旧拖拽速度。 */
@@ -5573,8 +6265,88 @@ export class BabylonEditorEngine {
 
   /** 克隆可编辑节点层级，失败时返回 null 以便快捷键不拦截默认行为。 */
   private cloneEditableNode(sourceNode: TransformNode, name: string, parent: TransformNode | null = null): TransformNode | null {
-    const clone = sourceNode.clone(name, parent, false);
-    return clone instanceof TransformNode ? clone : null;
+    const marker = this.markCloneSourceHierarchy(sourceNode);
+    let clone: TransformNode | null = null;
+    try {
+      const clonedNode = sourceNode.clone(name, parent, false);
+      if (clonedNode instanceof TransformNode) {
+        clone = clonedNode;
+        this.cloneSourceNodeMaps.set(clone, this.createCloneSourceNodeMap(clone, marker.sourceByToken));
+      }
+      return clone;
+    } finally {
+      this.restoreCloneSourceTokens(marker.snapshots);
+      if (clone) {
+        this.clearCloneSourceTokens(clone);
+      }
+    }
+  }
+
+  /** 为源层级临时写入克隆 token，避免按场景枚举顺序猜测源节点与副本节点关系。 */
+  private markCloneSourceHierarchy(sourceRoot: TransformNode): CloneSourceTokenMarkResult {
+    const sourceByToken = new Map<string, Node>();
+    const snapshots: CloneSourceTokenSnapshot[] = [];
+    const operationToken = `${this.cloneTokenSeed++}`;
+    this.getNodeHierarchy(sourceRoot).forEach((node) => {
+      const metadata = this.asMetadataObject(node.metadata);
+      const token = `${operationToken}:${node.uniqueId}`;
+      snapshots.push({
+        node,
+        hadToken: Object.prototype.hasOwnProperty.call(metadata, CLONE_SOURCE_TOKEN_KEY),
+        previousToken: metadata[CLONE_SOURCE_TOKEN_KEY]
+      });
+      sourceByToken.set(token, node);
+      node.metadata = {
+        ...metadata,
+        [CLONE_SOURCE_TOKEN_KEY]: token
+      };
+    });
+    return { sourceByToken, snapshots };
+  }
+
+  /** 从副本层级读取克隆 token 并建立反查表，随后清掉副本上的临时标记。 */
+  private createCloneSourceNodeMap(cloneRoot: TransformNode, sourceByToken: Map<string, Node>): WeakMap<Node, Node> {
+    const cloneSourceMap = new WeakMap<Node, Node>();
+    this.getNodeHierarchy(cloneRoot).forEach((cloneNode) => {
+      const metadata = this.asMetadataObject(cloneNode.metadata);
+      const token = typeof metadata[CLONE_SOURCE_TOKEN_KEY] === "string" ? metadata[CLONE_SOURCE_TOKEN_KEY] : "";
+      const sourceNode = token ? sourceByToken.get(token) : undefined;
+      if (sourceNode) {
+        cloneSourceMap.set(cloneNode, sourceNode);
+      }
+      this.clearCloneSourceToken(cloneNode);
+    });
+    return cloneSourceMap;
+  }
+
+  /** 恢复源节点原有 token 状态，保证临时克隆标记不会进入场景保存或后续运行态。 */
+  private restoreCloneSourceTokens(snapshots: CloneSourceTokenSnapshot[]): void {
+    snapshots.forEach((snapshot) => {
+      const metadata = { ...this.asMetadataObject(snapshot.node.metadata) };
+      if (snapshot.hadToken) {
+        metadata[CLONE_SOURCE_TOKEN_KEY] = snapshot.previousToken;
+      } else {
+        delete metadata[CLONE_SOURCE_TOKEN_KEY];
+      }
+      snapshot.node.metadata = metadata;
+    });
+  }
+
+  /** 清理副本层级残留的克隆 token，避免异常路径把内部标记带进真实节点。 */
+  private clearCloneSourceTokens(root: TransformNode): void {
+    this.getNodeHierarchy(root).forEach((node) => this.clearCloneSourceToken(node));
+  }
+
+  /** 清理单个节点上的克隆 token。 */
+  private clearCloneSourceToken(node: Node): void {
+    const metadata = this.asMetadataObject(node.metadata);
+    if (!Object.prototype.hasOwnProperty.call(metadata, CLONE_SOURCE_TOKEN_KEY)) {
+      return;
+    }
+
+    const nextMetadata = { ...metadata };
+    delete nextMetadata[CLONE_SOURCE_TOKEN_KEY];
+    node.metadata = nextMetadata;
   }
 
   /** 生成模型阵列失败结果，保证 App 层不需要重复拼装错误结构。 */
@@ -5670,10 +6442,11 @@ export class BabylonEditorEngine {
 
   /** 准备复制出的节点层级，确保 metadata、拾取状态和材质都独立且符合编辑器约定。 */
   private prepareClonedHierarchy(cloneRoot: TransformNode, sourceRoot: TransformNode, asClipboardTemplate: boolean): void {
+    const cloneSourceMap = this.cloneSourceNodeMaps.get(cloneRoot);
     const sourceNodes = this.getNodeHierarchy(sourceRoot);
     const cloneNodes = this.getNodeHierarchy(cloneRoot);
     cloneNodes.forEach((cloneNode, index) => {
-      const sourceNode = sourceNodes[index] ?? cloneNode;
+      const sourceNode = cloneSourceMap?.get(cloneNode) ?? sourceNodes[index] ?? cloneNode;
       const metadata = this.deepCloneMetadata(sourceNode.metadata);
       if (asClipboardTemplate) {
         metadata[HELPER_FLAG] = true;
@@ -5690,9 +6463,30 @@ export class BabylonEditorEngine {
         cloneNode.isPickable = !asClipboardTemplate;
       }
     });
+    this.cloneSourceNodeMaps.delete(cloneRoot);
+    this.prepareModelPackageCloneBaseline(cloneRoot, sourceRoot);
 
     const cloneMeshes = cloneRoot instanceof AbstractMesh ? [cloneRoot, ...cloneRoot.getChildMeshes()] : cloneRoot.getChildMeshes();
     this.cloneHierarchyMaterials(cloneMeshes, asClipboardTemplate);
+  }
+
+  /** 克隆模型包时先按源基线收敛副本节点，再清除几何基线等待副本独立重建运行态。 */
+  private prepareModelPackageCloneBaseline(cloneRoot: TransformNode, sourceRoot: TransformNode): void {
+    if (!this.isOpaqueRollerConveyorPackage(cloneRoot)) {
+      return;
+    }
+
+    const sourceBaseline = this.readOpaqueRollerConveyorBaseline(sourceRoot);
+    if (sourceBaseline) {
+      this.restoreOpaqueRollerConveyorBaseline(cloneRoot, sourceBaseline);
+    }
+    this.disposeGeneratedRollerCountNodes(cloneRoot, true);
+    const editorMetadata = this.getNodeEditorMetadata(cloneRoot);
+    const runtimeMetadata = { ...this.asMetadataObject(editorMetadata.modelPackageRuntime) };
+    this.clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata);
+    this.mergeNodeEditorMetadata(cloneRoot, {
+      modelPackageRuntime: runtimeMetadata
+    });
   }
 
   /** 重置克隆实例的模型包运行态缓存，动态参数仍从 modelPackageInstance.values 继承。 */
@@ -6104,12 +6898,12 @@ export class BabylonEditorEngine {
   /** 注册指针拾取逻辑，点击模型后同步层级、属性和高亮状态。 */
   private bindPointerSelection(): void {
     this.scene.onPointerObservable.add((pointerInfo) => {
-      if (this.previewMode || this.gizmoManager.isDragging) {
+      if (this.previewMode || this.gizmoManager.isDragging || this.shouldSkipPointerSelectionAfterCameraNavigation()) {
         return;
       }
 
       const event = pointerInfo.event as PointerEvent;
-      if (event.button !== 0) {
+      if (event.button !== LEFT_MOUSE_BUTTON || event.altKey) {
         return;
       }
 
@@ -6157,6 +6951,16 @@ export class BabylonEditorEngine {
       const root = this.findSelectableRoot(mesh);
       this.selectNode(this.isNodeLocked(root) ? null : root);
     });
+  }
+
+  /** 相机导航刚结束时 Babylon 可能补发 pick，短暂跳过可避免 Alt+左键环绕误选。 */
+  private shouldSkipPointerSelectionAfterCameraNavigation(): boolean {
+    return this.cameraNavigationActive || (this.lastCameraNavigationEndTime > 0 && performance.now() - this.lastCameraNavigationEndTime < 120);
+  }
+
+  /** 暴露给 React 菜单层判断右键拖拽后的 contextmenu 是否应被抑制。 */
+  public hasActiveOrRecentCameraNavigation(): boolean {
+    return this.shouldSkipPointerSelectionAfterCameraNavigation();
   }
 
   /** 绑定统计信息刷新，避免每帧都触发 React 重渲染。 */
@@ -6751,7 +7555,7 @@ export class BabylonEditorEngine {
     this.editorCamera.upperRadiusLimit = Math.max(this.editorCamera.upperRadiusLimit ?? 0, radius * 3);
     this.editorCamera.maxZ = Math.min(MAX_CAMERA_FAR_CLIP_METERS, Math.max(this.editorCamera.maxZ, radius * 6));
     this.editorCamera.radius = radius;
-    this.editorCamera.attachControl(this.canvas, true);
+    this.attachEditorCameraControl();
   }
 
   /** 按包围球和当前视口宽高计算取景半径，比固定倍数更不容易裁切长模型。 */
@@ -6771,7 +7575,7 @@ export class BabylonEditorEngine {
     this.editorCamera.setTarget(new Vector3(0, 1.2, 0));
     this.editorCamera.radius = DEFAULT_CAMERA_RADIUS_METERS;
     this.editorCamera.maxZ = DEFAULT_CAMERA_FAR_CLIP_METERS;
-    this.editorCamera.attachControl(this.canvas, true);
+    this.attachEditorCameraControl();
     this.createGridHelper(EDITOR_GRID_SIZE_METERS, EDITOR_GRID_CELL_SIZE_METERS, Vector3.Zero());
   }
 
