@@ -37,11 +37,31 @@ const STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT = "frontdistancey";
 const STACKER_BACK_DISTANCE_Y_FIELD_COMPACT = "backdistancey";
 const STACKER_FORK_FIELDS = ["fork_extend", "forkExtend", "forkX", "fork.x", "fork.extend"];
 const STACKER_FORK_ACTION_FIELDS = ["front_movement_z", "back_movement_z", "forkState"];
+const STACKER_FORK_DISTANCE_FIELD_COMPACTS = [
+  "frontforkdistance",
+  "backforkdistance",
+  "frontforkdistancey",
+  "backforkdistancey",
+  "frontforkdistancez",
+  "backforkdistancez",
+  "frontdistancez",
+  "backdistancez",
+  "frontdistancex",
+  "backdistancex",
+  "frontforkextend",
+  "backforkextend",
+  "forkdistance",
+  "forkextend"
+];
+const STACKER_FRONT_FORK_LOCATION_FIELD_COMPACT = "frontforklocation";
+const STACKER_BACK_FORK_LOCATION_FIELD_COMPACT = "backforklocation";
 const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
 const STACKER_PLC_DEVICE_CODE_FIELD = "device_code";
 const CARGO_ACTION_FIELDS = ["cargo_action", "cargoAction", "cargo.action", "action"];
 const CARGO_TARGET_FIELDS = ["cargo", "cargoId", "cargoCode", "payload", "box", "boxId", "boxCode", "targetCargo"];
 const CARGO_DROP_TARGET_FIELDS = ["target", "dropTarget", "targetLocator", "locator", "locatorAssetCode", "slot"];
+const ROLLER_CONTAINER_CODE_FIELDS = ["container_no", "containerNo", "container.no", "container_id", "containerId"];
+const ROLLER_TASK_CODE_FIELDS = ["task", "taskNo", "task_no", "taskId", "task_id"];
 const CARGO_PICKUP_VALUES = ["pickup", "pick", "attach", "load", "carry", "take", "取货", "吸附", "装载"];
 const CARGO_DROP_VALUES = ["drop", "detach", "unload", "release", "put", "放货", "释放", "卸载"];
 const DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION = 0.45;
@@ -49,6 +69,7 @@ const DEFAULT_CARGO_PICKUP_MAX_DISTANCE = 2.5;
 const DEFAULT_CARGO_ANCHOR_OFFSET = new Vector3(0, 0.32, 0);
 // 辊筒模型只声明自转速度时，用该米/秒速度推进已绑定货箱。
 const DEFAULT_CONVEYOR_CARGO_SPEED = 2;
+const DEFAULT_RUNTIME_CARGO_BOX_SIZE = 1;
 const STACKER_TRACK_NODE_NAMES = ["guidaoshang.1", "guidaoxia.2"];
 const STACKER_TRAVEL_NODE_NAMES = [
   "dingbuhuagui2.3",
@@ -222,12 +243,22 @@ export interface SceneDataDrivenDropTarget {
   matchFields: Record<string, string>;
 }
 
+/** 运行态临时货箱创建请求，由宿主引擎负责真正实例化 Babylon 节点。 */
+export interface RuntimeCargoBoxRequest {
+  cargoCode: string;
+  carrierRoot: TransformNode;
+  position: Vector3;
+  size: number;
+}
+
 /** 场景数据驱动运行时的宿主能力，由 Babylon 引擎提供。 */
 interface SceneDataDrivenRuntimeOptions {
   scene: Scene;
   getConfig: () => SceneDataDrivenSnapshot;
   getTargets: () => SceneDataDrivenTarget[];
   getDropTargets: () => SceneDataDrivenDropTarget[];
+  createRuntimeCargoBox?: (request: RuntimeCargoBoxRequest) => TransformNode | null;
+  disposeRuntimeNode?: (node: TransformNode) => void;
   onTargetsChanged: (roots: TransformNode[], now: number) => void;
   onConnectionStatusChanged?: (status: SceneDataConnectionStatusSnapshot) => void;
 }
@@ -277,11 +308,14 @@ export class SceneDataDrivenRuntime {
   private readonly targetStates = new Map<number, DataDrivenTargetState>();
   private readonly cargoAttachments = new Map<number, CargoAttachmentState>();
   private readonly cargoTransports = new Map<number, CargoTransportState>();
+  private readonly runtimeGeneratedCargoByCode = new Map<string, TransformNode>();
+  private readonly rollerFrontCargoPresence = new Map<number, boolean>();
   private simulationConfig: SceneDataDrivenSnapshot | null = null;
   private connectionGeneration = 0;
   private lastMessageAt = 0;
   private staleStatusEmitted = false;
   private running = false;
+  private runtimeCargoSequence = 0;
 
   /** 创建场景数据驱动运行时，实际连接只会在 start 时建立。 */
   public constructor(private readonly options: SceneDataDrivenRuntimeOptions) {}
@@ -373,13 +407,31 @@ export class SceneDataDrivenRuntime {
     if (restoreTargets) {
       this.restoreTargets();
     }
+    this.disposeRuntimeGeneratedCargoBoxes();
     this.cargoAttachments.clear();
     this.cargoTransports.clear();
+    this.rollerFrontCargoPresence.clear();
     this.targetStates.clear();
     this.running = false;
     this.lastMessageAt = 0;
     this.staleStatusEmitted = false;
     this.emitConnectionStatus({ state: "idle", label: "数据驱动已停止" });
+  }
+
+  /** 释放预览态自动生成的货箱，确保临时 cube 不残留到编辑态和保存文件。 */
+  private disposeRuntimeGeneratedCargoBoxes(): void {
+    this.runtimeGeneratedCargoByCode.forEach((node) => {
+      if (node.isDisposed()) {
+        return;
+      }
+
+      if (this.options.disposeRuntimeNode) {
+        this.options.disposeRuntimeNode(node);
+      } else {
+        node.dispose(false, true);
+      }
+    });
+    this.runtimeGeneratedCargoByCode.clear();
   }
 
   /** 配置变更时重建连接，保持预览中的数据源和 UI 配置一致。 */
@@ -738,10 +790,11 @@ export class SceneDataDrivenRuntime {
     const nextDistanceMotionValues = this.readStackerDistanceMotionValues(frame, state);
     this.mergeMotionValues(nextMotionValues, nextDistanceMotionValues);
     const nextActionDirections = this.readMotionGroupActionDirections(frame, state.motionGroups);
-    this.stopDistanceCalibratedActions(nextActionDirections, nextDistanceMotionValues);
     this.applyInterpolatedState(state, now);
     this.applyActionState(state, now, false);
     const currentMotionValues = this.createCurrentMotionValues(state, now);
+    this.mergeMotionValues(nextActionDirections, this.readStackerForkActionDirections(frame, state, currentMotionValues));
+    this.stopDistanceCalibratedActions(nextActionDirections, nextDistanceMotionValues);
     const speedDuration = this.createSpeedDrivenMotionDuration(currentMotionValues, nextMotionValues, state.motionGroups);
     const duration = speedDuration !== undefined ? Math.max(speedDuration, fallbackDuration) : fallbackDuration;
     state.motionStartedAt = now;
@@ -1068,16 +1121,61 @@ export class SceneDataDrivenRuntime {
 
   /** 处理输送线负载绑定帧，货箱后续由输送线动作自动推进。 */
   private applyCargoTransportFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
-    if (!this.isCargoTransportCarrier(state) || !this.isPayloadBindingFrame(frame)) {
+    if (!this.isCargoTransportCarrier(state)) {
       return;
     }
 
-    const cargoCode = this.readString(frame, CARGO_TARGET_FIELDS);
-    if (!cargoCode) {
+    if (this.isPayloadBindingFrame(frame)) {
+      const cargoCode = this.readString(frame, CARGO_TARGET_FIELDS);
+      if (cargoCode) {
+        this.bindCargoToTransportCarrier(state, cargoCode, now);
+      }
       return;
     }
 
-    this.bindCargoToTransportCarrier(state, cargoCode, now);
+    this.applyRollerFrontCargoFrame(state, frame, now);
+  }
+
+  /** 处理辊道机 PLC 光电信号，前端有货上升沿会生成运行态货箱。 */
+  private applyRollerFrontCargoFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
+    if (!this.isBoundedRollerConveyorTarget(state.target)) {
+      return;
+    }
+
+    const frontPresent = this.isRollerFrontCargoPresent(frame);
+    if (frontPresent === undefined) {
+      return;
+    }
+
+    const carrierId = state.target.root.uniqueId;
+    const wasPresent = this.rollerFrontCargoPresence.get(carrierId) ?? false;
+    this.rollerFrontCargoPresence.set(carrierId, frontPresent);
+    if (!frontPresent || wasPresent) {
+      return;
+    }
+
+    const cargoCode = this.createRollerCargoCode(frame, state);
+    const normalizedCargoCode = this.normalizeMatchValue(cargoCode);
+    const existingCargo = this.findCargoTarget(cargoCode, state.target.root);
+    if (existingCargo) {
+      this.bindCargoRootToTransportCarrier(state, existingCargo.root, cargoCode, now);
+      return;
+    }
+
+    const cargoRoot = this.runtimeGeneratedCargoByCode.get(normalizedCargoCode);
+    if (cargoRoot && !cargoRoot.isDisposed()) {
+      this.bindCargoRootToTransportCarrier(state, cargoRoot, cargoCode, now);
+      return;
+    }
+
+    const createdRoot = this.createRuntimeCargoBoxForRoller(state, cargoCode);
+    if (!createdRoot) {
+      return;
+    }
+
+    this.runtimeGeneratedCargoByCode.set(normalizedCargoCode, createdRoot);
+    this.bindCargoRootToTransportCarrier(state, createdRoot, cargoCode, now);
+    this.options.onTargetsChanged([createdRoot], now);
   }
 
   /** 尝试把指定货箱吸附到当前 Stacker 货叉吸附点。 */
@@ -1125,6 +1223,104 @@ export class SceneDataDrivenRuntime {
     }
 
     return this.readString(frame, ["p"]) === "payload" || frame.payload !== undefined;
+  }
+
+  /** 读取辊道机前端光电位，move bit0 为 1 表示前端有货。 */
+  private isRollerFrontCargoPresent(frame: DataFrame): boolean | undefined {
+    return this.readBitFlag(frame, "move", 0);
+  }
+
+  /** 从 Byte 位域字段中读取指定 bit，字段缺失或非法时返回 undefined。 */
+  private readBitFlag(frame: DataFrame, fieldName: string, bitIndex: number): boolean | undefined {
+    const normalizedFieldName = this.normalizeProtocolFieldName(fieldName);
+    const fieldValue = Object.entries(frame).find(([key]) => this.normalizeProtocolFieldName(key) === normalizedFieldName)?.[1];
+    const bitfield = this.readBitfieldNumber(fieldValue);
+    if (bitfield === undefined || bitIndex < 0) {
+      return undefined;
+    }
+
+    return (bitfield & (1 << bitIndex)) !== 0;
+  }
+
+  /** 为辊道机运行态货箱生成稳定编号，优先使用托盘号，其次使用任务号。 */
+  private createRollerCargoCode(frame: DataFrame, state: DataDrivenTargetState): string {
+    const containerCode = this.readString(frame, ROLLER_CONTAINER_CODE_FIELDS);
+    if (containerCode) {
+      return containerCode;
+    }
+
+    const taskCode = this.readString(frame, ROLLER_TASK_CODE_FIELDS);
+    if (taskCode && !this.isZeroLikeCode(taskCode)) {
+      return `Task${taskCode}`;
+    }
+
+    const deviceCode =
+      this.readString(frame, ["e", "deviceCode", "devId", "deviceId", "deviceID", "assetCode"]) ??
+      state.target.matchFields.assetCode ??
+      state.target.matchFields.name ??
+      String(state.target.root.uniqueId);
+    this.runtimeCargoSequence += 1;
+    return `Cargo-${deviceCode}-${this.runtimeCargoSequence}`;
+  }
+
+  /** 判断业务编号是否是空任务号，兼容 PLC 常见的 0、000、0.0 字符串。 */
+  private isZeroLikeCode(value: string): boolean {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return true;
+    }
+
+    const numberValue = Number(trimmed);
+    return Number.isFinite(numberValue) && numberValue === 0;
+  }
+
+  /** 在辊道机前端创建临时 cube，创建失败时保持运行态不变。 */
+  private createRuntimeCargoBoxForRoller(state: DataDrivenTargetState, cargoCode: string): TransformNode | null {
+    if (!this.options.createRuntimeCargoBox) {
+      return null;
+    }
+
+    const position = this.createRollerFrontCargoPosition(state, DEFAULT_RUNTIME_CARGO_BOX_SIZE);
+    return this.options.createRuntimeCargoBox({
+      cargoCode,
+      carrierRoot: state.target.root,
+      position,
+      size: DEFAULT_RUNTIME_CARGO_BOX_SIZE
+    });
+  }
+
+  /** 计算辊道机前端货箱中心点，保证 cube 一生成就在有效输送段内。 */
+  private createRollerFrontCargoPosition(state: DataDrivenTargetState, cargoSize: number): Vector3 {
+    const axis = this.resolveCargoTransportAxis(state);
+    const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, axis);
+    const carrierBounds = this.getNodeWorldBounds(state.target.root);
+    const fallbackPosition = state.target.root.getAbsolutePosition();
+    const basePosition = carrierBounds
+      ? carrierBounds.minimum.add(carrierBounds.maximum).scale(0.5)
+      : fallbackPosition.clone();
+    const halfSize = cargoSize / 2;
+    const topY = carrierBounds ? carrierBounds.maximum.y : fallbackPosition.y;
+
+    if (axisDirection.lengthSquared() <= 0) {
+      return new Vector3(basePosition.x, topY + halfSize, basePosition.z);
+    }
+
+    const trackRange = this.createCargoTransportTrackRange(state, axisDirection);
+    if (!trackRange) {
+      const positioned = basePosition.add(axisDirection.scale(halfSize));
+      positioned.y = topY + halfSize;
+      return positioned;
+    }
+
+    const trackLength = trackRange.maximum - trackRange.minimum;
+    const targetProjection =
+      trackLength >= cargoSize
+        ? trackRange.minimum + halfSize
+        : (trackRange.minimum + trackRange.maximum) / 2;
+    const currentProjection = Vector3.Dot(basePosition, axisDirection);
+    const positioned = basePosition.add(axisDirection.scale(targetProjection - currentProjection));
+    positioned.y = topY + halfSize;
+    return positioned;
   }
 
   /** 解除指定货箱或当前 Stacker 所有货箱的运行态吸附关系，带 target 时先放入定位框。 */
@@ -1193,15 +1389,24 @@ export class SceneDataDrivenRuntime {
       return;
     }
 
-    this.cargoTransports.set(cargoTarget.root.uniqueId, {
+    this.bindCargoRootToTransportCarrier(state, cargoTarget.root, cargoCode, now);
+  }
+
+  /** 将已拿到的货箱根节点绑定到输送线，避免运行态新建节点依赖目标列表刷新。 */
+  private bindCargoRootToTransportCarrier(state: DataDrivenTargetState, cargoRoot: TransformNode, cargoCode: string, now: number): void {
+    if (this.isAttachedCargoRoot(cargoRoot) || cargoRoot.isDisposed()) {
+      return;
+    }
+
+    this.cargoTransports.set(cargoRoot.uniqueId, {
       carrierRootId: state.target.root.uniqueId,
-      cargoRoot: cargoTarget.root,
+      cargoRoot,
       cargoCode: this.normalizeMatchValue(cargoCode),
       axis: this.resolveCargoTransportAxis(state),
       speed: this.resolveCargoTransportSpeed(state),
       updatedAt: now
     });
-    this.syncCargoTargetStateToCurrentPose(cargoTarget.root, now);
+    this.syncCargoTargetStateToCurrentPose(cargoRoot, now);
   }
 
   /** Stacker 接管货箱前解除输送线绑定，避免两个载体同时驱动同一货箱。 */
@@ -1482,7 +1687,7 @@ export class SceneDataDrivenRuntime {
     for (const group of state.motionGroups) {
       const key = group.key.toLowerCase();
       if ((key.includes("fork") && !key.includes("side")) || group.fields.some((field) => this.isStackerForkActionField(field))) {
-        extension = Math.max(extension, state.motionValues.get(group.key) ?? 0);
+        extension = Math.max(extension, Math.abs(state.motionValues.get(group.key) ?? 0));
       }
     }
     return extension;
@@ -1491,6 +1696,16 @@ export class SceneDataDrivenRuntime {
   /** 按资产编号、节点名或 uniqueId 查找被取放的货箱根节点。 */
   private findCargoTarget(cargoCode: string, carrierRoot: TransformNode): SceneDataDrivenTarget | null {
     const normalizedCargoCode = this.normalizeMatchValue(cargoCode);
+    const runtimeCargoRoot = this.runtimeGeneratedCargoByCode.get(normalizedCargoCode);
+    if (runtimeCargoRoot?.isDisposed()) {
+      this.runtimeGeneratedCargoByCode.delete(normalizedCargoCode);
+    } else if (runtimeCargoRoot) {
+      return {
+        root: runtimeCargoRoot,
+        matchFields: this.createRuntimeCargoMatchFields(cargoCode, runtimeCargoRoot)
+      };
+    }
+
     return (
       this.options.getTargets().find((target) => {
         if (target.root.uniqueId === carrierRoot.uniqueId || target.root.isDescendantOf?.(carrierRoot) || carrierRoot.isDescendantOf?.(target.root)) {
@@ -1511,6 +1726,17 @@ export class SceneDataDrivenRuntime {
       target.matchFields.name,
       ...Object.values(target.matchFields)
     ]);
+  }
+
+  /** 为运行态临时货箱提供与普通货箱一致的匹配字段。 */
+  private createRuntimeCargoMatchFields(cargoCode: string, cargoRoot: TransformNode): Record<string, string> {
+    return {
+      assetCode: cargoCode,
+      cargoCode,
+      boxCode: cargoCode,
+      name: cargoRoot.name,
+      uniqueId: String(cargoRoot.uniqueId)
+    };
   }
 
   /** 按 target 字段查找定位线框放货目标，定位框无需启用动画接收。 */
@@ -1802,7 +2028,7 @@ export class SceneDataDrivenRuntime {
   /** 将单个点位别名写入标准字段，原始点位仍保留给业务层展示。 */
   private applyDocumentFieldAlias(frame: Record<string, unknown>, pointName: string, pointValue: unknown): void {
     const normalizedPointName = this.normalizeProtocolFieldName(pointName);
-    const compactPointName = normalizedPointName.replace(/[\s_]/g, "");
+    const compactPointName = this.compactProtocolFieldName(pointName);
     if (normalizedPointName === "payload") {
       if (frame.cargo === undefined) {
         frame.cargo = pointValue;
@@ -1846,6 +2072,11 @@ export class SceneDataDrivenRuntime {
   /** 规范化协议字段名，只用于别名判断，不改变原始 payload 字段。 */
   private normalizeProtocolFieldName(value: string): string {
     return value.trim().replace(/-/g, "_").toLowerCase();
+  }
+
+  /** 压缩协议字段名用于点位匹配，点号字段和下划线字段按同一语义处理。 */
+  private compactProtocolFieldName(value: string): string {
+    return this.normalizeProtocolFieldName(value).replace(/[\s_.]/g, "");
   }
 
   /** 把 PLC 位信号转换成运行时动作枚举：1 正向，2 反向，0 停止或冲突。 */
@@ -2014,6 +2245,22 @@ export class SceneDataDrivenRuntime {
       "back_action",
       "front_forkAction",
       "back_forkAction",
+      "front_forkLocation",
+      "back_forkLocation",
+      "front_forkDistance",
+      "back_forkDistance",
+      "frontForkLocation",
+      "backForkLocation",
+      "frontForkDistance",
+      "backForkDistance",
+      "front_distanceZ",
+      "back_distanceZ",
+      "front_distanceX",
+      "back_distanceX",
+      "frontDistanceZ",
+      "backDistanceZ",
+      "frontDistanceX",
+      "backDistanceX",
       "forkState",
       "rotation",
       "move",
@@ -2164,6 +2411,7 @@ export class SceneDataDrivenRuntime {
   private readStackerDistanceMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
     const values = this.readStackerDistanceTravelMotionValues(frame, state);
     this.mergeMotionValues(values, this.readStackerDistanceLiftMotionValues(frame, state));
+    this.mergeMotionValues(values, this.readStackerDistanceForkMotionValues(frame, state));
     return values;
   }
 
@@ -2209,6 +2457,27 @@ export class SceneDataDrivenRuntime {
     return values;
   }
 
+  /** 读取 Stacker 货叉绝对伸缩位置，兼容距离数值和 PLC 货叉位置位信号。 */
+  private readStackerDistanceForkMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
+    const values = new Map<string, number>();
+    if (!state.isStacker) {
+      return values;
+    }
+
+    const forkGroup = state.motionGroups.find((group) => this.isStackerForkRuntimeMotionGroup(group));
+    if (!forkGroup) {
+      return values;
+    }
+
+    const distanceValue = this.readStackerForkDistanceValue(frame, forkGroup);
+    if (distanceValue === undefined) {
+      return values;
+    }
+
+    values.set(forkGroup.key, distanceValue);
+    return values;
+  }
+
   /** 在任意对象帧中查找 distancex 变体，兼容大小写和下划线写法。 */
   private readStackerDistanceXValue(frame: DataFrame): number | undefined {
     for (const [fieldName, fieldValue] of Object.entries(frame)) {
@@ -2234,8 +2503,36 @@ export class SceneDataDrivenRuntime {
 
   /** 读取指定前/后叉高度字段，兼容大小写和下划线写法。 */
   private readStackerDistanceYValueByField(frame: DataFrame, compactFieldName: string): number | undefined {
+    const fieldValue = this.readFrameValueByCompactField(frame, compactFieldName);
+    const numberValue = this.parseFiniteNumber(fieldValue);
+    return Number.isFinite(numberValue) ? numberValue : undefined;
+  }
+
+  /** 按归一化字段名读取帧值，兼容大小写、空格、下划线和横线。 */
+  private readFrameValueByCompactField(frame: DataFrame, compactFieldName: string): unknown {
     for (const [fieldName, fieldValue] of Object.entries(frame)) {
-      if (this.normalizeProtocolFieldName(fieldName).replace(/[\s_]/g, "") !== compactFieldName) {
+      if (this.compactProtocolFieldName(fieldName) === compactFieldName) {
+        return fieldValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 优先读取连续货叉距离值；没有距离值时再使用 front/back_forkLocation 位置信号。 */
+  private readStackerForkDistanceValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
+    const directValue = this.readStackerForkDistanceNumber(frame);
+    if (directValue !== undefined) {
+      return this.createStackerForkValueFromDistance(directValue, group);
+    }
+
+    return this.readStackerForkLocationValue(frame, group);
+  }
+
+  /** 读取 MQTT 中常见的货叉距离字段，字段名按大小写、下划线和横线归一化。 */
+  private readStackerForkDistanceNumber(frame: DataFrame): number | undefined {
+    for (const [fieldName, fieldValue] of Object.entries(frame)) {
+      const compactFieldName = this.compactProtocolFieldName(fieldName);
+      if (!STACKER_FORK_DISTANCE_FIELD_COMPACTS.includes(compactFieldName)) {
         continue;
       }
 
@@ -2247,6 +2544,26 @@ export class SceneDataDrivenRuntime {
     return undefined;
   }
 
+  /** 读取前/后叉位置位信号，前叉有效时优先使用前叉。 */
+  private readStackerForkLocationValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
+    return (
+      this.readStackerForkLocationValueByField(frame, STACKER_FRONT_FORK_LOCATION_FIELD_COMPACT, group) ??
+      this.readStackerForkLocationValueByField(frame, STACKER_BACK_FORK_LOCATION_FIELD_COMPACT, group)
+    );
+  }
+
+  /** 将 PLC 货叉位置位信号转换成以原点为中心的货叉伸缩目标。 */
+  private readStackerForkLocationValueByField(frame: DataFrame, compactFieldName: string, group: RuntimeMotionGroup): number | undefined {
+    for (const [fieldName, fieldValue] of Object.entries(frame)) {
+      if (this.compactProtocolFieldName(fieldName) !== compactFieldName) {
+        continue;
+      }
+
+      return this.createStackerForkValueFromLocation(fieldValue, group);
+    }
+    return undefined;
+  }
+
   /** 将 PLC 上报的字符串或数字转换成有限数字。 */
   private parseFiniteNumber(value: unknown): number {
     return typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
@@ -2254,7 +2571,7 @@ export class SceneDataDrivenRuntime {
 
   /** 判断字段是否是 Stacker X 向绝对距离，现场点位名为 distancex。 */
   private isStackerDistanceXField(fieldName: string): boolean {
-    return this.normalizeProtocolFieldName(fieldName).replace(/[\s_]/g, "") === STACKER_DISTANCE_X_FIELD_COMPACT;
+    return this.compactProtocolFieldName(fieldName) === STACKER_DISTANCE_X_FIELD_COMPACT;
   }
 
   /** 根据距轨道起点的绝对距离生成 travel 运动组目标值，起点默认取当前限位 min 端。 */
@@ -2267,6 +2584,50 @@ export class SceneDataDrivenRuntime {
   private createStackerLiftValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
     const liftOrigin = group.limits?.min ?? 0;
     return liftOrigin + distanceValue / 1000;
+  }
+
+  /** 货叉距离字段可直接发米，也可发毫米；明显超过货叉行程时按毫米换算。 */
+  private createStackerForkValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
+    const maxTravel = this.resolveStackerForkTravelLimit(group);
+    const meters = Math.abs(distanceValue) > Math.max(10, maxTravel * 2) ? distanceValue / 1000 : distanceValue;
+    return meters;
+  }
+
+  /** PLC front/back_forkLocation 是位置位信号；换速位按半行程可视化，极限位按完整/半行程校准。 */
+  private createStackerForkValueFromLocation(value: unknown, group: RuntimeMotionGroup): number | undefined {
+    const bitfield = this.readBitfieldNumber(value);
+    if (bitfield === undefined) {
+      return undefined;
+    }
+
+    const travel = this.resolveStackerForkTravelLimit(group);
+    const shallowTravel = travel * 0.5;
+    const leftDeep = (bitfield & (1 << 6)) !== 0;
+    const rightDeep = (bitfield & (1 << 5)) !== 0;
+    const leftShallow = (bitfield & (1 << 4)) !== 0 || (bitfield & (1 << 3)) !== 0;
+    const rightShallow = (bitfield & (1 << 0)) !== 0 || (bitfield & (1 << 1)) !== 0;
+    const origin = (bitfield & (1 << 2)) !== 0;
+    const leftTarget = leftDeep ? -travel : leftShallow ? -shallowTravel : undefined;
+    const rightTarget = rightDeep ? travel : rightShallow ? shallowTravel : undefined;
+
+    if (leftTarget !== undefined && rightTarget === undefined) {
+      return leftTarget;
+    }
+    if (rightTarget !== undefined && leftTarget === undefined) {
+      return rightTarget;
+    }
+    if (origin && leftTarget === undefined && rightTarget === undefined) {
+      return 0;
+    }
+    return undefined;
+  }
+
+  /** 读取货叉左右伸缩最大行程，用于距离单位判断和位置位信号换算。 */
+  private resolveStackerForkTravelLimit(group: RuntimeMotionGroup): number {
+    const min = group.limits?.min;
+    const max = group.limits?.max;
+    const travel = Math.max(Math.abs(min ?? 0), Math.abs(max ?? 0), DEFAULT_STACKER_FORK_EXTENSION_LIMIT);
+    return Number.isFinite(travel) && travel > 0 ? travel : DEFAULT_STACKER_FORK_EXTENSION_LIMIT;
   }
 
   /** 读取 action 模式运动组绑定的原始枚举值，字符串和数字都按协议码处理。 */
@@ -2329,6 +2690,97 @@ export class SceneDataDrivenRuntime {
       }
     });
     return directions;
+  }
+
+  /** 根据 PLC 左/右伸缩位信号修正货叉动作方向，缩叉始终朝当前原点回收。 */
+  private readStackerForkActionDirections(
+    frame: DataFrame,
+    state: DataDrivenTargetState,
+    currentValues: Map<string, number>
+  ): Map<string, number> {
+    const directions = new Map<string, number>();
+    if (!state.isStacker) {
+      return directions;
+    }
+
+    const forkGroup = state.motionGroups.find((group) => this.isStackerForkRuntimeMotionGroup(group));
+    if (!forkGroup) {
+      return directions;
+    }
+
+    const rawValue = this.readStackerForkActionRawValue(frame);
+    if (rawValue === undefined) {
+      return directions;
+    }
+
+    const direction = this.readStackerForkBitfieldDirection(rawValue, currentValues.get(forkGroup.key) ?? 0);
+    if (direction !== undefined && Number.isFinite(direction)) {
+      directions.set(forkGroup.key, direction);
+    }
+    return directions;
+  }
+
+  /** 读取现场 PLC 前/后叉动作原始位域，前叉有效时优先使用前叉。 */
+  private readStackerForkActionRawValue(frame: DataFrame): unknown {
+    const frontValue = this.readFrameValueByCompactField(frame, "frontforkaction");
+    const backValue = this.readFrameValueByCompactField(frame, "backforkaction");
+    const frontBitfield = this.readBitfieldNumber(frontValue);
+    const backBitfield = this.readBitfieldNumber(backValue);
+    if (frontBitfield !== undefined && frontBitfield !== 0) {
+      return frontValue;
+    }
+    if (backBitfield !== undefined && backBitfield !== 0) {
+      return backValue;
+    }
+    if (frontBitfield === 0) {
+      return frontValue;
+    }
+    if (backBitfield === 0) {
+      return backValue;
+    }
+    return undefined;
+  }
+
+  /** 解析 V5.2 forkAction：bit1 右伸、bit2 左缩、bit3 左伸、bit4 右缩。 */
+  private readStackerForkBitfieldDirection(value: unknown, currentValue: number): number | undefined {
+    const bitfield = this.readBitfieldNumber(value);
+    if (bitfield === undefined) {
+      return undefined;
+    }
+
+    const rightExtend = (bitfield & (1 << 1)) !== 0;
+    const leftExtend = (bitfield & (1 << 3)) !== 0;
+    const leftRetract = (bitfield & (1 << 2)) !== 0;
+    const rightRetract = (bitfield & (1 << 4)) !== 0;
+    const candidates = new Set<number>();
+    if (rightExtend) {
+      candidates.add(1);
+    }
+    if (leftExtend) {
+      candidates.add(-1);
+    }
+    if (leftRetract || rightRetract) {
+      const retractDirection = this.createForkRetractDirection(currentValue);
+      if (retractDirection !== 0) {
+        candidates.add(retractDirection);
+      }
+    }
+
+    if (candidates.size === 1) {
+      return [...candidates][0];
+    }
+    return 0;
+  }
+
+  /** 缩叉信号没有左右位移量时，以当前伸出方向决定回原点方向。 */
+  private createForkRetractDirection(currentValue: number): number {
+    if (currentValue > 1e-6) {
+      return -1;
+    }
+    if (currentValue < -1e-6) {
+      return 1;
+    }
+    return 0;
   }
 
   /** 绝对距离校准是对应运动组的权威位置；同帧命中时停止 action，避免校准后继续积分漂移。 */
@@ -2602,7 +3054,8 @@ export class SceneDataDrivenRuntime {
             fixedNodeNames,
             useStackerTrackLimit ? fixedNodeNames : [],
             false,
-            useStackerTrackLimit
+            useStackerTrackLimit,
+            isStacker && this.isStackerForkMotionDefinition(key, group)
           );
         })
         .filter((group) => group.fields.length > 0 && (group.target === "root" || group.nodes.length > 0));
@@ -2641,7 +3094,8 @@ export class SceneDataDrivenRuntime {
         fixedNodeNames,
         useLegacyFallback ? fixedNodeNames : [],
         useLegacyFallback,
-        true
+        true,
+        false
       ),
       lift: this.createRuntimeMotionGroup(
         "lift",
@@ -2654,6 +3108,7 @@ export class SceneDataDrivenRuntime {
         fixedNodeNames,
         [],
         useLegacyFallback,
+        false,
         false
       ),
       fork: this.createRuntimeMotionGroup(
@@ -2667,7 +3122,8 @@ export class SceneDataDrivenRuntime {
         fixedNodeNames,
         [],
         useLegacyFallback,
-        false
+        false,
+        true
       ),
       forkSide: this.createRuntimeMotionGroup(
         "forkSide",
@@ -2680,6 +3136,7 @@ export class SceneDataDrivenRuntime {
         fixedNodeNames,
         [],
         useLegacyFallback,
+        false,
         false
       )
     };
@@ -2704,7 +3161,7 @@ export class SceneDataDrivenRuntime {
       actionMap: Object.fromEntries(STACKER_FORK_ACTION_MAP_ENTRIES),
       fallbackPattern: STACKER_FORK_FALLBACK_PATTERN_TEXT,
       limits: {
-        min: 0,
+        min: -DEFAULT_STACKER_FORK_EXTENSION_LIMIT,
         max: DEFAULT_STACKER_FORK_EXTENSION_LIMIT
       }
     };
@@ -2719,7 +3176,8 @@ export class SceneDataDrivenRuntime {
       fixedNodeNames,
       [],
       false,
-      false
+      false,
+      true
     );
   }
 
@@ -2746,10 +3204,19 @@ export class SceneDataDrivenRuntime {
     fixedNodeNames: string[],
     fallbackLimitNodeNames: string[],
     useLegacyFallback: boolean,
-    allowTrackBoundsLimitFallback: boolean
+    allowTrackBoundsLimitFallback: boolean,
+    forceBidirectionalForkLimit: boolean
   ): RuntimeMotionGroup {
     const targetMode = group?.target ?? "nodes";
     const nodes = targetMode === "root" ? [] : this.findMotionGroupNodes(root, group, fallbackNodeNames, fallbackPattern, fixedNodeNames, useLegacyFallback);
+    const limits = this.createRuntimeMotionLimit(
+      root,
+      nodes,
+      group?.axis ?? fallbackAxis,
+      group,
+      targetMode === "nodes" ? fallbackLimitNodeNames : [],
+      targetMode === "nodes" && allowTrackBoundsLimitFallback
+    );
     return {
       key,
       kind: group?.kind ?? "translate",
@@ -2760,14 +3227,18 @@ export class SceneDataDrivenRuntime {
       actionMap: this.createRuntimeActionMap(key, group),
       target: targetMode,
       speed: group?.speed,
-      limits: this.createRuntimeMotionLimit(
-        root,
-        nodes,
-        group?.axis ?? fallbackAxis,
-        group,
-        targetMode === "nodes" ? fallbackLimitNodeNames : [],
-        targetMode === "nodes" && allowTrackBoundsLimitFallback
-      )
+      limits: forceBidirectionalForkLimit ? this.createBidirectionalStackerForkMotionLimit(limits) : limits
+    };
+  }
+
+  /** Stacker 货叉可向左右两侧伸出，显式 0..max 限位在运行态扩展为 -max..max。 */
+  private createBidirectionalStackerForkMotionLimit(limit: RuntimeMotionLimit | undefined): RuntimeMotionLimit {
+    const travel = Math.max(Math.abs(limit?.min ?? 0), Math.abs(limit?.max ?? 0), DEFAULT_STACKER_FORK_EXTENSION_LIMIT);
+    return {
+      min: -travel,
+      max: travel,
+      blockerNodes: limit?.blockerNodes ?? [],
+      clearance: limit?.clearance ?? 0
     };
   }
 
@@ -2820,6 +3291,17 @@ export class SceneDataDrivenRuntime {
   /** 判断点位字段是否表达 Stacker 载台升降。 */
   private isStackerLiftField(field: string): boolean {
     return STACKER_LIFT_LIMIT_FIELDS.has(field.trim().toLowerCase());
+  }
+
+  /** 判断运行时运动组是否是 Stacker 货叉伸缩组，用于距离、位置和动作共同驱动同一逻辑值。 */
+  private isStackerForkRuntimeMotionGroup(group: RuntimeMotionGroup): boolean {
+    const key = group.key.toLowerCase();
+    return (
+      group.kind === "translate" &&
+      group.target === "nodes" &&
+      !key.includes("side") &&
+      ((key.includes("fork") && group.nodes.length > 0) || group.fields.some((field) => this.isStackerForkActionField(field)))
+    );
   }
 
   /** 判断点位字段是否表达 Stacker 货叉伸缩动作。 */

@@ -218,7 +218,7 @@ function createStackerFrame(ts = Date.now()) {
 /** 按现场 PLC 点位表生成 DDJ2 报文，运行时会再归一成标准动作字段。 */
 function createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhase) {
   const frame = [
-    { e: DEVICE_ID, p: "device_code", v: DEMO_DEVICE_CODE },
+    { e: DEVICE_ID, p: "deviceCode", v: DEMO_DEVICE_CODE },
     { e: DEVICE_ID, p: "action", v: createTravelBitfield(Math.sin(travelPhase)) },
     { e: DEVICE_ID, p: "front_action", v: createLiftBitfield(Math.sin(liftPhase)) },
     { e: DEVICE_ID, p: "back_action", v: createLiftBitfield(Math.sin(liftPhase)) },
@@ -268,13 +268,13 @@ function createLiftBitfield(value) {
   return 0;
 }
 
-/** 把伸叉/缩叉转换为 PLC forkAction 位域：bit1 伸叉，bit2 缩叉。 */
+/** 把伸叉/缩叉转换为 PLC forkAction 位域：bit1 右伸叉，bit4 向右缩叉。 */
 function createForkBitfield(action) {
   if (action === 1) {
     return 1 << 1;
   }
   if (action === 2) {
-    return 1 << 2;
+    return 1 << 4;
   }
   return 0;
 }

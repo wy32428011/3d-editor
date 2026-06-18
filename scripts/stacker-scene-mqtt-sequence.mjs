@@ -497,7 +497,7 @@ function convertPayloadToPlc(payload) {
     return payload;
   }
 
-  const records = [{ e: STACKER_ID, p: "device_code", v: STACKER_DEVICE_CODE }];
+  const records = [{ e: STACKER_ID, p: "deviceCode", v: STACKER_DEVICE_CODE }];
   payload.forEach((record) => {
     if (!record || typeof record !== "object") {
       return;
@@ -556,14 +556,14 @@ function createLiftBitfieldFromAction(value) {
   return 0;
 }
 
-/** 标准伸缩 action 转 PLC 货叉位域：bit1 伸叉，bit2 缩叉。 */
+/** 标准伸缩 action 转 PLC 货叉位域：bit1 向右伸叉，bit4 向右缩叉。 */
 function createForkBitfieldFromAction(value) {
   const action = readActionNumber(value);
   if (action === 1 || action === 3) {
     return 1 << 1;
   }
   if (action === 2 || action === 4) {
-    return 1 << 2;
+    return 1 << 4;
   }
   return 0;
 }

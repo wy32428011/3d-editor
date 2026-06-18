@@ -63,7 +63,8 @@ import {
   SceneDataDrivenRuntime,
   type SceneDataDrivenDropTarget,
   type SceneDataDrivenRootMotionFields,
-  type SceneDataDrivenTarget
+  type SceneDataDrivenTarget,
+  type RuntimeCargoBoxRequest
 } from "../editor/sceneDataDrivenRuntime";
 import { SceneBusinessRuntime } from "../editor/sceneBusinessRuntime";
 import {
@@ -1241,6 +1242,8 @@ export class BabylonEditorEngine {
       getConfig: () => this.createSceneInspectorSnapshot().dataDriven,
       getTargets: () => this.createSceneDataDrivenTargets(),
       getDropTargets: () => this.createSceneDataDrivenDropTargets(),
+      createRuntimeCargoBox: (request) => this.createRuntimeCargoBox(request),
+      disposeRuntimeNode: (node) => node.dispose(false, true),
       onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now),
       onConnectionStatusChanged: (status) => this.callbacks.onDataConnectionStatusChange(status)
     });
@@ -7004,6 +7007,38 @@ export class BabylonEditorEngine {
     return typeof value === "string" && value.trim() ? value.trim() : fallback;
   }
 
+  /** 创建数据驱动运行态货箱 cube，只存在于预览内存中，不进入撤销栈和场景保存。 */
+  private createRuntimeCargoBox(request: RuntimeCargoBoxRequest): TransformNode {
+    const cargoCode = request.cargoCode.trim() || `Cargo-${Date.now()}`;
+    const name = `运行态货箱 ${cargoCode}`;
+    const mesh = MeshBuilder.CreateBox(name, { size: request.size }, this.scene);
+    mesh.position.copyFrom(request.position);
+    mesh.isPickable = true;
+    mesh.doNotSerialize = true;
+    mesh.metadata = {
+      [ROOT_FLAG]: true,
+      primitive: "cube",
+      isDataDrivenRuntimeGenerated: true,
+      dataDrivenRuntimeKind: "cargoCube",
+      dataDrivenRuntimeOwnerId: request.carrierRoot.uniqueId,
+      dataDrivenRuntimeCargoCode: cargoCode,
+      editor: {
+        assetInfo: {
+          assetCode: cargoCode,
+          cargoCode,
+          boxCode: cargoCode
+        }
+      }
+    };
+
+    const material = new StandardMaterial(`${name} 材质`, this.scene);
+    material.diffuseColor = Color3.FromHexString("#d89a3d");
+    material.specularColor = new Color3(0.22, 0.2, 0.16);
+    material.doNotSerialize = true;
+    mesh.material = material;
+    return mesh;
+  }
+
   /** 创建一个符合当前编辑规范的基础对象。 */
   private createPrimitive(kind: PrimitiveKind, position: Vector3): TransformNode {
     const name = `${this.getPrimitiveName(kind)} ${this.primitiveSeed++}`;
@@ -11035,7 +11070,7 @@ export class BabylonEditorEngine {
 
   /** 判断节点是否应该作为左侧树节点展示，避免展开导入模型内部 TransformNode。 */
   private isSceneGraphDisplayNode(node: Node): boolean {
-    if (node.metadata?.isPoiRuntimeGenerated) {
+    if (node.metadata?.isPoiRuntimeGenerated || node.metadata?.isDataDrivenRuntimeGenerated) {
       return false;
     }
 

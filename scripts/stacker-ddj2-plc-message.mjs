@@ -31,7 +31,7 @@ let frameIndex = 0;
 let isShuttingDown = false;
 
 const BASE_RECORDS = [
-  ["device_code", DEVICE_CODE],
+  ["deviceCode", DEVICE_CODE],
   ["mode", "4"],
   ["stacker_error", "0"],
   ["move", "0"],
@@ -50,7 +50,9 @@ const BASE_RECORDS = [
   ["front_layer", "1"],
   ["front_row", "2"],
   ["front_cargoMove", "0"],
+  ["front_action", "0"],
   ["front_cargoError", "0"],
+  ["front_distanceY", "0"],
   ["front_forkCargo", "0"],
   ["front_forkCargo1", "false"],
   ["front_forkLocation", "0"],
@@ -72,6 +74,7 @@ const BASE_RECORDS = [
   ["back_cargoMove", "0"],
   ["back_action", "4"],
   ["back_cargoError", "0"],
+  ["back_distanceY", "0"],
   ["back_forkCargo", "0"],
   ["back_forkCargo1", "false"],
   ["back_forkLocation", "0"],
@@ -113,7 +116,7 @@ const MOTION_STEPS = [
   },
   {
     label: "货叉缩回",
-    overrides: { front_forkAction: "4", back_forkAction: "4" }
+    overrides: { front_forkAction: "16", back_forkAction: "16" }
   },
   {
     label: "全机构停止",
@@ -297,7 +300,7 @@ function createStackerPlcPayload(step, timestampMs) {
     data: BASE_RECORDS.map(([pointName, value]) => ({
       e: DEVICE_ID,
       p: pointName,
-      v: overrides[pointName] ?? (pointName === "device_code" ? DEVICE_CODE : value)
+      v: overrides[pointName] ?? (pointName === "deviceCode" ? DEVICE_CODE : value)
     })),
     ts: formatShanghaiTimestamp(timestampMs)
   };
