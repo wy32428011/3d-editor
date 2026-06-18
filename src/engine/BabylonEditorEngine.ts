@@ -241,6 +241,7 @@ const CAMERA_POINTER_DRAG_THRESHOLD = 6;
 const CAMERA_NAVIGATION_SHIFT_MULTIPLIER = 3;
 const CAMERA_MIN_BETA = 0.01;
 const CAMERA_MAX_BETA = Math.PI - CAMERA_MIN_BETA;
+const OVERHEAD_CAMERA_BETA = CAMERA_MIN_BETA;
 const LEFT_MOUSE_BUTTON = 0;
 const MIDDLE_MOUSE_BUTTON = 1;
 const RIGHT_MOUSE_BUTTON = 2;
@@ -539,6 +540,7 @@ interface EditorCameraPointerState {
 interface EditorCameraPointerNavigationOptions {
   onNavigationStart?: (action: EditorCameraPointerAction) => void;
   onNavigationEnd?: (action: EditorCameraPointerAction, moved: boolean) => void;
+  getLockedBeta?: () => number | null;
 }
 
 /** 根据 ArcRotateCamera 当前配置计算一次沿视线方向移动的距离。 */
@@ -874,8 +876,10 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     clearEditorCameraInertia(this.camera);
     const sensitivityX = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.angularSensibilityX || DEFAULT_CAMERA_ROTATION_SENSIBILITY));
     const sensitivityY = Math.max(MIN_CAMERA_INPUT_SENSIBILITY, Math.abs(this.angularSensibilityY || DEFAULT_CAMERA_ROTATION_SENSIBILITY));
+    const lockedBeta = this.options.getLockedBeta?.() ?? null;
     this.camera.alpha += (-deltaX * speedMultiplier) / sensitivityX;
-    this.camera.beta = Math.min(CAMERA_MAX_BETA, Math.max(CAMERA_MIN_BETA, this.camera.beta + (-deltaY * speedMultiplier) / sensitivityY));
+    this.camera.beta =
+      lockedBeta ?? Math.min(CAMERA_MAX_BETA, Math.max(CAMERA_MIN_BETA, this.camera.beta + (-deltaY * speedMultiplier) / sensitivityY));
   }
 
   /** Unity Scene View 中按住 Shift 会加快鼠标导航速度。 */
@@ -1163,6 +1167,7 @@ export class BabylonEditorEngine {
   private gpuVendor = "未知 GPU";
   private gpuRenderer = "未知渲染器";
   private previewMode = false;
+  private overheadMode = false;
   private pendingStackerDemoSimulation = false;
   private stackerDemoSimulationActive = false;
   private previewCameraSnapshot: PreviewCameraSnapshot | null = null;
@@ -1431,6 +1436,18 @@ export class BabylonEditorEngine {
     this.updateGridGlow(this.gridGlowPulse);
     this.scene.skipPointerMovePicking = enabled;
     this.callbacks.onStatsChange(this.collectStats());
+  }
+
+  /** 开关正顶俯瞰模式；开启后鼠标旋转只改变水平朝向，不再改变俯仰角。 */
+  public setOverheadMode(enabled: boolean): void {
+    if (this.overheadMode === enabled) {
+      return;
+    }
+
+    this.overheadMode = enabled;
+    this.applyCameraPitchLock();
+    this.clearEditorCameraInertia();
+    this.scene.render();
   }
 
   /** 按当前模式应用 WebGL 后备缓冲缩放；默认走接近 4K 的高清策略。 */
@@ -2146,7 +2163,6 @@ export class BabylonEditorEngine {
     }
 
     this.selectedNode = node;
-    this.syncCameraOrbitTargetToSelection();
     this.ensureMoveToolForTransformSelection(node);
     this.applyHighlight();
     this.syncGizmoMode();
@@ -5255,7 +5271,8 @@ export class BabylonEditorEngine {
           if (moved || action !== "look") {
             this.lastCameraNavigationEndTime = performance.now();
           }
-        }
+        },
+        getLockedBeta: () => this.getLockedCameraBeta()
       })
     );
     camera.inputs.add(new EditorCameraWheelDollyInput(this.canvas));
@@ -5337,8 +5354,24 @@ export class BabylonEditorEngine {
 
   /** 绑定编辑相机输入后立刻关闭 Babylon 默认 movement 映射，保证只有自定义 Unity 输入生效。 */
   private attachEditorCameraControl(): void {
+    this.applyCameraPitchLock();
     this.editorCamera.attachControl(this.canvas, true);
     disableEditorCameraDefaultMovementInputs(this.editorCamera);
+  }
+
+  /** 俯瞰模式用接近 0 的安全俯仰角模拟垂直正顶，避免 ArcRotateCamera 在 beta=0 时方向奇异。 */
+  private getLockedCameraBeta(): number | null {
+    return this.overheadMode ? OVERHEAD_CAMERA_BETA : null;
+  }
+
+  /** 按当前相机模式统一修正俯仰角，防止预览恢复或聚焦取景打破正顶俯瞰。 */
+  private applyCameraPitchLock(): void {
+    const lockedBeta = this.getLockedCameraBeta();
+    if (lockedBeta === null) {
+      return;
+    }
+
+    this.editorCamera.beta = lockedBeta;
   }
 
   /** 清空 ArcRotateCamera 的惯性偏移，避免重新绑定输入后延续旧拖拽速度。 */
@@ -6911,16 +6944,6 @@ export class BabylonEditorEngine {
       }
 
       if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
-        const mesh = pointerInfo.pickInfo?.pickedMesh;
-        if (!mesh || mesh.metadata?.[HELPER_FLAG]) {
-          this.syncCameraOrbitTargetToSelection();
-          return;
-        }
-
-        const root = this.findSelectableRoot(mesh);
-        if (!this.isNodeLocked(root)) {
-          this.syncCameraOrbitTargetToNode(root);
-        }
         return;
       }
 
@@ -8019,7 +8042,7 @@ export class BabylonEditorEngine {
 
     this.selectedNodeIds = new Set(selectableNodes.map((node) => node.uniqueId));
     this.selectedNode = nextPrimary;
-    this.syncCameraOrbitTargetToSelection();
+    // 普通选择只改变选区和 Gizmo，不改变相机 target，避免鼠标点选模型时视角跳动。
     this.ensureMoveToolForTransformSelection(nextPrimary);
     this.applyHighlight();
     this.syncGizmoMode();

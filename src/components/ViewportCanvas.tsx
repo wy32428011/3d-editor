@@ -9,6 +9,7 @@ interface ViewportCanvasProps {
   tool: EditorTool;
   performanceMode: boolean;
   previewMode: boolean;
+  overheadMode: boolean;
   onEngineReady: (engine: BabylonEditorEngine | null) => void;
   onDropAsset: (assetId: string, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
   onDropFiles: (files: FileList, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
@@ -34,6 +35,7 @@ export function ViewportCanvas({
   tool,
   performanceMode,
   previewMode,
+  overheadMode,
   onEngineReady,
   onDropAsset,
   onDropFiles,
@@ -84,6 +86,10 @@ export function ViewportCanvas({
   useEffect(() => {
     engineRef.current?.setPreviewMode(previewMode);
   }, [previewMode]);
+
+  useEffect(() => {
+    engineRef.current?.setOverheadMode(overheadMode);
+  }, [overheadMode]);
 
   /** 允许浏览器把文件或内置对象拖放到视口。 */
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {

@@ -8,6 +8,7 @@ import {
   Gauge,
   Grid3X3,
   Lightbulb,
+  Map,
   MousePointer2,
   Move3D,
   Package,
@@ -29,6 +30,7 @@ interface ToolbarProps {
   tool: EditorTool;
   performanceMode: boolean;
   previewMode: boolean;
+  overheadMode: boolean;
   stats: EditorStats;
   onToolChange: (tool: EditorTool) => void;
   onAddPrimitive: (kind: PrimitiveKind) => void;
@@ -52,6 +54,7 @@ interface ToolbarProps {
   onToggleInspector: () => void;
   onTogglePerformance: () => void;
   onTogglePreview: () => void;
+  onToggleOverheadMode: () => void;
 }
 
 const toolButtons: Array<{ tool: EditorTool; label: string; icon: typeof MousePointer2 }> = [
@@ -104,6 +107,7 @@ export function Toolbar({
   tool,
   performanceMode,
   previewMode,
+  overheadMode,
   stats,
   onToolChange,
   onAddPrimitive,
@@ -126,7 +130,8 @@ export function Toolbar({
   cadImportDisabledReason,
   onToggleInspector,
   onTogglePerformance,
-  onTogglePreview
+  onTogglePreview,
+  onToggleOverheadMode
 }: ToolbarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const cadInputRef = useRef<HTMLInputElement>(null);
@@ -257,6 +262,14 @@ export function Toolbar({
           onClick={onTogglePreview}
         >
           {previewMode ? <Square size={18} /> : <Play size={18} />}
+        </button>
+        <button
+          className={`icon-button ${overheadMode ? "is-active" : ""}`}
+          title={overheadMode ? "退出正顶俯瞰模式" : "正顶俯瞰模式"}
+          type="button"
+          onClick={onToggleOverheadMode}
+        >
+          <Map size={18} />
         </button>
         <button className="icon-button" title="Babylon Inspector" type="button" onClick={onToggleInspector}>
           <Bug size={18} />

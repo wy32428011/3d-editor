@@ -1079,6 +1079,7 @@ export function App() {
   const [stats, setStats] = useState<EditorStats>(initialStats);
   const [performanceMode, setPerformanceMode] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
+  const [overheadMode, setOverheadMode] = useState(false);
   const [recentProjects, setRecentProjects] = useState<RecentProjectRecord[]>([]);
   const [activeProject, setActiveProject] = useState<DesktopProjectRecord | null>(null);
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
@@ -1351,6 +1352,7 @@ export function App() {
   const activateProject = useCallback((project: DesktopProjectRecord | null) => {
     const nextSceneId = project?.activeSceneId ?? project?.scenes[0]?.id ?? null;
     setPreviewMode(false);
+    setOverheadMode(false);
     activeSceneRef.current = { projectPath: project?.path ?? null, sceneId: nextSceneId };
     setActiveProject(project);
     setActiveSceneId(nextSceneId);
@@ -1398,6 +1400,7 @@ export function App() {
   /** 切换项目场景时退出预览，避免旧场景动画状态泄漏到新场景。 */
   useEffect(() => {
     setPreviewMode(false);
+    setOverheadMode(false);
   }, [activeProject?.path, activeSceneId]);
 
   /** 创建新项目，实际目录选择由 Electron 主进程文件对话框完成。 */
@@ -2723,6 +2726,11 @@ export function App() {
     setPreviewMode((value) => !value);
   }, []);
 
+  /** 切换正顶俯瞰模式；模式只影响当前编辑会话，不写入场景文件。 */
+  const handleToggleOverheadMode = useCallback(() => {
+    setOverheadMode((value) => !value);
+  }, []);
+
   /** 创建新场景并立即切换到该场景。 */
   const handleCreateScene = useCallback(async () => {
     if (cadImportActiveRef.current) {
@@ -2909,6 +2917,7 @@ export function App() {
         tool={tool}
         performanceMode={performanceMode}
         previewMode={previewMode}
+        overheadMode={overheadMode}
         stats={stats}
         onToolChange={setTool}
         onAddPrimitive={handleAddPrimitive}
@@ -2932,6 +2941,7 @@ export function App() {
         onToggleInspector={handleToggleInspector}
         onTogglePerformance={handleTogglePerformance}
         onTogglePreview={handleTogglePreview}
+        onToggleOverheadMode={handleToggleOverheadMode}
       />
 
       <div className="project-strip">
@@ -3050,6 +3060,7 @@ export function App() {
           tool={tool}
           performanceMode={performanceMode}
           previewMode={previewMode}
+          overheadMode={overheadMode}
           onEngineReady={handleEngineReady}
           onDropAsset={handleDropAsset}
           onDropFiles={handleDropFiles}
