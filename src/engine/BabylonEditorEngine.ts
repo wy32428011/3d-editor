@@ -199,6 +199,45 @@ const OPAQUE_ROLLER_CONVEYOR_WIDTH_SCALE_NODE_NAMES = ["A1", "A2", "A3", "A21"];
 const OPAQUE_ROLLER_CONVEYOR_HEIGHT_SCALE_NODE_NAMES = ["A4", "A5", "A6", "A7"];
 const OPAQUE_ROLLER_CONVEYOR_GROUND_NODE_NAMES = ["A16", "A17", "A18", "A19"];
 const OPAQUE_ROLLER_CONVEYOR_BOTTOM_FIXED_NODE_NAMES = ["A2", "A3", ...OPAQUE_ROLLER_CONVEYOR_GROUND_NODE_NAMES];
+const OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME = "Box003";
+const OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME = "DJ";
+// 图片红框规则：链条机主体长条和导轨按顶点 Z 延展，固定局部 -Z 起点，禁止根节点整体拉伸。
+const OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES = [
+  OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME,
+  "Rail_01_M001",
+  "Rail_02_M001",
+  "ZJ",
+  "ZJ01"
+];
+const OPAQUE_CHAIN_CONVEYOR_TAIL_FOLLOW_NODE_NAMES = ["Box004"];
+// 图片目标规则：链条机改宽时只拉主体横梁跨度，两侧导轨、支架和尾端附件作为刚体外移。
+const OPAQUE_CHAIN_CONVEYOR_WIDTH_GEOMETRY_NODE_NAMES = [OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME];
+const OPAQUE_CHAIN_CONVEYOR_WIDTH_FOLLOW_NODE_NAMES = [
+  "Rail_01_M001",
+  "Rail_02_M001",
+  "ZJ",
+  "ZJ01",
+  "Box004"
+];
+const OPAQUE_CHAIN_CONVEYOR_BASELINE_REQUIRED_NODE_NAMES = [
+  ...OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES,
+  ...OPAQUE_CHAIN_CONVEYOR_TAIL_FOLLOW_NODE_NAMES,
+  OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME
+];
+const OPAQUE_CHAIN_CONVEYOR_REQUIRED_NODE_NAMES = [
+  OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME,
+  "Rail_01_M001",
+  "Rail_02_M001",
+  OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME
+];
+const OPAQUE_CHAIN_CONVEYOR_BASELINE_VERSION = 2;
+const OPAQUE_CHAIN_CONVEYOR_EXTENSION_REASON = "chainLengthExtension";
+const OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_HALF_WIDTH_RATIO = 0.24;
+const OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_MOTOR_WIDTH_RATIO = 0.72;
+const OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_HALF_DEPTH_RATIO = 0.24;
+const OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_MOTOR_DEPTH_RATIO = 2.4;
+// GLB 会因法线/材质拆出同坐标顶点，组件拆分前先按坐标焊接到物理零件粒度。
+const OPAQUE_CHAIN_CONVEYOR_COMPONENT_WELD_PRECISION = 100000;
 const CAD_LINE_ELEVATION_METERS = GRID_RENDER_ELEVATION_METERS + 0.045;
 const CAD_LINE_CHUNK_SEGMENTS = 32000;
 const CAD_LINE_PACK_MAX_BYTES = 20 * 1024 * 1024;
@@ -1088,6 +1127,47 @@ interface OpaqueRollerConveyorLengthTailReference {
   currentTailX: number;
 }
 
+/** 链条机红框长度几何基线，顶点数组使用对应 Mesh 的局部坐标。 */
+interface OpaqueChainConveyorLengthGeometryBaseline {
+  center: Vector3;
+  size: Vector3;
+  /** 红框主体和长梁类节点只改顶点 Z 坐标，避免 TransformNode 非均匀缩放破坏截面形状。 */
+  positionVertices?: number[];
+}
+
+/** 链条机命名节点下真实可变形 Mesh 的基线，兼容 Rail 节点是空包装 TransformNode 的 GLB。 */
+interface OpaqueChainConveyorLengthMeshBaseline extends OpaqueChainConveyorLengthGeometryBaseline {
+  path: string;
+  positionVertices: number[];
+}
+
+/** 当前 opaque 链条机 GLB 的节点基线，用于从固定 -Z 起点重新应用长度。 */
+interface OpaqueChainConveyorNodeBaseline extends OpaqueChainConveyorLengthGeometryBaseline {
+  position: Vector3;
+  scaling: Vector3;
+  rotation: Vector3;
+  rotationQuaternion: Quaternion | null;
+  enabled?: boolean;
+  lengthMeshBaselines?: OpaqueChainConveyorLengthMeshBaseline[];
+}
+
+/** opaque 链条机整体基线尺寸，坐标均为模型根节点本地坐标。 */
+interface OpaqueChainConveyorBaseline {
+  nodes: Map<string, OpaqueChainConveyorNodeBaseline>;
+  minimum: Vector3;
+  maximum: Vector3;
+  size: Vector3;
+}
+
+/** 链条机 Box003 内部的连通几何块，用于区分可伸长长梁和必须保持形状的横梁/支撑脚。 */
+interface OpaqueChainConveyorMeshComponent {
+  vertexIndices: number[];
+  minimum: Vector3;
+  maximum: Vector3;
+  center: Vector3;
+  size: Vector3;
+}
+
 /** 模型包实例替换前保留的根级编辑状态，确保重载 GLB 后不丢用户场景布置。 */
 interface ModelPackageInstanceReplacementSnapshot {
   root: TransformNode;
@@ -1438,15 +1518,19 @@ export class BabylonEditorEngine {
     this.callbacks.onStatsChange(this.collectStats());
   }
 
-  /** 开关正顶俯瞰模式；开启后鼠标旋转只改变水平朝向，不再改变俯仰角。 */
+  /** 开关正顶俯瞰模式；开启后只锁定俯仰角，主动旋转、平移和缩放仍可用。 */
   public setOverheadMode(enabled: boolean): void {
     if (this.overheadMode === enabled) {
       return;
     }
 
     this.overheadMode = enabled;
-    this.applyCameraPitchLock();
     this.clearEditorCameraInertia();
+    if (enabled) {
+      this.applyCameraPitchLock();
+    } else {
+      this.attachEditorCameraControl();
+    }
     this.scene.render();
   }
 
@@ -3167,6 +3251,7 @@ export class BabylonEditorEngine {
     const metadata = this.asMetadataObject(root.metadata);
     const runtimeMetadata = { ...this.asMetadataObject(snapshot.editorMetadata.modelPackageRuntime) };
     this.clearOpaqueRollerConveyorRuntimeMetadata(runtimeMetadata);
+    this.clearOpaqueChainConveyorRuntimeMetadata(runtimeMetadata);
     root.metadata = {
       ...metadata,
       [ROOT_FLAG]: true,
@@ -6492,6 +6577,8 @@ export class BabylonEditorEngine {
       if (cloneNode === cloneRoot) {
         metadata[ROOT_FLAG] = !asClipboardTemplate;
         this.resetClonedModelPackageRuntimeMetadata(metadata);
+      } else {
+        this.restoreClonedChildNodeName(cloneNode, sourceNode);
       }
       cloneNode.metadata = metadata;
       cloneNode.doNotSerialize = asClipboardTemplate;
@@ -6500,29 +6587,93 @@ export class BabylonEditorEngine {
       }
     });
     this.cloneSourceNodeMaps.delete(cloneRoot);
-    this.prepareModelPackageCloneBaseline(cloneRoot, sourceRoot);
+    this.prepareModelPackageCloneBaseline(cloneRoot, sourceRoot, asClipboardTemplate);
 
     const cloneMeshes = cloneRoot instanceof AbstractMesh ? [cloneRoot, ...cloneRoot.getChildMeshes()] : cloneRoot.getChildMeshes();
     this.cloneHierarchyMaterials(cloneMeshes, asClipboardTemplate);
   }
 
   /** 克隆模型包时先按源基线收敛副本节点，再清除几何基线等待副本独立重建运行态。 */
-  private prepareModelPackageCloneBaseline(cloneRoot: TransformNode, sourceRoot: TransformNode): void {
-    if (!this.isOpaqueRollerConveyorPackage(cloneRoot)) {
+  private prepareModelPackageCloneBaseline(cloneRoot: TransformNode, sourceRoot: TransformNode, asClipboardTemplate: boolean): void {
+    let runtimeMetadataUpdated = false;
+    const editorMetadata = this.getNodeEditorMetadata(cloneRoot);
+    const runtimeMetadata = { ...this.asMetadataObject(editorMetadata.modelPackageRuntime) };
+
+    if (this.isOpaqueRollerConveyorPackage(cloneRoot)) {
+      const sourceBaseline = this.readOpaqueRollerConveyorBaseline(sourceRoot);
+      if (sourceBaseline) {
+        this.restoreOpaqueRollerConveyorBaseline(cloneRoot, sourceBaseline);
+      }
+      this.disposeGeneratedRollerCountNodes(cloneRoot, true);
+      this.clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata);
+      runtimeMetadataUpdated = true;
+    }
+
+    if (this.isOpaqueChainConveyorPackage(cloneRoot)) {
+      const sourceBaseline =
+        this.readOpaqueChainConveyorBaseline(sourceRoot) ??
+        (sourceRoot.metadata?.[HELPER_FLAG] ? null : this.ensureOpaqueChainConveyorBaseline(sourceRoot));
+      this.clearOpaqueChainConveyorCloneRuntimeMetadata(runtimeMetadata);
+      if (sourceBaseline) {
+        runtimeMetadata.opaqueChainConveyorBaseline = this.createOpaqueChainConveyorBaselineMetadata(sourceBaseline);
+      }
+      if (!asClipboardTemplate) {
+        this.makeOpaqueChainConveyorDeformableGeometryUnique(cloneRoot);
+        if (sourceBaseline) {
+          this.restoreOpaqueChainConveyorBaseline(cloneRoot, sourceBaseline);
+        }
+        this.disposeGeneratedChainConveyorNodes(cloneRoot);
+        const cloneBaseline = this.captureOpaqueChainConveyorBaseline(cloneRoot);
+        if (cloneBaseline) {
+          runtimeMetadata.opaqueChainConveyorBaseline = this.createOpaqueChainConveyorBaselineMetadata(cloneBaseline);
+        }
+      }
+      runtimeMetadataUpdated = true;
+    }
+
+    if (runtimeMetadataUpdated) {
+      this.mergeNodeEditorMetadata(cloneRoot, {
+        modelPackageRuntime: runtimeMetadata
+      });
+    }
+  }
+
+  /** Babylon 克隆会给子节点名追加根节点前缀，这里恢复源节点名，保证模型包按固定物理节点名继续参数化。 */
+  private restoreClonedChildNodeName(cloneNode: Node, sourceNode: Node): void {
+    if (typeof sourceNode.name !== "string" || sourceNode.name.length === 0) {
       return;
     }
 
-    const sourceBaseline = this.readOpaqueRollerConveyorBaseline(sourceRoot);
-    if (sourceBaseline) {
-      this.restoreOpaqueRollerConveyorBaseline(cloneRoot, sourceBaseline);
-    }
-    this.disposeGeneratedRollerCountNodes(cloneRoot, true);
-    const editorMetadata = this.getNodeEditorMetadata(cloneRoot);
-    const runtimeMetadata = { ...this.asMetadataObject(editorMetadata.modelPackageRuntime) };
-    this.clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata);
-    this.mergeNodeEditorMetadata(cloneRoot, {
-      modelPackageRuntime: runtimeMetadata
+    cloneNode.name = sourceNode.name;
+  }
+
+  /** 链条机会做顶点级长度/宽度变形，应用参数前必须拆出独立 Geometry，避免共享几何把副本和源实例绑在一起。 */
+  private makeOpaqueChainConveyorDeformableGeometryUnique(root: TransformNode): void {
+    const nodesByName = this.getOpaqueChainConveyorNodesByName(root);
+    const meshes = new Set<Mesh>();
+    const addMesh = (mesh: Mesh): void => {
+      if (mesh.getTotalVertices() > 0 && !this.hasGeneratedRuntimeAncestorForBaseline(mesh, root)) {
+        meshes.add(mesh);
+      }
+    };
+
+    OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const node = nodesByName.get(nodeName);
+      if (!node) {
+        return;
+      }
+      if (node instanceof Mesh) {
+        addMesh(node);
+      }
+      this.getOpaqueChainConveyorLengthGeometryMeshes(node).forEach(addMesh);
     });
+
+    meshes.forEach((mesh) => {
+      if (mesh.geometry && mesh.geometry.meshes.length > 1) {
+        mesh.makeGeometryUnique();
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
   }
 
   /** 重置克隆实例的模型包运行态缓存，动态参数仍从 modelPackageInstance.values 继承。 */
@@ -6535,6 +6686,7 @@ export class BabylonEditorEngine {
 
     const runtimeMetadata = { ...this.asMetadataObject(editorMetadata.modelPackageRuntime) };
     this.clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata);
+    this.clearOpaqueChainConveyorCloneRuntimeMetadata(runtimeMetadata);
     metadata.editor = {
       ...editorMetadata,
       modelPackageRuntime: {
@@ -8057,6 +8209,10 @@ export class BabylonEditorEngine {
 
   /** 将相机旋转中心切到指定节点中心，并保持当前相机位置不跳变。 */
   private syncCameraOrbitTargetToNode(node: TransformNode | null): void {
+    if (this.overheadMode) {
+      return;
+    }
+
     if (!node || this.previewMode || this.transformGizmoDragging || node.metadata?.[HELPER_FLAG]) {
       return;
     }
@@ -8639,12 +8795,715 @@ export class BabylonEditorEngine {
     values: Record<string, DynamicParameterValue>,
     changedParameterKey?: string
   ): void {
+    if (this.applyOpaqueChainConveyorParameterFallback(root, values)) {
+      return;
+    }
+
     if (this.applyOpaqueRollerConveyorParameterFallback(root, values, changedParameterKey)) {
       return;
     }
 
     this.applyModelPackageRollerDensityFallback(root, values);
     this.applyOpaqueRollerConveyorSupportFallback(root, values);
+  }
+
+  /** 当前链条机 GLB 使用固定节点名，长度变化时按部件级规则更新，避免整体 Z 缩放拉伸电机和支架。 */
+  private applyOpaqueChainConveyorParameterFallback(
+    root: TransformNode,
+    values: Record<string, DynamicParameterValue>
+  ): boolean {
+    if (!this.isOpaqueChainConveyorPackage(root)) {
+      return false;
+    }
+
+    this.resetModelPackageRootParametricAxisScaling(root, "x");
+    this.resetModelPackageRootParametricAxisScaling(root, "z");
+    const baseline = this.ensureOpaqueChainConveyorBaseline(root);
+    if (!baseline) {
+      return false;
+    }
+
+    this.restoreOpaqueChainConveyorBaseline(root, baseline);
+    this.disposeGeneratedChainConveyorNodes(root);
+
+    const requestedLength = this.readPositiveDynamicNumberParameter(values.chainLength, baseline.size.z);
+    const targetLength = this.createOpaqueChainConveyorEffectiveLength(baseline, requestedLength);
+    const lengthDelta = targetLength - baseline.size.z;
+    const requestedWidth = this.readPositiveDynamicNumberParameter(values.chainWidth, baseline.size.x);
+    const targetWidth = this.createOpaqueChainConveyorEffectiveWidth(baseline, requestedWidth);
+    const widthDelta = targetWidth - baseline.size.x;
+    const widthCenterX = this.getOpaqueChainConveyorBaselineCenterX(baseline);
+    const nodesByName = this.getOpaqueChainConveyorNodesByName(root);
+
+    OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const node = nodesByName.get(nodeName);
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (node && nodeBaseline) {
+        if (nodeName === OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME) {
+          this.applyOpaqueChainConveyorBodyLengthGeometryForNode(node, nodeBaseline, baseline, baseline.minimum.z, lengthDelta);
+          return;
+        }
+        this.applyOpaqueChainConveyorLengthGeometryForNode(node, nodeBaseline, baseline.minimum.z, lengthDelta);
+      }
+    });
+    OPAQUE_CHAIN_CONVEYOR_WIDTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const node = nodesByName.get(nodeName);
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (node && nodeBaseline) {
+        if (nodeName === OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME) {
+          this.applyOpaqueChainConveyorBodyWidthGeometryForNode(node, nodeBaseline, baseline, widthCenterX, widthDelta);
+          return;
+        }
+        this.applyOpaqueChainConveyorWidthGeometryForNode(node, nodeBaseline, widthCenterX, widthDelta);
+      }
+    });
+
+    this.refreshNodeWorldMatrices(root);
+    OPAQUE_CHAIN_CONVEYOR_TAIL_FOLLOW_NODE_NAMES.forEach((nodeName) => {
+      const node = nodesByName.get(nodeName);
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (node && nodeBaseline) {
+        this.moveNodeCenterOnRootAxis(root, node, "z", nodeBaseline.center.z + lengthDelta);
+      }
+    });
+    OPAQUE_CHAIN_CONVEYOR_WIDTH_FOLLOW_NODE_NAMES.forEach((nodeName) => {
+      const node = nodesByName.get(nodeName);
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (node && nodeBaseline) {
+        this.moveNodeCenterOnRootAxis(root, node, "x", nodeBaseline.center.x + this.createOpaqueChainConveyorWidthOffset(baseline, nodeBaseline, widthDelta));
+      }
+    });
+
+    const showFrontSupport = this.readDynamicBooleanParameter(values.showFrontSupport);
+    const showRearSupport = this.readDynamicBooleanParameter(values.showRearSupport);
+    if (showFrontSupport !== undefined) {
+      this.setNamedSupportNodesEnabled(root, ["ZJ01"], showFrontSupport);
+    }
+    if (showRearSupport !== undefined) {
+      this.setNamedSupportNodesEnabled(root, ["ZJ"], showRearSupport);
+    }
+
+    this.refreshNodeWorldMatrices(root);
+    this.applyHighlight();
+    this.callbacks.onStatsChange(this.collectStats());
+    return true;
+  }
+
+  /** 链条机长度按参数相对基线增减，但不会缩短到让任一红框网格反向。 */
+  private createOpaqueChainConveyorEffectiveLength(baseline: OpaqueChainConveyorBaseline, requestedLength: number): number {
+    const minimumLength = this.createOpaqueChainConveyorMinimumEffectiveLength(baseline);
+    return Math.max(minimumLength, requestedLength);
+  }
+
+  /** 计算链条机允许的最短有效长度，保证所有参与顶点延展的 Mesh 仍保留正向长度。 */
+  private createOpaqueChainConveyorMinimumEffectiveLength(baseline: OpaqueChainConveyorBaseline): number {
+    const stretchableRootLengths: number[] = [];
+    const captureStretchableLength = (geometryBaseline: OpaqueChainConveyorLengthGeometryBaseline, lengthAnchorZ: number): void => {
+      if (!geometryBaseline.positionVertices) {
+        return;
+      }
+
+      const stretchableRootLength = this.getOpaqueChainConveyorRootStretchLength(lengthAnchorZ, geometryBaseline);
+      if (stretchableRootLength > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON && Number.isFinite(stretchableRootLength)) {
+        stretchableRootLengths.push(stretchableRootLength);
+      }
+    };
+
+    OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (!nodeBaseline) {
+        return;
+      }
+      const lengthAnchorZ =
+        nodeName === OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME
+          ? this.getOpaqueChainConveyorBodyLengthAnchorZ(baseline, nodeBaseline, baseline.minimum.z)
+          : baseline.minimum.z;
+      captureStretchableLength(nodeBaseline, lengthAnchorZ);
+      nodeBaseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+        captureStretchableLength(
+          meshBaseline,
+          nodeName === OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME
+            ? this.getOpaqueChainConveyorBodyLengthAnchorZ(baseline, meshBaseline, baseline.minimum.z)
+            : baseline.minimum.z
+        );
+      });
+    });
+
+    if (stretchableRootLengths.length === 0) {
+      return Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, baseline.size.z);
+    }
+
+    const maximumSafeShrink = Math.min(...stretchableRootLengths) - MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON;
+    return Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, baseline.size.z - Math.max(0, maximumSafeShrink));
+  }
+
+  /** 链条机宽度按整机外包络处理，避免继续使用根节点 X 缩放。 */
+  private createOpaqueChainConveyorEffectiveWidth(baseline: OpaqueChainConveyorBaseline, requestedWidth: number): number {
+    return Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, requestedWidth, baseline.size.x * 0.05);
+  }
+
+  /** 根据节点处于宽度中心的哪一侧，计算刚体外移量。 */
+  private createOpaqueChainConveyorWidthOffset(
+    baseline: OpaqueChainConveyorBaseline,
+    nodeBaseline: OpaqueChainConveyorNodeBaseline,
+    widthDelta: number
+  ): number {
+    if (Math.abs(widthDelta) <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return 0;
+    }
+
+    const centerOffset = nodeBaseline.center.x - this.getOpaqueChainConveyorBaselineCenterX(baseline);
+    if (Math.abs(centerOffset) <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return 0;
+    }
+    return Math.sign(centerOffset) * widthDelta / 2;
+  }
+
+  /** 读取链条机整机基线宽度中心，避免把中心点额外写入 metadata。 */
+  private getOpaqueChainConveyorBaselineCenterX(baseline: OpaqueChainConveyorBaseline): number {
+    return (baseline.minimum.x + baseline.maximum.x) / 2;
+  }
+
+  /** 计算链条机中间驱动区的半宽，Box003 在这个区域内的顶点保持原始形状。 */
+  private getOpaqueChainConveyorDriveBayHalfWidth(baseline: OpaqueChainConveyorBaseline): number {
+    const motorBaseline = baseline.nodes.get(OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME);
+    const fromBody = baseline.size.x * OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_HALF_WIDTH_RATIO;
+    const fromMotor = (motorBaseline?.size.x ?? 0) * OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_MOTOR_WIDTH_RATIO;
+    return Math.max(fromBody, fromMotor, MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON);
+  }
+
+  /** 计算链条机中间驱动区的半深度，保护 DJ 前后驱动座不被长度参数拉斜。 */
+  private getOpaqueChainConveyorDriveBayHalfDepth(baseline: OpaqueChainConveyorBaseline): number {
+    const motorBaseline = baseline.nodes.get(OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME);
+    const fromBody = baseline.size.z * OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_HALF_DEPTH_RATIO;
+    const fromMotor = (motorBaseline?.size.z ?? 0) * OPAQUE_CHAIN_CONVEYOR_DRIVE_BAY_MOTOR_DEPTH_RATIO;
+    return Math.max(fromBody, fromMotor, MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON);
+  }
+
+  /** 取得 DJ 驱动段在根节点 Z 轴上的尾侧边界，Box003 只从这里之后开始承担长度增量。 */
+  private getOpaqueChainConveyorDriveBayTailRootZ(baseline: OpaqueChainConveyorBaseline): number | null {
+    const motorBaseline = baseline.nodes.get(OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME);
+    if (!motorBaseline) {
+      return null;
+    }
+    return motorBaseline.center.z + this.getOpaqueChainConveyorDriveBayHalfDepth(baseline);
+  }
+
+  /** Box003 长度锚点锁到 DJ 驱动段尾侧，避免中间电机座和支撑板被拉长。 */
+  private getOpaqueChainConveyorBodyLengthAnchorZ(
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    geometryBaseline: OpaqueChainConveyorLengthGeometryBaseline,
+    fallbackAnchorZ: number
+  ): number {
+    const driveBayTailZ = this.getOpaqueChainConveyorDriveBayTailRootZ(conveyorBaseline);
+    const requestedAnchorZ = driveBayTailZ === null ? fallbackAnchorZ : Math.max(fallbackAnchorZ, driveBayTailZ);
+    const nodeMinimumZ = geometryBaseline.center.z - geometryBaseline.size.z / 2;
+    const nodeMaximumZ = geometryBaseline.center.z + geometryBaseline.size.z / 2;
+    return Math.min(nodeMaximumZ, Math.max(nodeMinimumZ, requestedAnchorZ));
+  }
+
+  /** 判断顶点是否位于链条机中间驱动区，驱动区不能随长度或宽度参数被拉伸。 */
+  private isOpaqueChainConveyorDriveBayVertex(
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    geometryBaseline: OpaqueChainConveyorLengthGeometryBaseline,
+    xBounds: { minimum: number; maximum: number; center: number },
+    zBounds: { minimum: number; maximum: number; center: number },
+    sourceX: number,
+    sourceZ: number
+  ): boolean {
+    const motorBaseline = conveyorBaseline.nodes.get(OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME);
+    if (!motorBaseline) {
+      return false;
+    }
+
+    const rootX = this.mapOpaqueChainConveyorLengthVertexAxisToRootAxis(sourceX, geometryBaseline, xBounds, "x");
+    const rootZ = this.mapOpaqueChainConveyorLengthVertexAxisToRootAxis(sourceZ, geometryBaseline, zBounds, "z");
+    return (
+      Math.abs(rootX - motorBaseline.center.x) <= this.getOpaqueChainConveyorDriveBayHalfWidth(conveyorBaseline) &&
+      Math.abs(rootZ - motorBaseline.center.z) <= this.getOpaqueChainConveyorDriveBayHalfDepth(conveyorBaseline)
+    );
+  }
+
+  /** 对 Box003 应用长度延展，但保护中间驱动区，避免电机支撑和红框区域被拉长变形。 */
+  private applyOpaqueChainConveyorBodyLengthGeometryForNode(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorNodeBaseline,
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    lengthAnchorZ: number,
+    lengthDelta: number
+  ): void {
+    this.applyOpaqueChainConveyorBodyLengthGeometry(node, baseline, conveyorBaseline, lengthAnchorZ, lengthDelta);
+    baseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+      const mesh = this.resolveOpaqueChainConveyorLengthMesh(node, meshBaseline.path);
+      if (mesh) {
+        this.applyOpaqueChainConveyorBodyLengthGeometry(mesh, meshBaseline, conveyorBaseline, lengthAnchorZ, lengthDelta);
+      }
+    });
+  }
+
+  /** 对 Box003 应用宽度延展，但保护中间驱动区，避免电机支撑板随宽度被横向拉开。 */
+  private applyOpaqueChainConveyorBodyWidthGeometryForNode(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorNodeBaseline,
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    widthCenterX: number,
+    widthDelta: number
+  ): void {
+    this.applyOpaqueChainConveyorBodyWidthGeometry(node, baseline, conveyorBaseline, widthCenterX, widthDelta);
+    baseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+      const mesh = this.resolveOpaqueChainConveyorLengthMesh(node, meshBaseline.path);
+      if (mesh) {
+        this.applyOpaqueChainConveyorBodyWidthGeometry(mesh, meshBaseline, conveyorBaseline, widthCenterX, widthDelta);
+      }
+    });
+  }
+
+  /** 只让 Box003 内真正的长梁伸长，横梁、脚板和支撑脚按刚体平移保持原始形状。 */
+  private applyOpaqueChainConveyorBodyLengthGeometry(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    lengthAnchorZ: number,
+    lengthDelta: number
+  ): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices || !Number.isFinite(lengthAnchorZ) || !Number.isFinite(lengthDelta)) {
+      return;
+    }
+
+    const baselinePositionVertices = baseline.positionVertices;
+    const zBounds = this.getPositionVertexAxisBounds(baselinePositionVertices, "z");
+    const xBounds = this.getPositionVertexAxisBounds(baselinePositionVertices, "x");
+    if (!zBounds || !xBounds || baseline.size.z <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const bodyAnchorZ = this.getOpaqueChainConveyorBodyLengthAnchorZ(conveyorBaseline, baseline, lengthAnchorZ);
+    const anchorVertexZ = this.mapOpaqueChainConveyorRootZToLengthVertexZ(bodyAnchorZ, baseline, zBounds);
+    const stretchableRootLength = this.getOpaqueChainConveyorRootStretchLength(bodyAnchorZ, baseline);
+    if (stretchableRootLength <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const stretchRatio = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, stretchableRootLength + lengthDelta) / stretchableRootLength;
+    const nextPositions = baselinePositionVertices.slice();
+    const vertexUnitsPerRootUnit = (zBounds.maximum - zBounds.minimum) / baseline.size.z;
+    const rigidVertexDeltaZ = lengthDelta * vertexUnitsPerRootUnit;
+    this.createOpaqueChainConveyorMeshComponents(node, baselinePositionVertices).forEach((component) => {
+      if (component.maximum.z <= anchorVertexZ + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        return;
+      }
+      if (this.shouldStretchOpaqueChainConveyorBodyLengthComponent(component, zBounds)) {
+        component.vertexIndices.forEach((vertexIndex) => {
+          const positionIndex = vertexIndex * 3 + 2;
+          const sourceZ = baselinePositionVertices[positionIndex];
+          if (sourceZ > anchorVertexZ + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+            nextPositions[positionIndex] = anchorVertexZ + (sourceZ - anchorVertexZ) * stretchRatio;
+          }
+        });
+        return;
+      }
+      if (
+        component.center.z > anchorVertexZ + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON &&
+        !this.isOpaqueChainConveyorDriveBayComponent(conveyorBaseline, baseline, xBounds, zBounds, component)
+      ) {
+        component.vertexIndices.forEach((vertexIndex) => {
+          nextPositions[vertexIndex * 3 + 2] += rigidVertexDeltaZ;
+        });
+      }
+    });
+    node.setVerticesData(VertexBuffer.PositionKind, nextPositions, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 宽度变化时侧边小块按刚体外移，内部跨宽横梁/支撑也按 X 向延展，避免主体与导轨脱开架空。 */
+  private applyOpaqueChainConveyorBodyWidthGeometry(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    widthCenterX: number,
+    widthDelta: number
+  ): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices || !Number.isFinite(widthCenterX) || !Number.isFinite(widthDelta)) {
+      return;
+    }
+
+    const baselinePositionVertices = baseline.positionVertices;
+    const xBounds = this.getPositionVertexAxisBounds(baselinePositionVertices, "x");
+    const zBounds = this.getPositionVertexAxisBounds(baselinePositionVertices, "z");
+    if (!xBounds || !zBounds || baseline.size.x <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const currentPositions = node.getVerticesData(VertexBuffer.PositionKind, true, true);
+    if (!currentPositions || currentPositions.length !== baselinePositionVertices.length) {
+      return;
+    }
+
+    const anchorVertexX = this.mapOpaqueChainConveyorRootXToWidthVertexX(widthCenterX, baseline, xBounds);
+    const vertexUnitsPerRootUnit = (xBounds.maximum - xBounds.minimum) / baseline.size.x;
+    const vertexHalfDelta = widthDelta * vertexUnitsPerRootUnit / 2;
+    const nextPositions = Array.from(currentPositions, (position) => Number(position));
+    this.createOpaqueChainConveyorMeshComponents(node, baselinePositionVertices).forEach((component) => {
+      if (this.shouldProtectOpaqueChainConveyorDriveBayWidthComponent(conveyorBaseline, baseline, xBounds, zBounds, component)) {
+        return;
+      }
+
+      if (this.shouldMoveOpaqueChainConveyorBodyWidthComponent(component, xBounds)) {
+        const rootCenterX = this.mapOpaqueChainConveyorLengthVertexAxisToRootAxis(component.center.x, baseline, xBounds, "x");
+        const rootOffset = rootCenterX - widthCenterX;
+        if (Math.abs(rootOffset) <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+          return;
+        }
+        const vertexDeltaX = Math.sign(rootOffset) * vertexHalfDelta;
+        component.vertexIndices.forEach((vertexIndex) => {
+          nextPositions[vertexIndex * 3] += vertexDeltaX;
+        });
+        return;
+      }
+
+      if (!this.shouldStretchOpaqueChainConveyorBodyWidthComponent(component, xBounds)) {
+        return;
+      }
+
+      component.vertexIndices.forEach((vertexIndex) => {
+        const positionIndex = vertexIndex * 3;
+        const sourceX = baselinePositionVertices[positionIndex];
+        if (sourceX > anchorVertexX + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+          nextPositions[positionIndex] += vertexHalfDelta;
+        } else if (sourceX < anchorVertexX - MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+          nextPositions[positionIndex] -= vertexHalfDelta;
+        }
+      });
+    });
+    node.setVerticesData(VertexBuffer.PositionKind, nextPositions, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 按坐标焊接后的物理连通关系拆分 Mesh 顶点，避免 Box003 的支撑脚和横梁被面片级规则拆散。 */
+  private createOpaqueChainConveyorMeshComponents(
+    mesh: Mesh,
+    positionVertices: number[]
+  ): OpaqueChainConveyorMeshComponent[] {
+    const vertexCount = Math.floor(positionVertices.length / 3);
+    const indices = mesh.getIndices();
+    if (!indices || indices.length < 3 || vertexCount <= 0) {
+      return [this.createOpaqueChainConveyorMeshComponent([...Array(vertexCount).keys()], positionVertices)];
+    }
+
+    const parents = Array.from({ length: vertexCount }, (_, index) => index);
+    const find = (index: number): number => {
+      let current = index;
+      while (parents[current] !== current) {
+        parents[current] = parents[parents[current]];
+        current = parents[current];
+      }
+      return current;
+    };
+    const union = (left: number, right: number): void => {
+      if (left < 0 || right < 0 || left >= vertexCount || right >= vertexCount) {
+        return;
+      }
+      const leftRoot = find(left);
+      const rightRoot = find(right);
+      if (leftRoot !== rightRoot) {
+        parents[rightRoot] = leftRoot;
+      }
+    };
+
+    const weldedVertexByKey = new Map<string, number>();
+    for (let vertexIndex = 0; vertexIndex < vertexCount; vertexIndex += 1) {
+      const key = this.createOpaqueChainConveyorMeshComponentWeldKey(positionVertices, vertexIndex);
+      const weldedVertexIndex = weldedVertexByKey.get(key);
+      if (weldedVertexIndex === undefined) {
+        weldedVertexByKey.set(key, vertexIndex);
+      } else {
+        union(weldedVertexIndex, vertexIndex);
+      }
+    }
+
+    for (let index = 0; index + 2 < indices.length; index += 3) {
+      const first = Number(indices[index]);
+      const second = Number(indices[index + 1]);
+      const third = Number(indices[index + 2]);
+      union(first, second);
+      union(second, third);
+      union(third, first);
+    }
+
+    const componentVertices = new Map<number, number[]>();
+    for (let vertexIndex = 0; vertexIndex < vertexCount; vertexIndex += 1) {
+      const root = find(vertexIndex);
+      const vertices = componentVertices.get(root) ?? [];
+      vertices.push(vertexIndex);
+      componentVertices.set(root, vertices);
+    }
+
+    return [...componentVertices.values()]
+      .filter((vertices) => vertices.length > 0)
+      .map((vertices) => this.createOpaqueChainConveyorMeshComponent(vertices, positionVertices));
+  }
+
+  /** 为同坐标拆分顶点生成稳定焊接键，保证横梁、脚板等实体按整体参与参数化。 */
+  private createOpaqueChainConveyorMeshComponentWeldKey(positionVertices: number[], vertexIndex: number): string {
+    const positionIndex = vertexIndex * 3;
+    const normalize = (value: number): number => {
+      const coordinate = Number.isFinite(value) ? value : 0;
+      return Math.round(coordinate * OPAQUE_CHAIN_CONVEYOR_COMPONENT_WELD_PRECISION);
+    };
+    return [
+      normalize(positionVertices[positionIndex]),
+      normalize(positionVertices[positionIndex + 1]),
+      normalize(positionVertices[positionIndex + 2])
+    ].join("|");
+  }
+
+  /** 计算一个 Box003 物理连通块的局部包围盒，后续按块判断伸长或刚体平移。 */
+  private createOpaqueChainConveyorMeshComponent(
+    vertexIndices: number[],
+    positionVertices: number[]
+  ): OpaqueChainConveyorMeshComponent {
+    const minimum = new Vector3(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    const maximum = new Vector3(Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY);
+    vertexIndices.forEach((vertexIndex) => {
+      const positionIndex = vertexIndex * 3;
+      const x = positionVertices[positionIndex];
+      const y = positionVertices[positionIndex + 1];
+      const z = positionVertices[positionIndex + 2];
+      minimum.x = Math.min(minimum.x, x);
+      minimum.y = Math.min(minimum.y, y);
+      minimum.z = Math.min(minimum.z, z);
+      maximum.x = Math.max(maximum.x, x);
+      maximum.y = Math.max(maximum.y, y);
+      maximum.z = Math.max(maximum.z, z);
+    });
+
+    const center = minimum.add(maximum).scale(0.5);
+    return {
+      vertexIndices,
+      minimum,
+      maximum,
+      center,
+      size: maximum.subtract(minimum)
+    };
+  }
+
+  /** 只有沿长度方向占比足够大的 Box003 连通块才允许被拉长，其它支撑块保持刚体。 */
+  private shouldStretchOpaqueChainConveyorBodyLengthComponent(
+    component: OpaqueChainConveyorMeshComponent,
+    zBounds: { minimum: number; maximum: number; center: number }
+  ): boolean {
+    const meshLength = zBounds.maximum - zBounds.minimum;
+    return (
+      meshLength > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON &&
+      component.size.z >= meshLength * 0.45 &&
+      component.size.x <= Math.max(meshLength * 0.18, component.size.z * 0.2)
+    );
+  }
+
+  /** 宽度变化时侧边窄块作为刚体跟随边界移动，避免长梁和支撑小件截面被横向拉胖。 */
+  private shouldMoveOpaqueChainConveyorBodyWidthComponent(
+    component: OpaqueChainConveyorMeshComponent,
+    xBounds: { minimum: number; maximum: number; center: number }
+  ): boolean {
+    const meshWidth = xBounds.maximum - xBounds.minimum;
+    return meshWidth > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON && component.size.x <= meshWidth * 0.35;
+  }
+
+  /** 跨宽连通块需要随 chainWidth 顶点延展，否则两侧导轨外移后内部横梁会悬空。 */
+  private shouldStretchOpaqueChainConveyorBodyWidthComponent(
+    component: OpaqueChainConveyorMeshComponent,
+    xBounds: { minimum: number; maximum: number; center: number }
+  ): boolean {
+    const meshWidth = xBounds.maximum - xBounds.minimum;
+    return meshWidth > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON && component.size.x > meshWidth * 0.35;
+  }
+
+  /** DJ 驱动区内的紧凑小件保持原始位置和截面，跨宽件仍允许延展来连接新的主体宽度。 */
+  private shouldProtectOpaqueChainConveyorDriveBayWidthComponent(
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    geometryBaseline: OpaqueChainConveyorLengthGeometryBaseline,
+    xBounds: { minimum: number; maximum: number; center: number },
+    zBounds: { minimum: number; maximum: number; center: number },
+    component: OpaqueChainConveyorMeshComponent
+  ): boolean {
+    return (
+      this.shouldMoveOpaqueChainConveyorBodyWidthComponent(component, xBounds) &&
+      this.isOpaqueChainConveyorDriveBayComponent(conveyorBaseline, geometryBaseline, xBounds, zBounds, component)
+    );
+  }
+
+  /** 按连通块中心判断是否属于 DJ 中间驱动区，驱动段保持原始形状和位置。 */
+  private isOpaqueChainConveyorDriveBayComponent(
+    conveyorBaseline: OpaqueChainConveyorBaseline,
+    geometryBaseline: OpaqueChainConveyorLengthGeometryBaseline,
+    xBounds: { minimum: number; maximum: number; center: number },
+    zBounds: { minimum: number; maximum: number; center: number },
+    component: OpaqueChainConveyorMeshComponent
+  ): boolean {
+    return this.isOpaqueChainConveyorDriveBayVertex(
+      conveyorBaseline,
+      geometryBaseline,
+      xBounds,
+      zBounds,
+      component.center.x,
+      component.center.z
+    );
+  }
+
+  /** 对链条机命名节点及其真实子 Mesh 应用长度延展，兼容 Rail 节点导出为空包装的情况。 */
+  private applyOpaqueChainConveyorLengthGeometryForNode(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorNodeBaseline,
+    lengthAnchorZ: number,
+    lengthDelta: number
+  ): void {
+    this.applyOpaqueChainConveyorLengthGeometry(node, baseline, lengthAnchorZ, lengthDelta);
+    baseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+      const mesh = this.resolveOpaqueChainConveyorLengthMesh(node, meshBaseline.path);
+      if (mesh) {
+        this.applyOpaqueChainConveyorLengthGeometry(mesh, meshBaseline, lengthAnchorZ, lengthDelta);
+      }
+    });
+  }
+
+  /** 基于 -Z 固定起点拉伸链条机红框主体和长梁顶点，节点自身截面和非长度轴保持基线形状。 */
+  private applyOpaqueChainConveyorLengthGeometry(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    lengthAnchorZ: number,
+    lengthDelta: number
+  ): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices || !Number.isFinite(lengthAnchorZ) || !Number.isFinite(lengthDelta)) {
+      return;
+    }
+
+    const bounds = this.getPositionVertexAxisBounds(baseline.positionVertices, "z");
+    if (!bounds || baseline.size.z <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const anchorVertexZ = this.mapOpaqueChainConveyorRootZToLengthVertexZ(lengthAnchorZ, baseline, bounds);
+    const stretchableRootLength = this.getOpaqueChainConveyorRootStretchLength(lengthAnchorZ, baseline);
+    if (stretchableRootLength <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const stretchRatio = Math.max(MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON, stretchableRootLength + lengthDelta) / stretchableRootLength;
+    const nextPositions = baseline.positionVertices.slice();
+    for (let index = 2; index < nextPositions.length; index += 3) {
+      const sourceZ = baseline.positionVertices[index];
+      if (sourceZ > anchorVertexZ + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        nextPositions[index] = anchorVertexZ + (sourceZ - anchorVertexZ) * stretchRatio;
+      }
+    }
+    node.setVerticesData(VertexBuffer.PositionKind, nextPositions, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 对链条机主体及其真实子 Mesh 应用宽度延展，和长度延展可叠加。 */
+  private applyOpaqueChainConveyorWidthGeometryForNode(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorNodeBaseline,
+    widthCenterX: number,
+    widthDelta: number
+  ): void {
+    this.applyOpaqueChainConveyorWidthGeometry(node, baseline, widthCenterX, widthDelta);
+    baseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+      const mesh = this.resolveOpaqueChainConveyorLengthMesh(node, meshBaseline.path);
+      if (mesh) {
+        this.applyOpaqueChainConveyorWidthGeometry(mesh, meshBaseline, widthCenterX, widthDelta);
+      }
+    });
+  }
+
+  /** 保留链条机主体截面厚度，只把宽度中心两侧顶点分别外移或内移。 */
+  private applyOpaqueChainConveyorWidthGeometry(
+    node: TransformNode,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    widthCenterX: number,
+    widthDelta: number
+  ): void {
+    if (!(node instanceof Mesh) || !baseline.positionVertices || !Number.isFinite(widthCenterX) || !Number.isFinite(widthDelta)) {
+      return;
+    }
+
+    const bounds = this.getPositionVertexAxisBounds(baseline.positionVertices, "x");
+    if (!bounds || baseline.size.x <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return;
+    }
+
+    const currentPositions = node.getVerticesData(VertexBuffer.PositionKind, true, true);
+    if (!currentPositions || currentPositions.length !== baseline.positionVertices.length) {
+      return;
+    }
+
+    const anchorVertexX = this.mapOpaqueChainConveyorRootXToWidthVertexX(widthCenterX, baseline, bounds);
+    const vertexUnitsPerRootUnit = (bounds.maximum - bounds.minimum) / baseline.size.x;
+    const vertexHalfDelta = widthDelta * vertexUnitsPerRootUnit / 2;
+    const nextPositions = Array.from(currentPositions, (position) => Number(position));
+    for (let index = 0; index < nextPositions.length; index += 3) {
+      const sourceX = baseline.positionVertices[index];
+      if (sourceX > anchorVertexX + MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        nextPositions[index] += vertexHalfDelta;
+      } else if (sourceX < anchorVertexX - MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+        nextPositions[index] -= vertexHalfDelta;
+      }
+    }
+    node.setVerticesData(VertexBuffer.PositionKind, nextPositions, true);
+    node.refreshBoundingInfo(false, false);
+  }
+
+  /** 将根节点本地 X 宽度中心映射到主体 Mesh 顶点 X，用于分左右侧平移。 */
+  private mapOpaqueChainConveyorRootXToWidthVertexX(
+    rootX: number,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    bounds: { minimum: number; maximum: number; center: number }
+  ): number {
+    const nodeMinimumX = baseline.center.x - baseline.size.x / 2;
+    const nodeMaximumX = baseline.center.x + baseline.size.x / 2;
+    const clampedRootX = Math.min(nodeMaximumX, Math.max(nodeMinimumX, rootX));
+    const rootRatio = this.createSafeRatio(clampedRootX - nodeMinimumX, baseline.size.x);
+    return bounds.minimum + (bounds.maximum - bounds.minimum) * rootRatio;
+  }
+
+  /** 将链条机 Mesh 顶点局部轴坐标反推到根节点本地轴坐标，用于识别中间驱动区。 */
+  private mapOpaqueChainConveyorLengthVertexAxisToRootAxis(
+    vertexValue: number,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    bounds: { minimum: number; maximum: number; center: number },
+    axis: "x" | "z"
+  ): number {
+    const nodeMinimum = baseline.center[axis] - baseline.size[axis] / 2;
+    const rootRatio = this.createSafeRatio(vertexValue - bounds.minimum, bounds.maximum - bounds.minimum);
+    return nodeMinimum + baseline.size[axis] * rootRatio;
+  }
+
+  /** 计算根节点本地坐标下从固定锚点到该节点 +Z 尾端的可伸缩长度。 */
+  private getOpaqueChainConveyorRootStretchLength(
+    rootZ: number,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline
+  ): number {
+    if (baseline.size.z <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return 0;
+    }
+
+    const nodeMinimumZ = baseline.center.z - baseline.size.z / 2;
+    const nodeMaximumZ = baseline.center.z + baseline.size.z / 2;
+    const clampedRootZ = Math.min(nodeMaximumZ, Math.max(nodeMinimumZ, rootZ));
+    return nodeMaximumZ - clampedRootZ;
+  }
+
+  /** 将根节点本地 Z 锚点映射到红框主体和长梁 position 顶点 Z，用于只拉伸起点之后的顶点。 */
+  private mapOpaqueChainConveyorRootZToLengthVertexZ(
+    rootZ: number,
+    baseline: OpaqueChainConveyorLengthGeometryBaseline,
+    bounds: { minimum: number; maximum: number; center: number }
+  ): number {
+    const nodeMinimumZ = baseline.center.z - baseline.size.z / 2;
+    const nodeMaximumZ = baseline.center.z + baseline.size.z / 2;
+    const clampedRootZ = Math.min(nodeMaximumZ, Math.max(nodeMinimumZ, rootZ));
+    const rootRatio = this.createSafeRatio(clampedRootZ - nodeMinimumZ, baseline.size.z);
+    return bounds.minimum + (bounds.maximum - bounds.minimum) * rootRatio;
   }
 
   /** 当前辊道机 GLB 使用不透明 A 系列和 GT 系列命名，参数变化时按部件级规则更新，避免整体根缩放把模型拉伸变形。 */
@@ -9491,6 +10350,378 @@ export class BabylonEditorEngine {
     node.refreshBoundingInfo(false, false);
   }
 
+  /** 确保当前链条机拥有导入时节点基线，长度变化始终从该基线重新计算。 */
+  private ensureOpaqueChainConveyorBaseline(root: TransformNode): OpaqueChainConveyorBaseline | null {
+    this.makeOpaqueChainConveyorDeformableGeometryUnique(root);
+    const existing = this.readOpaqueChainConveyorBaseline(root);
+    if (existing) {
+      this.ensureOpaqueChainConveyorLengthGeometryBaseline(root, existing);
+      return existing;
+    }
+
+    this.disposeGeneratedChainConveyorNodes(root);
+    const baseline = this.captureOpaqueChainConveyorBaseline(root);
+    if (!baseline) {
+      return null;
+    }
+
+    this.persistOpaqueChainConveyorBaseline(root, baseline);
+    return baseline;
+  }
+
+  /** 兼容旧场景：基线缺少红框主体或长梁顶点时，从当前 GLB mesh 补齐原始顶点数据。 */
+  private ensureOpaqueChainConveyorLengthGeometryBaseline(root: TransformNode, baseline: OpaqueChainConveyorBaseline): void {
+    const nodesByName = this.getOpaqueChainConveyorNodesByName(root);
+    let changed = false;
+    OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.forEach((nodeName) => {
+      const nodeBaseline = baseline.nodes.get(nodeName);
+      if (!nodeBaseline || this.hasOpaqueChainConveyorLengthGeometryBaseline(nodeBaseline)) {
+        return;
+      }
+
+      const node = nodesByName.get(nodeName);
+      const positionVertices = node ? this.captureOpaqueChainConveyorLengthVertices(node, nodeName) : undefined;
+      if (positionVertices) {
+        nodeBaseline.positionVertices = positionVertices;
+        changed = true;
+        return;
+      }
+
+      const lengthMeshBaselines = node ? this.captureOpaqueChainConveyorLengthMeshBaselines(root, node, nodeName) : undefined;
+      if (lengthMeshBaselines?.length) {
+        nodeBaseline.lengthMeshBaselines = lengthMeshBaselines;
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      this.persistOpaqueChainConveyorBaseline(root, baseline);
+    }
+  }
+
+  /** 判断链条机命名节点是否已经有可用于长度重算的顶点基线。 */
+  private hasOpaqueChainConveyorLengthGeometryBaseline(baseline: OpaqueChainConveyorNodeBaseline): boolean {
+    return Boolean(baseline.positionVertices || baseline.lengthMeshBaselines?.length);
+  }
+
+  /** 捕获链条机原始节点局部状态和根节点本地包围盒，排除运行态补梁。 */
+  private captureOpaqueChainConveyorBaseline(root: TransformNode): OpaqueChainConveyorBaseline | null {
+    this.refreshNodeWorldMatrices(root);
+    const rootBounds = this.getOpaqueChainConveyorBaselineWorldBounds(root, true);
+    if (!rootBounds) {
+      return null;
+    }
+
+    const rootLocalBounds = this.worldBoundsToRootLocalBounds(root, rootBounds);
+    const nodes = new Map<string, OpaqueChainConveyorNodeBaseline>();
+    this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root && Boolean(node.name))
+      .map((node) => ({
+        node,
+        nodeName: this.getOpaqueChainConveyorCanonicalNodeName(node.name)
+      }))
+      .filter(({ nodeName }) => this.isOpaqueChainConveyorOriginalNodeName(nodeName))
+      .filter(({ node }) => !this.isGeneratedRuntimeNodeForBaseline(node))
+      .forEach(({ node, nodeName }) => {
+        const bounds = this.getOpaqueChainConveyorBaselineWorldBounds(node, true);
+        const localBounds = bounds ? this.worldBoundsToRootLocalBounds(root, bounds) : null;
+        const center = localBounds?.center ?? Vector3.Zero();
+        const nodeSize = localBounds?.size ?? Vector3.Zero();
+        const positionVertices = this.captureOpaqueChainConveyorLengthVertices(node, nodeName);
+        const lengthMeshBaselines = positionVertices
+          ? undefined
+          : this.captureOpaqueChainConveyorLengthMeshBaselines(root, node, nodeName);
+        nodes.set(nodeName, {
+          position: node.position.clone(),
+          scaling: node.scaling.clone(),
+          rotation: node.rotation.clone(),
+          rotationQuaternion: node.rotationQuaternion?.clone() ?? null,
+          enabled: typeof node.isEnabled === "function" ? node.isEnabled() : undefined,
+          center,
+          size: nodeSize,
+          positionVertices,
+          lengthMeshBaselines
+        });
+      });
+
+    return {
+      nodes,
+      minimum: rootLocalBounds.minimum,
+      maximum: rootLocalBounds.maximum,
+      size: rootLocalBounds.size
+    };
+  }
+
+  /** 读取链条机红框主体和长梁原始顶点，后续按局部 Z 延展而不是缩放整节点。 */
+  private captureOpaqueChainConveyorLengthVertices(
+    node: TransformNode,
+    nodeName: string
+  ): number[] | undefined {
+    if (!OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.includes(nodeName) || !(node instanceof Mesh)) {
+      return undefined;
+    }
+    return this.captureOpaqueChainConveyorMeshLengthVertices(node);
+  }
+
+  /** 捕获链条机命名包装节点下真实 Mesh 的原始顶点，解决 Rail 节点导出为空 TransformNode 时不伸长的问题。 */
+  private captureOpaqueChainConveyorLengthMeshBaselines(
+    root: TransformNode,
+    node: TransformNode,
+    nodeName: string
+  ): OpaqueChainConveyorLengthMeshBaseline[] | undefined {
+    if (!OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.includes(nodeName)) {
+      return undefined;
+    }
+
+    const baselines = this.getOpaqueChainConveyorLengthGeometryMeshes(node)
+      .map((mesh): OpaqueChainConveyorLengthMeshBaseline | null => {
+        const bounds = this.createNodeWorldBoundsFromMeshes([mesh]);
+        const localBounds = bounds ? this.worldBoundsToRootLocalBounds(root, bounds) : null;
+        const meshSize = localBounds?.size ?? Vector3.Zero();
+        const positionVertices = this.captureOpaqueChainConveyorMeshLengthVertices(mesh);
+        const path = this.createOpaqueChainConveyorLengthMeshPath(node, mesh);
+        if (!positionVertices || !path) {
+          return null;
+        }
+
+        return {
+          path,
+          center: localBounds?.center ?? Vector3.Zero(),
+          size: meshSize,
+          positionVertices
+        };
+      })
+      .filter((baseline): baseline is OpaqueChainConveyorLengthMeshBaseline => Boolean(baseline));
+
+    return baselines.length > 0 ? baselines : undefined;
+  }
+
+  /** 读取单个真实 Mesh 的原始 position 顶点，保留 GLB 局部单位以免叠加节点缩放后被压扁。 */
+  private captureOpaqueChainConveyorMeshLengthVertices(mesh: Mesh): number[] | undefined {
+    const positions = mesh.getVerticesData(VertexBuffer.PositionKind, true, true);
+    if (!positions || positions.length < 3 || positions.length % 3 !== 0) {
+      return undefined;
+    }
+    return Array.from(positions, (position) => Number(position));
+  }
+
+  /** 收集命名链条机节点下可直接改 position 顶点的 Mesh，不把运行态生成节点纳入基线。 */
+  private getOpaqueChainConveyorLengthGeometryMeshes(node: TransformNode): Mesh[] {
+    return node
+      .getChildMeshes(false)
+      .filter(
+        (mesh): mesh is Mesh =>
+          mesh instanceof Mesh &&
+          mesh.getTotalVertices() > 0 &&
+          !this.hasGeneratedRuntimeAncestorForBaseline(mesh, node)
+      );
+  }
+
+  /** 记录真实 Mesh 相对命名节点的层级索引路径，避免依赖子 Mesh 名称唯一。 */
+  private createOpaqueChainConveyorLengthMeshPath(owner: TransformNode, mesh: Mesh): string {
+    if (mesh === owner) {
+      return ".";
+    }
+
+    const segments: string[] = [];
+    let current: Node | null = mesh;
+    while (current && current !== owner) {
+      const parent: Node | null = current.parent;
+      if (!parent) {
+        return "";
+      }
+      const siblings = this.getSceneChildren(parent, true);
+      const index = siblings.indexOf(current);
+      if (index < 0) {
+        return "";
+      }
+      segments.unshift(String(index));
+      current = parent;
+    }
+    return current === owner ? segments.join("/") : "";
+  }
+
+  /** 按保存的层级索引路径找回真实 Mesh，用于保存重开、复制和阵列后的长度重算。 */
+  private resolveOpaqueChainConveyorLengthMesh(owner: TransformNode, path: string): Mesh | null {
+    if (path === ".") {
+      return owner instanceof Mesh ? owner : null;
+    }
+    if (!path) {
+      return null;
+    }
+
+    let current: Node = owner;
+    for (const segment of path.split("/")) {
+      const index = Number(segment);
+      if (!Number.isInteger(index) || index < 0) {
+        return null;
+      }
+      const child = this.getSceneChildren(current, true)[index];
+      if (!child) {
+        return null;
+      }
+      current = child;
+    }
+    return current instanceof Mesh ? current : null;
+  }
+
+  /** 把链条机基线写入 metadata，避免保存重开后把已延展姿态当作新基线。 */
+  private persistOpaqueChainConveyorBaseline(root: TransformNode, baseline: OpaqueChainConveyorBaseline): void {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...runtimeMetadata,
+        opaqueChainConveyorBaseline: this.createOpaqueChainConveyorBaselineMetadata(baseline)
+      }
+    });
+  }
+
+  /** 序列化链条机基线，复制模板和真实实例都复用同一格式，避免副本参数化失去基线。 */
+  private createOpaqueChainConveyorBaselineMetadata(baseline: OpaqueChainConveyorBaseline): Record<string, unknown> {
+    return {
+      version: OPAQUE_CHAIN_CONVEYOR_BASELINE_VERSION,
+      minimum: snapshotVector(baseline.minimum),
+      maximum: snapshotVector(baseline.maximum),
+      size: snapshotVector(baseline.size),
+      nodes: Object.fromEntries(
+        [...baseline.nodes.entries()].map(([name, node]) => [
+          name,
+          {
+            position: snapshotVector(node.position),
+            scaling: snapshotVector(node.scaling),
+            rotation: snapshotVector(node.rotation),
+            rotationQuaternion: node.rotationQuaternion ? this.snapshotQuaternion(node.rotationQuaternion) : null,
+            enabled: node.enabled,
+            center: snapshotVector(node.center),
+            size: snapshotVector(node.size),
+            ...(node.positionVertices ? { positionVertices: node.positionVertices } : {}),
+            ...(node.lengthMeshBaselines?.length
+              ? {
+                  lengthMeshBaselines: node.lengthMeshBaselines.map((meshBaseline) => ({
+                    path: meshBaseline.path,
+                    center: snapshotVector(meshBaseline.center),
+                    size: snapshotVector(meshBaseline.size),
+                    positionVertices: meshBaseline.positionVertices
+                  }))
+                }
+              : {})
+          }
+        ])
+      )
+    };
+  }
+
+  /** 从 metadata 读取链条机基线，格式损坏或节点集合不完整时返回空并重新捕获。 */
+  private readOpaqueChainConveyorBaseline(root: TransformNode): OpaqueChainConveyorBaseline | null {
+    const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
+    const baselineMetadata = this.asMetadataObject(runtimeMetadata.opaqueChainConveyorBaseline);
+    const nodeMetadata = this.asMetadataObject(baselineMetadata.nodes);
+    if (Number(baselineMetadata.version) !== OPAQUE_CHAIN_CONVEYOR_BASELINE_VERSION || Object.keys(nodeMetadata).length === 0) {
+      return null;
+    }
+
+    const minimum = this.readMetadataVector3(baselineMetadata.minimum);
+    const maximum = this.readMetadataVector3(baselineMetadata.maximum);
+    const size = this.readMetadataVector3(baselineMetadata.size);
+    if (!minimum || !maximum || !size) {
+      return null;
+    }
+
+    const nodes = new Map<string, OpaqueChainConveyorNodeBaseline>();
+    Object.entries(nodeMetadata).forEach(([name, value]) => {
+      if (!this.isOpaqueChainConveyorOriginalNodeName(name)) {
+        return;
+      }
+
+      const node = this.asMetadataObject(value);
+      const position = this.readMetadataVector3(node.position);
+      const scaling = this.readMetadataVector3(node.scaling);
+      const rotation = this.readMetadataVector3(node.rotation);
+      const center = this.readMetadataVector3(node.center);
+      const nodeSize = this.readMetadataVector3(node.size);
+      if (!position || !scaling || !rotation || !center || !nodeSize) {
+        return;
+      }
+
+      const positionVertices = this.readMetadataNumberArray(node.positionVertices);
+      const lengthMeshBaselines = Array.isArray(node.lengthMeshBaselines)
+        ? node.lengthMeshBaselines
+            .map((item): OpaqueChainConveyorLengthMeshBaseline | null => {
+              const meshBaseline = this.asMetadataObject(item);
+              const path = typeof meshBaseline.path === "string" ? meshBaseline.path : "";
+              const meshCenter = this.readMetadataVector3(meshBaseline.center);
+              const meshSize = this.readMetadataVector3(meshBaseline.size);
+              const meshPositionVertices = this.readMetadataNumberArray(meshBaseline.positionVertices);
+              if (!path || !meshCenter || !meshSize || !meshPositionVertices) {
+                return null;
+              }
+              return {
+                path,
+                center: meshCenter,
+                size: meshSize,
+                positionVertices: meshPositionVertices
+              };
+            })
+            .filter((item): item is OpaqueChainConveyorLengthMeshBaseline => Boolean(item))
+        : undefined;
+      nodes.set(name, {
+        position,
+        scaling,
+        rotation,
+        rotationQuaternion: this.readMetadataQuaternion(node.rotationQuaternion),
+        enabled: typeof node.enabled === "boolean" ? node.enabled : undefined,
+        center,
+        size: nodeSize,
+        positionVertices,
+        lengthMeshBaselines: lengthMeshBaselines?.length ? lengthMeshBaselines : undefined
+      });
+    });
+
+    const availableNodeNames = new Set(this.getNodeHierarchy(root).map((node) => this.getOpaqueChainConveyorCanonicalNodeName(node.name)));
+    const requiredNodeNames = OPAQUE_CHAIN_CONVEYOR_BASELINE_REQUIRED_NODE_NAMES.filter((name) => availableNodeNames.has(name));
+    return requiredNodeNames.every((name) => nodes.has(name))
+      ? { nodes, minimum, maximum, size }
+      : null;
+  }
+
+  /** 将链条机所有已知原始节点恢复到基线状态，再按当前参数重新应用。 */
+  private restoreOpaqueChainConveyorBaseline(root: TransformNode, baseline: OpaqueChainConveyorBaseline): void {
+    const nodesByName = this.getOpaqueChainConveyorNodesByName(root);
+    baseline.nodes.forEach((nodeBaseline, nodeName) => {
+      const node = nodesByName.get(nodeName);
+      if (!node) {
+        return;
+      }
+
+      node.position.copyFrom(nodeBaseline.position);
+      node.scaling.copyFrom(nodeBaseline.scaling);
+      node.rotation.copyFrom(nodeBaseline.rotation);
+      node.rotationQuaternion = nodeBaseline.rotationQuaternion?.clone() ?? null;
+      this.restoreOpaqueChainConveyorLengthVertices(node, nodeBaseline);
+      if (nodeBaseline.enabled !== undefined && typeof node.setEnabled === "function") {
+        node.setEnabled(nodeBaseline.enabled);
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
+  }
+
+  /** 每次重新应用链条机长度前恢复红框主体和长梁原始顶点，避免连续输入时重复延展。 */
+  private restoreOpaqueChainConveyorLengthVertices(node: TransformNode, baseline: OpaqueChainConveyorNodeBaseline): void {
+    if (node instanceof Mesh && baseline.positionVertices) {
+      node.setVerticesData(VertexBuffer.PositionKind, baseline.positionVertices, true);
+      node.refreshBoundingInfo(false, false);
+    }
+
+    baseline.lengthMeshBaselines?.forEach((meshBaseline) => {
+      const mesh = this.resolveOpaqueChainConveyorLengthMesh(node, meshBaseline.path);
+      if (!mesh) {
+        return;
+      }
+      mesh.setVerticesData(VertexBuffer.PositionKind, meshBaseline.positionVertices, true);
+      mesh.refreshBoundingInfo(false, false);
+    });
+  }
+
   /** 清除不应跨模型包替换复用的 opaque 辊道机运行态基线和自动参数记录。 */
   private clearOpaqueRollerConveyorRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
     delete runtimeMetadata.opaqueRollerConveyorBaseline;
@@ -9504,6 +10735,16 @@ export class BabylonEditorEngine {
   private clearOpaqueRollerConveyorCloneRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
     delete runtimeMetadata.opaqueRollerConveyorBaseline;
     delete runtimeMetadata.opaqueRollerConveyorAutoRollerCount;
+  }
+
+  /** 清除链条机模型包替换时不应继承的运行态基线。 */
+  private clearOpaqueChainConveyorRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
+    delete runtimeMetadata.opaqueChainConveyorBaseline;
+  }
+
+  /** 克隆链条机实例时清除几何基线，让副本用自己的 GLB 节点重新捕获。 */
+  private clearOpaqueChainConveyorCloneRuntimeMetadata(runtimeMetadata: Record<string, unknown>): void {
+    delete runtimeMetadata.opaqueChainConveyorBaseline;
   }
 
   /** 基线只能来自 GLB 原始节点，运行态克隆和脚本生成节点都不能参与。 */
@@ -9520,6 +10761,26 @@ export class BabylonEditorEngine {
   /** 当前 opaque 辊道机 GLB 的真实物理节点命名，只保留这些节点进入部件级基线。 */
   private isOpaqueRollerConveyorOriginalNodeName(nodeName: string): boolean {
     return /^(A\d+|GT\d+)$/i.test(nodeName);
+  }
+
+  /** 当前 opaque 链条机 GLB 的原始物理节点命名，只保留这些节点进入基线。 */
+  private isOpaqueChainConveyorOriginalNodeName(nodeName: string): boolean {
+    return (
+      nodeName === OPAQUE_CHAIN_CONVEYOR_BODY_NODE_NAME ||
+      nodeName === OPAQUE_CHAIN_CONVEYOR_MOTOR_NODE_NAME ||
+      OPAQUE_CHAIN_CONVEYOR_LENGTH_GEOMETRY_NODE_NAMES.includes(nodeName) ||
+      OPAQUE_CHAIN_CONVEYOR_TAIL_FOLLOW_NODE_NAMES.includes(nodeName)
+    );
+  }
+
+  /** 兼容旧复制体：Babylon 曾把子节点改成“副本根名.原节点名”，链条机规则统一按末段原名索引。 */
+  private getOpaqueChainConveyorCanonicalNodeName(nodeName: string): string {
+    if (this.isOpaqueChainConveyorOriginalNodeName(nodeName)) {
+      return nodeName;
+    }
+
+    const suffix = nodeName.slice(nodeName.lastIndexOf(".") + 1);
+    return this.isOpaqueChainConveyorOriginalNodeName(suffix) ? suffix : nodeName;
   }
 
   /** 去掉模型包 runtime 写到根节点的参数化缩放，保留用户在编辑器里手动设置的缩放。 */
@@ -9541,6 +10802,27 @@ export class BabylonEditorEngine {
     return changed;
   }
 
+  /** 只去掉模型包 runtime 写到根节点指定轴的参数化缩放，保留其它参数轴的既有行为。 */
+  private resetModelPackageRootParametricAxisScaling(root: TransformNode, axis: "x" | "y" | "z"): boolean {
+    const parametricRootScaling = this.getModelPackageParametricRootScaling(root);
+    const axisScale = parametricRootScaling[axis];
+    if (!Number.isFinite(axisScale) || Math.abs(axisScale - 1) <= MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON) {
+      return false;
+    }
+
+    root.scaling[axis] = Math.abs(axisScale) > MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON ? root.scaling[axis] / axisScale : root.scaling[axis];
+    const nextParametricRootScaling = parametricRootScaling.clone();
+    nextParametricRootScaling[axis] = 1;
+    this.mergeNodeEditorMetadata(root, {
+      modelPackageRuntime: {
+        ...this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime),
+        parametricRootScaling: snapshotVector(nextParametricRootScaling)
+      }
+    });
+    this.refreshNodeWorldMatrices(root);
+    return true;
+  }
+
   /** 获取 opaque 辊道机子节点名称索引，当前 GLB 的 A 系列和 GT 系列名称唯一。 */
   private getOpaqueRollerConveyorNodesByName(root: TransformNode): Map<string, TransformNode> {
     return new Map(
@@ -9548,6 +10830,20 @@ export class BabylonEditorEngine {
         .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
         .map((node) => [node.name, node])
     );
+  }
+
+  /** 获取 opaque 链条机子节点名称索引，当前 GLB 的节点名唯一且数量很少。 */
+  private getOpaqueChainConveyorNodesByName(root: TransformNode): Map<string, TransformNode> {
+    const nodesByName = new Map<string, TransformNode>();
+    this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
+      .forEach((node) => {
+        const nodeName = this.getOpaqueChainConveyorCanonicalNodeName(node.name);
+        if (this.isOpaqueChainConveyorOriginalNodeName(nodeName) && !nodesByName.has(nodeName)) {
+          nodesByName.set(nodeName, node);
+        }
+      });
+    return nodesByName;
   }
 
   /** 在整体基线中心周围按比例移动坐标，不改变节点自身非对应轴尺寸。 */
@@ -10037,6 +11333,49 @@ export class BabylonEditorEngine {
     ].every((name) => names.has(name));
   }
 
+  /** 判断当前根节点是否是需要链条机长度兜底的模型包实例。 */
+  private isOpaqueChainConveyorPackage(root: TransformNode): boolean {
+    return this.hasOpaqueChainConveyorNodeSet(root);
+  }
+
+  /** 检查链条机 GLB 的固定节点集合，防止链条机规则误命中其它输送设备。 */
+  private hasOpaqueChainConveyorNodeSet(root: TransformNode): boolean {
+    const names = new Set(
+      this.getNodeHierarchy(root)
+        .filter((node) => node instanceof TransformNode)
+        .map((node) => this.getOpaqueChainConveyorCanonicalNodeName(node.name))
+    );
+    return OPAQUE_CHAIN_CONVEYOR_REQUIRED_NODE_NAMES.every((name) => names.has(name));
+  }
+
+  /** 计算链条机基线包围盒，排除运行态补梁及其子网格。 */
+  private getOpaqueChainConveyorBaselineWorldBounds(node: TransformNode, includeDisabled = false): NodeWorldBounds | null {
+    const meshes = this.getEditableMeshes(node).filter(
+      (mesh) =>
+        mesh.getTotalVertices() > 0 &&
+        (includeDisabled || mesh.isEnabled()) &&
+        !this.hasGeneratedRuntimeAncestorForBaseline(mesh, node)
+    );
+    return this.createNodeWorldBoundsFromMeshes(meshes);
+  }
+
+  /** 清理旧版本链条机长度兜底生成的临时补板，避免它继续影响基线和保存。 */
+  private disposeGeneratedChainConveyorNodes(root: TransformNode): void {
+    const generatedNodes = this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root)
+      .filter((node) => {
+        const metadata = this.asMetadataObject(node.metadata);
+        return metadata.generatedByParametricRuntime === true && metadata.reason === OPAQUE_CHAIN_CONVEYOR_EXTENSION_REASON;
+      });
+    const materials = new Set<Material>();
+    generatedNodes.forEach((node) => {
+      const meshes = node instanceof AbstractMesh ? [node, ...node.getChildMeshes()] : node.getChildMeshes();
+      meshes.forEach((mesh) => this.collectMaterialTree(mesh.material, materials));
+    });
+    generatedNodes.forEach((node) => node.dispose(false, false));
+    this.disposeUnusedMaterials(materials);
+  }
+
   /** 按精确节点名切换支架可见性，返回是否真的改变了节点启用状态。 */
   private setNamedSupportNodesEnabled(root: TransformNode, nodeNames: string[], enabled: boolean): boolean {
     const nodesByName = new Map(
@@ -10460,6 +11799,9 @@ export class BabylonEditorEngine {
       this.normalizeModelPackageRootForLifecycle(root);
       if (manifest && this.isOpaqueRollerConveyorPackage(root)) {
         this.ensureOpaqueRollerConveyorBaseline(root);
+      }
+      if (manifest && this.isOpaqueChainConveyorPackage(root)) {
+        this.ensureOpaqueChainConveyorBaseline(root);
       }
       warning = action();
       if (mode === "stop") {
