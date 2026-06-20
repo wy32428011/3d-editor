@@ -102,7 +102,12 @@ import {
   EDITOR_GRID_SIZE_METERS,
   SCENE_UNIT_IN_METERS
 } from "../editor/units";
-import { DEFAULT_LOCATOR_ANIMATION_CONNECTION, DEFAULT_SCENE_DATA_DRIVEN, DEFAULT_SCENE_EDITOR_SETTINGS } from "../types/editor";
+import {
+  DEFAULT_LOCATOR_ANIMATION_CONNECTION,
+  DEFAULT_LOCATOR_DIMENSIONS,
+  DEFAULT_SCENE_DATA_DRIVEN,
+  DEFAULT_SCENE_EDITOR_SETTINGS
+} from "../types/editor";
 import type {
   AssetInfoSnapshot,
   AssetLibraryFocusTarget,
@@ -117,6 +122,9 @@ import type {
   MeshVertexModifySnapshot,
   LocatorAnimationConnectionSnapshot,
   LocatorAnimationConnectionUpdate,
+  LocatorDimensionsSnapshot,
+  LocatorDimensionsUpdate,
+  ModelArrayAxis,
   ModelArrayOptions,
   ModelArrayResult,
   ModelDataDrivenDefinition,
@@ -168,6 +176,7 @@ const GRID_VIEWPORT_PADDING_FACTOR = 0.9;
 const GRID_RECENTER_THRESHOLD_CELLS = 8;
 const GRID_RESIZE_HYSTERESIS = 0.35;
 const GRID_FLASH_PERIOD_MS = 1200;
+const MIN_LOCATOR_DIMENSION_METERS = 0.01;
 const GRID_FLASH_MIN_VISIBILITY = 0.32;
 const GRID_FLASH_MAX_VISIBILITY = 1;
 const GRID_FLASH_PULSE_ELEVATION_OFFSET_METERS = 0.026;
@@ -182,6 +191,10 @@ const MAX_MODEL_PACKAGE_RUNTIME_GENERATED_NODES = 5000;
 const MODEL_PACKAGE_PARAMETRIC_SCALE_EPSILON = 0.000001;
 const MAX_MODEL_ARRAY_CLONE_COUNT = 50;
 const MODEL_ARRAY_MIN_AUTO_STEP_METERS = 0.000001;
+const MAX_MODEL_ARRAY_SPACING_METERS = 100000;
+const SHELF_MODEL_KEY = "shelf";
+const SHELF_ARRAY_SHARED_SUPPORT_NODE_NAMES = ["Box004", "Box001", "Box002", "Box003", "node5", "node7", "node9", "node11"];
+const SHELF_ARRAY_RUNTIME_NAME_SUFFIX_PATTERN = /_(?:shelf_layer|shelf_column|double_deep).*$/i;
 const OPAQUE_ROLLER_CONVEYOR_ROLLER_NODE_NAMES = ["GT1", "GT2", "GT3", "GT4", "GT5", "GT6", "GT7", "GT8", "GT9", "GT10"];
 const OPAQUE_ROLLER_CONVEYOR_FRONT_SUPPORT_NODE_NAMES = ["A16", "A7", "A3", "A5", "A17"];
 const OPAQUE_ROLLER_CONVEYOR_REAR_SUPPORT_NODE_NAMES = ["A18", "A19", "A4", "A2", "A6"];
@@ -2604,10 +2617,16 @@ export class BabylonEditorEngine {
       return this.createModelArrayFailure(`克隆数量必须是 1-${MAX_MODEL_ARRAY_CLONE_COUNT} 之间的整数。`);
     }
 
+    const modelSpacing = options.spacing;
+    if (!Number.isFinite(modelSpacing) || modelSpacing < 0 || modelSpacing > MAX_MODEL_ARRAY_SPACING_METERS) {
+      return this.createModelArrayFailure(`模型间距必须是 0-${MAX_MODEL_ARRAY_SPACING_METERS} 米之间的数字。`);
+    }
+
     const sourceRoot = this.getModelArrayTargetRoot(this.findTransformNodeByUniqueId(options.targetId));
     if (!sourceRoot) {
       return this.createModelArrayFailure("当前选择不可创建模型阵列，请选择未锁定的普通模型。");
     }
+    const sourceModelPackage = this.getModelPackageAssetForRoot(sourceRoot)?.modelPackage;
 
     const directionByAxis: Partial<Record<string, Vector3>> = {
       x: new Vector3(1, 0, 0),
@@ -2625,14 +2644,14 @@ export class BabylonEditorEngine {
       return this.createModelArrayFailure("当前模型没有可用于自动贴边阵列的可渲染包围盒。");
     }
 
-    const autoStep = options.axis === "x" || options.axis === "-x" ? sourceBounds.size.x : sourceBounds.size.z;
+    const autoStep = this.calculateModelArrayBaseStep(sourceRoot, sourceBounds, options.axis, sourceModelPackage);
     if (!Number.isFinite(autoStep) || autoStep <= MODEL_ARRAY_MIN_AUTO_STEP_METERS) {
       const axisLabel = options.axis === "x" || options.axis === "-x" ? "X" : "Z";
       return this.createModelArrayFailure(`当前模型在 ${axisLabel} 方向尺寸过小，无法自动贴边阵列。`);
     }
+    const arrayStep = autoStep + modelSpacing;
 
     const sourceParent = sourceRoot.parent instanceof TransformNode ? sourceRoot.parent : null;
-    const sourceModelPackage = this.getModelPackageAssetForRoot(sourceRoot)?.modelPackage;
     const usedAssetCodes = this.collectSceneAssetCodes();
     const sourceAssetCode = this.getNodeAssetInfo(sourceRoot).assetCode.trim();
     const clones: TransformNode[] = [];
@@ -2656,7 +2675,7 @@ export class BabylonEditorEngine {
         this.prepareClonedHierarchy(clone, sourceRoot, false);
         clone.name = cloneName;
         clone.setEnabled(true);
-        const worldOffset = direction.scale(autoStep * index);
+        const worldOffset = direction.scale(arrayStep * index);
         clone.position.addInPlace(this.worldDeltaToParentLocalDelta(clone, worldOffset));
         if (sourceAssetCode) {
           this.updateNodeAssetInfo(clone, {
@@ -5296,6 +5315,10 @@ export class BabylonEditorEngine {
       this.updateLocatorAnimationConnection(node, update.locatorAnimationConnection);
     }
 
+    if (transformEditable && update.locatorDimensions && this.isLocatorWireCubeNode(node)) {
+      this.updateLocatorDimensions(node, update.locatorDimensions);
+    }
+
     return graphDirty;
   }
 
@@ -5312,6 +5335,7 @@ export class BabylonEditorEngine {
       update.assetInfo !== undefined ||
       update.meshVertexModify !== undefined ||
       update.locatorAnimationConnection !== undefined ||
+      update.locatorDimensions !== undefined ||
       update.poi !== undefined ||
       update.dynamicParameter !== undefined
     );
@@ -5704,6 +5728,14 @@ export class BabylonEditorEngine {
           });
           if (node.metadata?.cadDrawing) {
             this.applyCadDisplayOpacity(node, this.getCadDisplayOpacity(node));
+          }
+          if (this.isLocatorWireCubeNode(node)) {
+            const locatorDimensions = this.getLocatorDimensions(node);
+            this.mergeNodeEditorMetadata(node, {
+              locatorDimensions,
+              locatorAnimationConnection: this.getLocatorAnimationConnection(node)
+            });
+            this.applyLocatorDimensionsToNode(node, locatorDimensions);
           }
         }
       });
@@ -6479,6 +6511,98 @@ export class BabylonEditorEngine {
     };
   }
 
+  /** 计算模型阵列的基础步长；Shelf 沿 X 阵列时按支架中心距对齐，让 0 间距表示中间立柱重合。 */
+  private calculateModelArrayBaseStep(
+    sourceRoot: TransformNode,
+    sourceBounds: NodeWorldBounds,
+    axis: ModelArrayAxis,
+    sourceModelPackage: ModelPackageManifest | undefined
+  ): number {
+    const fallbackStep = axis === "x" || axis === "-x" ? sourceBounds.size.x : sourceBounds.size.z;
+    if (axis !== "x" && axis !== "-x") {
+      return fallbackStep;
+    }
+
+    return this.calculateShelfModelArrayPitch(sourceRoot, sourceModelPackage) ?? fallbackStep;
+  }
+
+  /** Shelf 货架阵列复用模型包内部列距语义，优先用当前世界坐标里的左右支架中心距。 */
+  private calculateShelfModelArrayPitch(root: TransformNode, manifest: ModelPackageManifest | undefined): number | null {
+    if (!this.isShelfModelPackageRoot(root, manifest)) {
+      return null;
+    }
+
+    const supportCenters = this.collectShelfArraySupportCenters(root);
+    if (supportCenters.length >= 2) {
+      const pitch = Math.max(...supportCenters) - Math.min(...supportCenters);
+      if (Number.isFinite(pitch) && pitch > MODEL_ARRAY_MIN_AUTO_STEP_METERS) {
+        return pitch;
+      }
+    }
+
+    const values = manifest ? this.getModelPackageValues(root, manifest) : this.getRawModelPackageValues(root);
+    const cellWidth = Number(values.cellWidth);
+    const columnCount = Math.max(1, Math.round(Number(values.columnCount) || 1));
+    const fallbackPitch = cellWidth * columnCount;
+    return Number.isFinite(fallbackPitch) && fallbackPitch > MODEL_ARRAY_MIN_AUTO_STEP_METERS ? fallbackPitch : null;
+  }
+
+  /** 判断当前模型包是否是 Shelf；只对明确携带 shelf 标识的模型包启用支架中心距阵列。 */
+  private isShelfModelPackageRoot(root: TransformNode, manifest: ModelPackageManifest | undefined): boolean {
+    const instance = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageInstance);
+    if (!manifest && (typeof instance.packageId !== "string" || typeof instance.assetId !== "string")) {
+      return false;
+    }
+
+    const values = manifest ? this.getModelPackageValues(root, manifest) : this.getRawModelPackageValues(root);
+    if (String(values.modelKey ?? "").trim().toLowerCase() === SHELF_MODEL_KEY) {
+      return true;
+    }
+
+    const hints = [
+      manifest?.packageId,
+      manifest?.displayName,
+      manifest?.rootDirectoryName,
+      manifest?.primaryModelFile,
+      manifest?.scriptFile,
+      manifest?.runtimeScriptFile,
+      manifest?.sourceRoot,
+      this.getNodeSourceFileName(root)
+    ];
+    return hints.some((hint) => this.isShelfModelPackageHint(hint));
+  }
+
+  /** 识别模型包 manifest 中的 shelf 路径或文件名，避免普通用户命名误触发。 */
+  private isShelfModelPackageHint(value: string | undefined): boolean {
+    return Boolean(value && /(?:^|[\\/_.\-\s])shelf(?:[\\/_.\-\s]|$)/i.test(value));
+  }
+
+  /** 收集 Shelf 左右支架中心点，去重后用于判断相邻货架应重合的边界中心线。 */
+  private collectShelfArraySupportCenters(root: TransformNode): number[] {
+    const centers = this.getNodeHierarchy(root)
+      .filter((node): node is TransformNode => node instanceof TransformNode && node !== root && this.isShelfArraySupportNode(node))
+      .map((node) => this.getNodeWorldBounds(node, true)?.center.x)
+      .filter((center): center is number => typeof center === "number" && Number.isFinite(center))
+      .sort((left, right) => left - right);
+
+    return centers.filter((center, index) => index === 0 || Math.abs(center - centers[index - 1]) > MODEL_ARRAY_MIN_AUTO_STEP_METERS);
+  }
+
+  /** Shelf 支架节点可能来自原始 GLB 名、运行时 sourceNodeName 或克隆名前缀，统一按名称片段识别。 */
+  private isShelfArraySupportNode(node: Node): boolean {
+    const metadata = this.asMetadataObject(node.metadata);
+    const parentName = node.parent ? node.parent.name : "";
+    const candidates = [metadata.sourceNodeName, node.name, parentName].filter((value): value is string => typeof value === "string");
+    return candidates.some((candidate) => {
+      const tokens = candidate
+        .replace(SHELF_ARRAY_RUNTIME_NAME_SUFFIX_PATTERN, "")
+        .split(/[._\s-]+/)
+        .map((token) => token.trim().toLowerCase())
+        .filter(Boolean);
+      return SHELF_ARRAY_SHARED_SUPPORT_NODE_NAMES.some((supportName) => tokens.includes(supportName.toLowerCase()));
+    });
+  }
+
   /** 收敛模型阵列目标，只允许普通 Mesh/Transform 模型进入批量克隆流程。 */
   private getModelArrayTargetRoot(node: TransformNode | null | undefined): TransformNode | null {
     const root = node ? this.findModelPackageRoot(node) ?? node : null;
@@ -7237,6 +7361,7 @@ export class BabylonEditorEngine {
 
     if (kind === "locatorWireCube") {
       this.mergeNodeEditorMetadata(mesh, {
+        locatorDimensions: DEFAULT_LOCATOR_DIMENSIONS,
         locatorAnimationConnection: DEFAULT_LOCATOR_ANIMATION_CONNECTION
       });
     }
@@ -7284,16 +7409,30 @@ export class BabylonEditorEngine {
 
   /** 创建只包含 12 条边的定位线框，底面以局部原点贴地，便于把货物手动摆入框内。 */
   private createLocatorWireCubeMesh(name: string): LinesMesh {
-    const size = DEFAULT_BOX_SIZE_METERS;
-    const halfSize = size / 2;
+    const lineSystem = MeshBuilder.CreateLineSystem(
+      name,
+      { lines: this.createLocatorWireCubeLines(DEFAULT_LOCATOR_DIMENSIONS), updatable: true },
+      this.scene
+    );
+    lineSystem.color = Color3.FromHexString("#72d6ff");
+    lineSystem.alpha = 0.95;
+    lineSystem.intersectionThreshold = 0.08;
+    lineSystem.alwaysSelectAsActiveMesh = true;
+    return lineSystem;
+  }
+
+  /** 按定位框长宽高生成 12 条边；长对应 X 轴，宽对应 Z 轴，高对应 Y 轴。 */
+  private createLocatorWireCubeLines(dimensions: LocatorDimensionsSnapshot): Vector3[][] {
+    const halfLength = dimensions.length / 2;
+    const halfWidth = dimensions.width / 2;
     const bottomCorners = [
-      new Vector3(-halfSize, 0, -halfSize),
-      new Vector3(halfSize, 0, -halfSize),
-      new Vector3(halfSize, 0, halfSize),
-      new Vector3(-halfSize, 0, halfSize)
+      new Vector3(-halfLength, 0, -halfWidth),
+      new Vector3(halfLength, 0, -halfWidth),
+      new Vector3(halfLength, 0, halfWidth),
+      new Vector3(-halfLength, 0, halfWidth)
     ];
-    const topCorners = bottomCorners.map((corner) => corner.add(new Vector3(0, size, 0)));
-    const lines = [
+    const topCorners = bottomCorners.map((corner) => corner.add(new Vector3(0, dimensions.height, 0)));
+    return [
       [bottomCorners[0], bottomCorners[1]],
       [bottomCorners[1], bottomCorners[2]],
       [bottomCorners[2], bottomCorners[3]],
@@ -7307,12 +7446,13 @@ export class BabylonEditorEngine {
       [bottomCorners[2], topCorners[2]],
       [bottomCorners[3], topCorners[3]]
     ];
-    const lineSystem = MeshBuilder.CreateLineSystem(name, { lines }, this.scene);
-    lineSystem.color = Color3.FromHexString("#72d6ff");
-    lineSystem.alpha = 0.95;
-    lineSystem.intersectionThreshold = 0.08;
-    lineSystem.alwaysSelectAsActiveMesh = true;
-    return lineSystem;
+  }
+
+  /** 把定位框线段端点展开为 position buffer，兼容旧场景中非 updatable 的 LinesMesh。 */
+  private flattenLocatorWireCubeLinePositions(dimensions: LocatorDimensionsSnapshot): number[] {
+    return this.createLocatorWireCubeLines(dimensions).flatMap((line) =>
+      line.flatMap((point) => [point.x, point.y, point.z])
+    );
   }
 
   /** 创建默认材质，让新增物体在深色视口里有清晰轮廓。 */
@@ -8481,7 +8621,8 @@ export class BabylonEditorEngine {
       dynamicParameters: this.getNodeDynamicParameters(node),
       poi: this.isPoiNode(node) ? this.getNodePoiConfig(node) : undefined,
       poiRuntime: this.isPoiNode(node) ? this.sceneBusinessRuntime.getPoiRuntimeState(node) : undefined,
-      locatorAnimationConnection: this.isLocatorWireCubeNode(node) ? this.getLocatorAnimationConnection(node) : undefined
+      locatorAnimationConnection: this.isLocatorWireCubeNode(node) ? this.getLocatorAnimationConnection(node) : undefined,
+      locatorDimensions: this.isLocatorWireCubeNode(node) ? this.getLocatorDimensions(node) : undefined
     };
   }
 
@@ -10611,6 +10752,27 @@ export class BabylonEditorEngine {
     };
   }
 
+  /** 读取定位框几何尺寸，旧场景缺失字段时回退到默认 1.5m 立方框。 */
+  private getLocatorDimensions(node: TransformNode): LocatorDimensionsSnapshot {
+    const editorMetadata = this.getNodeEditorMetadata(node);
+    return this.normalizeLocatorDimensions(this.asMetadataObject(editorMetadata.locatorDimensions));
+  }
+
+  /** 将定位框尺寸收敛为正数，避免 0 或非法 metadata 生成不可见线框。 */
+  private normalizeLocatorDimensions(value: Record<string, unknown>): LocatorDimensionsSnapshot {
+    return {
+      version: 1,
+      length: this.normalizeLocatorDimension(value.length, DEFAULT_LOCATOR_DIMENSIONS.length),
+      width: this.normalizeLocatorDimension(value.width, DEFAULT_LOCATOR_DIMENSIONS.width),
+      height: this.normalizeLocatorDimension(value.height, DEFAULT_LOCATOR_DIMENSIONS.height)
+    };
+  }
+
+  /** 读取单个定位框尺寸字段，小于最小值时钳制到可见下限。 */
+  private normalizeLocatorDimension(value: unknown, fallback: number): number {
+    return Math.max(MIN_LOCATOR_DIMENSION_METERS, this.getNumberMetadata(value, fallback));
+  }
+
   /** 从 metadata 读取链条机基线，格式损坏或节点集合不完整时返回空并重新捕获。 */
   private readOpaqueChainConveyorBaseline(root: TransformNode): OpaqueChainConveyorBaseline | null {
     const runtimeMetadata = this.asMetadataObject(this.getNodeEditorMetadata(root).modelPackageRuntime);
@@ -11579,6 +11741,35 @@ export class BabylonEditorEngine {
         ...update
       })
     });
+  }
+
+  /** 写回定位框尺寸，并立即更新当前 LinesMesh 的 12 条边。 */
+  private updateLocatorDimensions(node: TransformNode, update: LocatorDimensionsUpdate): void {
+    const dimensions = this.normalizeLocatorDimensions({
+      ...this.getLocatorDimensions(node),
+      ...update
+    });
+    this.mergeNodeEditorMetadata(node, { locatorDimensions: dimensions });
+    this.applyLocatorDimensionsToNode(node, dimensions);
+  }
+
+  /** 把尺寸同步到定位框真实顶点，保留节点 ID、选中态和业务 metadata 不变。 */
+  private applyLocatorDimensionsToNode(node: TransformNode, dimensions: LocatorDimensionsSnapshot): void {
+    if (!(node instanceof LinesMesh)) {
+      return;
+    }
+
+    const lines = this.createLocatorWireCubeLines(dimensions);
+    try {
+      if (!node.isVertexBufferUpdatable(VertexBuffer.PositionKind)) {
+        node.markVerticesDataAsUpdatable(VertexBuffer.PositionKind, true);
+      }
+      MeshBuilder.CreateLineSystem(node.name, { lines, instance: node }, this.scene);
+    } catch {
+      node.setVerticesData(VertexBuffer.PositionKind, this.flattenLocatorWireCubeLinePositions(dimensions), true);
+    }
+    node.refreshBoundingInfo(true);
+    node.computeWorldMatrix(true);
   }
 
   /** 写回指定节点所属模型包的动态参数，并立即重跑运行脚本驱动真实模型。 */

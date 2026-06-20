@@ -103,6 +103,7 @@ interface ModelArrayDialogState {
   target: ModelArrayContextTarget;
   axis: ModelArrayAxis;
   count: string;
+  spacing: string;
 }
 
 interface HierarchySelectionResult {
@@ -137,6 +138,7 @@ const MAX_ASSET_BROWSER_HEIGHT = 420;
 const MAX_ASSET_BROWSER_HEIGHT_RATIO = 0.45;
 const MODEL_ARRAY_DEFAULT_AXIS: ModelArrayAxis = "x";
 const MODEL_ARRAY_DEFAULT_COUNT = "3";
+const MODEL_ARRAY_DEFAULT_SPACING = "0";
 const SCENE_CONTEXT_MENU_WIDTH = 220;
 const SCENE_CONTEXT_MENU_HEIGHT = 420;
 
@@ -2230,7 +2232,8 @@ export function App() {
     setModelArrayDialog({
       target: sceneContextMenu.target,
       axis: MODEL_ARRAY_DEFAULT_AXIS,
-      count: MODEL_ARRAY_DEFAULT_COUNT
+      count: MODEL_ARRAY_DEFAULT_COUNT,
+      spacing: MODEL_ARRAY_DEFAULT_SPACING
     });
     setSceneContextMenu(null);
   }, [engine, sceneContextMenu]);
@@ -2249,7 +2252,8 @@ export function App() {
     const result = engine.createModelArray({
       targetId: modelArrayDialog.target.id,
       axis: modelArrayDialog.axis,
-      count: Number(modelArrayDialog.count)
+      count: Number(modelArrayDialog.count),
+      spacing: Number(modelArrayDialog.spacing)
     });
     if (!result.success) {
       setProjectError(result.message ?? "创建模型阵列失败。");
@@ -3303,6 +3307,16 @@ export function App() {
                 type="number"
                 value={modelArrayDialog.count}
                 onChange={(event) => handleModelArrayDialogChange({ count: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>模型间距（m）</span>
+              <input
+                min={0}
+                step={0.1}
+                type="number"
+                value={modelArrayDialog.spacing}
+                onChange={(event) => handleModelArrayDialogChange({ spacing: event.target.value })}
               />
             </label>
             <div className="modal-actions">

@@ -15,6 +15,8 @@ import type {
   InspectorTarget,
   LocatorAnimationConnectionSnapshot,
   LocatorAnimationConnectionUpdate,
+  LocatorDimensionsSnapshot,
+  LocatorDimensionsUpdate,
   MeshVertexModifySnapshot,
   PoiConditionOperator,
   PoiConfigSnapshot,
@@ -59,6 +61,14 @@ const meshNumberFields: Array<{
   { key: "radius", label: "半径", step: "0.1" },
   { key: "curveAngle", label: "弯道角度", step: "1" },
   { key: "rollerDensity", label: "辊筒密度", step: "0.1" }
+];
+const locatorDimensionFields: Array<{
+  key: keyof Pick<LocatorDimensionsSnapshot, "length" | "width" | "height">;
+  label: string;
+}> = [
+  { key: "length", label: `长(${LENGTH_UNIT_SYMBOL})` },
+  { key: "width", label: `宽(${LENGTH_UNIT_SYMBOL})` },
+  { key: "height", label: `高(${LENGTH_UNIT_SYMBOL})` }
 ];
 
 const dataDrivenModeOptions = ["RuntimeDataDrivenZD"];
@@ -272,6 +282,15 @@ function NodeInspector({
           <InspectorSection title="资产信息" defaultOpen>
             <AssetInfoEditor value={selection.assetInfo} onChange={(assetInfo) => onChange({ assetInfo })} />
           </InspectorSection>
+
+          {selection.locatorDimensions && (
+            <InspectorSection title="定位尺寸" defaultOpen>
+              <LocatorDimensionsEditor
+                value={selection.locatorDimensions}
+                onChange={(locatorDimensions) => onChange({ locatorDimensions })}
+              />
+            </InspectorSection>
+          )}
 
           <InspectorSection title="动画连接" defaultOpen>
             <LocatorAnimationConnectionEditor
@@ -1121,6 +1140,28 @@ function LocatorAnimationConnectionEditor({
       <div className="inspector-data-source-editor">
         <DataSourceConnectionEditor value={sceneDataDriven} onChange={onSceneDataDrivenChange} />
       </div>
+    </>
+  );
+}
+
+interface LocatorDimensionsEditorProps {
+  value: LocatorDimensionsSnapshot;
+  onChange: (update: LocatorDimensionsUpdate) => void;
+}
+
+/** 定位线框尺寸编辑器，长宽高直接控制 LinesMesh 顶点而不是通用缩放。 */
+function LocatorDimensionsEditor({ value, onChange }: LocatorDimensionsEditorProps) {
+  return (
+    <>
+      {locatorDimensionFields.map((field) => (
+        <InspectorNumberRow
+          key={field.key}
+          label={field.label}
+          step="0.1"
+          value={value[field.key]}
+          onChange={(nextValue) => onChange({ [field.key]: clampNumberValue(nextValue, 0.01) })}
+        />
+      ))}
     </>
   );
 }

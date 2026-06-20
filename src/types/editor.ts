@@ -313,6 +313,17 @@ export interface LocatorAnimationConnectionSnapshot {
 /** 定位线框立方体动画连接配置的面板增量。 */
 export type LocatorAnimationConnectionUpdate = Partial<Omit<LocatorAnimationConnectionSnapshot, "version">>;
 
+/** 定位线框立方体的真实几何尺寸，长/宽落在 X/Z 地面轴，高度落在 Y 轴。 */
+export interface LocatorDimensionsSnapshot {
+  version: 1;
+  length: number;
+  width: number;
+  height: number;
+}
+
+/** 定位线框立方体尺寸的面板增量。 */
+export type LocatorDimensionsUpdate = Partial<Omit<LocatorDimensionsSnapshot, "version">>;
+
 /** 模型阵列支持的地面轴向，Z 对应 Babylon 地面深度方向，负号表示世界坐标负向。 */
 export type ModelArrayAxis = "x" | "-x" | "z" | "-z";
 
@@ -322,11 +333,12 @@ export type AssetLibraryFocusTarget =
   | { type: "primitive"; primitiveKind: PrimitiveKind }
   | { type: "poi"; poiKind: PoiKind };
 
-/** 创建模型阵列时由 UI 传入的参数，数量表示新增副本数，步长由引擎按目标世界包围盒自动计算。 */
+/** 创建模型阵列时由 UI 传入的参数，数量表示新增副本数，间距表示贴边后额外保留的米制空隙。 */
 export interface ModelArrayOptions {
   targetId: number;
   axis: ModelArrayAxis;
   count: number;
+  spacing: number;
 }
 
 /** 模型阵列命令结果，失败时 message 直接用于界面提示。 */
@@ -371,6 +383,8 @@ export interface TransformSnapshot {
   poiRuntime?: PoiRuntimeState;
   /** 定位线框立方体专属动画连接配置；非定位框为空。 */
   locatorAnimationConnection?: LocatorAnimationConnectionSnapshot;
+  /** 定位线框立方体专属几何尺寸；非定位框为空。 */
+  locatorDimensions?: LocatorDimensionsSnapshot;
 }
 
 /** 属性面板向 Babylon 场景提交的部分更新。 */
@@ -391,6 +405,8 @@ export interface TransformUpdate {
   poi?: PoiConfigUpdate;
   /** 更新定位线框立方体的数据驱动接收端配置。 */
   locatorAnimationConnection?: LocatorAnimationConnectionUpdate;
+  /** 更新定位线框立方体的真实线框尺寸。 */
+  locatorDimensions?: LocatorDimensionsUpdate;
 }
 
 /** 场景相机属性快照，当前只暴露编辑视口可视距离。 */
@@ -503,6 +519,14 @@ export const DEFAULT_LOCATOR_ANIMATION_CONNECTION: LocatorAnimationConnectionSna
   positionZField: "y",
   rotationYField: "r",
   interpolationMs: 200
+};
+
+/** 定位线框立方体默认尺寸，保持与默认内置盒体 1.5m 边长一致。 */
+export const DEFAULT_LOCATOR_DIMENSIONS: LocatorDimensionsSnapshot = {
+  version: 1,
+  length: 1.5,
+  width: 1.5,
+  height: 1.5
 };
 
 /** 场景编辑器设置默认值，沿用截图中三项灵敏度的初始数值。 */
