@@ -2107,10 +2107,10 @@ export function App() {
     [engine]
   );
 
-  /** 从层级面板拖拽节点到目标分组；目标为空时移回根级。 */
+  /** 从层级面板拖拽一个或多个节点到目标分组；目标为空时移回根级。 */
   const handleMoveNodeToGroup = useCallback(
-    (id: number, groupId: number | null) => {
-      engine?.moveNodeToGroup(id, groupId);
+    (ids: number[], groupId: number | null) => {
+      engine?.moveNodesToGroup(ids, groupId);
     },
     [engine]
   );

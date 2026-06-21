@@ -2938,13 +2938,13 @@ export class BabylonEditorEngine {
     this.scene.render();
   }
 
-  /** 把模型或分组移动到目标分组下；groupId 为空时移回场景根级。 */
+  /** 把单个模型或分组移动到目标分组下；保留旧入口，实际逻辑交给批量移动统一兜底。 */
   public moveNodeToGroup(nodeId: number, groupId: number | null): void {
-    const node = this.findTransformNodeByUniqueId(nodeId);
-    if (!node || node.metadata?.[HELPER_FLAG] || this.isNodeLocked(node)) {
-      return;
-    }
+    this.moveNodesToGroup([nodeId], groupId);
+  }
 
+  /** 把多个模型或分组一次性移动到目标 group；非法节点会被过滤，合法节点共享一次撤销快照。 */
+  public moveNodesToGroup(nodeIds: number[], groupId: number | null): void {
     let targetParent: TransformNode | null = null;
     if (groupId !== null) {
       const group = this.findTransformNodeByUniqueId(groupId);
@@ -2954,21 +2954,37 @@ export class BabylonEditorEngine {
       targetParent = group;
     }
 
-    if (targetParent && (targetParent.uniqueId === node.uniqueId || this.isNodeAncestor(node, targetParent))) {
+    const transformNodeById = this.createTransformNodeLookup();
+    const uniqueNodeIds = [...new Set(nodeIds)].filter((id) => Number.isInteger(id));
+    const candidateNodes = uniqueNodeIds
+      .map((id) => transformNodeById.get(id))
+      .filter((node): node is TransformNode => node instanceof TransformNode && !node.metadata?.[HELPER_FLAG] && !this.isNodeLocked(node));
+    const candidateIds = new Set(candidateNodes.map((node) => node.uniqueId));
+    const movableNodes = candidateNodes.filter((node) => {
+      if (this.hasSelectedAncestor(node, candidateIds)) {
+        return false;
+      }
+
+      if (targetParent && (targetParent.uniqueId === node.uniqueId || this.isNodeAncestor(node, targetParent))) {
+        return false;
+      }
+
+      return (node.parent instanceof TransformNode ? node.parent : null) !== targetParent;
+    });
+
+    if (movableNodes.length === 0) {
       return;
     }
 
-    if ((node.parent instanceof TransformNode ? node.parent : null) === targetParent) {
-      return;
-    }
-
-    this.recordSceneUndoSnapshot("移动对象分组");
-    node.setParent(targetParent);
-    node.metadata = {
-      ...this.asMetadataObject(node.metadata),
-      [ROOT_FLAG]: true
-    };
-    this.refreshNodeWorldMatrices(node);
+    this.recordSceneUndoSnapshot(movableNodes.length > 1 ? "批量移动对象分组" : "移动对象分组");
+    movableNodes.forEach((node) => {
+      node.setParent(targetParent);
+      node.metadata = {
+        ...this.asMetadataObject(node.metadata),
+        [ROOT_FLAG]: true
+      };
+      this.refreshNodeWorldMatrices(node);
+    });
     this.refreshSceneGraph();
     this.emitSelectionSnapshot();
     this.scene.render();

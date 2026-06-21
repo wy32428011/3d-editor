@@ -34,12 +34,16 @@ interface HierarchyPanelProps {
   onCreateNode: () => void;
   onToggleVisibility: (id: number, visible: boolean) => void;
   onToggleLock: (id: number, locked: boolean) => void;
-  onMoveNodeToGroup: (id: number, groupId: number | null) => void;
+  onMoveNodeToGroup: (ids: number[], groupId: number | null) => void;
   onNodeContextMenu: (node: SceneNodeSummary, point: { x: number; y: number }) => void;
   onBlankContextMenu: (point: { x: number; y: number }) => void;
 }
 
 const nodeDragMimeType = "application/x-editor-scene-node";
+
+interface DraggedNodePayload {
+  ids: number[];
+}
 
 /** 左侧模型树展示可编辑模型和逻辑分组，负责搜索、展开、锁定、显隐和拖拽归组。 */
 export function HierarchyPanel({
@@ -57,7 +61,7 @@ export function HierarchyPanel({
 }: HierarchyPanelProps) {
   const [query, setQuery] = useState("");
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({});
-  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [draggingIds, setDraggingIds] = useState<number[]>([]);
   const [dropTargetId, setDropTargetId] = useState<number | "root" | null>(null);
   const consumedExpansionTokenRef = useRef<number | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
@@ -103,31 +107,63 @@ export function HierarchyPanel({
     }));
   };
 
-  /** 开始拖拽未锁定节点，锁定节点只允许选择和解锁。 */
+  /** 开始拖拽未锁定节点；若起点已被多选，则拖拽当前顶层选区。 */
   const handleDragStart = (event: DragEvent<HTMLDivElement>, node: SceneNodeSummary) => {
     if (node.locked) {
       event.preventDefault();
       return;
     }
 
-    setDraggingId(node.id);
+    const ids = getDragNodeIds(node, nodes, nodeById);
+    setDraggingIds(ids);
     event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData(nodeDragMimeType, String(node.id));
+    event.dataTransfer.setData(nodeDragMimeType, JSON.stringify({ ids } satisfies DraggedNodePayload));
   };
 
   /** 结束拖拽时清理所有高亮态。 */
   const handleDragEnd = () => {
-    setDraggingId(null);
+    setDraggingIds([]);
     setDropTargetId(null);
   };
 
-  /** 判断当前拖拽节点能否投放到指定 group。 */
-  const canDropOnGroup = (target: SceneNodeSummary): boolean => {
-    if (draggingId === null || target.kind !== "Group" || target.locked || target.id === draggingId) {
-      return false;
+  /** 返回可以投放到指定 group 的拖拽节点 ID，忽略锁定、自身和会形成循环的节点。 */
+  const getDroppableNodeIdsForGroup = (ids: number[], target: SceneNodeSummary): number[] => {
+    if (ids.length === 0 || target.kind !== "Group" || target.locked) {
+      return [];
     }
 
-    return !isNodeDescendant(target.id, draggingId, nodeById);
+    return ids.filter((id) => {
+      const node = nodeById.get(id);
+      return Boolean(
+        node &&
+          !node.locked &&
+          node.id !== target.id &&
+          node.parentId !== target.id &&
+          !isNodeDescendant(target.id, node.id, nodeById)
+      );
+    });
+  };
+
+  /** 判断当前拖拽集合中是否有节点能投放到指定 group。 */
+  const canDropOnGroup = (target: SceneNodeSummary): boolean => {
+    return getDroppableNodeIdsForGroup(draggingIds, target).length > 0;
+  };
+
+  /** 返回可以移回根级的拖拽节点 ID，已经在根级或锁定的节点会被忽略。 */
+  const getDroppableNodeIdsForRoot = (ids: number[]): number[] => {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    return ids.filter((id) => {
+      const node = nodeById.get(id);
+      return Boolean(node && !node.locked && node.parentId !== undefined);
+    });
+  };
+
+  /** 判断根区域是否接收当前拖拽集合。 */
+  const canDropOnRoot = (): boolean => {
+    return getDroppableNodeIdsForRoot(draggingIds).length > 0;
   };
 
   /** 允许把未锁定节点投放到 group 上。 */
@@ -146,25 +182,21 @@ export function HierarchyPanel({
   const handleRowDrop = (event: DragEvent<HTMLDivElement>, node: SceneNodeSummary) => {
     event.preventDefault();
     event.stopPropagation();
-    const nodeId = readDraggedNodeId(event);
-    if (nodeId === null || !canDropOnGroup(node)) {
+    const ids = readDraggedNodeIds(event);
+    const droppableIds = getDroppableNodeIdsForGroup(ids, node);
+    if (droppableIds.length === 0) {
       handleDragEnd();
       return;
     }
 
-    onMoveNodeToGroup(nodeId, node.id);
+    onMoveNodeToGroup(droppableIds, node.id);
     setExpandedGroups((current) => ({ ...current, [node.id]: true }));
     handleDragEnd();
   };
 
   /** 根区域允许把子节点移回场景根级。 */
   const handleRootDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (draggingId === null) {
-      return;
-    }
-
-    const node = nodeById.get(draggingId);
-    if (!node || node.locked || node.parentId === undefined) {
+    if (!canDropOnRoot()) {
       return;
     }
 
@@ -175,14 +207,14 @@ export function HierarchyPanel({
 
   /** 拖到列表空白区域时把节点移回根级。 */
   const handleRootDrop = (event: DragEvent<HTMLDivElement>) => {
-    if (draggingId === null) {
+    if (draggingIds.length === 0) {
       return;
     }
 
     event.preventDefault();
-    const nodeId = readDraggedNodeId(event);
-    if (nodeId !== null) {
-      onMoveNodeToGroup(nodeId, null);
+    const droppableIds = getDroppableNodeIdsForRoot(readDraggedNodeIds(event));
+    if (droppableIds.length > 0) {
+      onMoveNodeToGroup(droppableIds, null);
     }
     handleDragEnd();
   };
@@ -442,15 +474,67 @@ function isNodeDescendant(candidateId: number, ancestorId: number, nodeById: Map
   return false;
 }
 
-/** 从拖拽事件中读取节点 ID，非法 payload 会被忽略。 */
-function readDraggedNodeId(event: DragEvent): number | null {
-  const rawId = event.dataTransfer.getData(nodeDragMimeType);
-  if (!rawId) {
-    return null;
+/** 读取拖拽起点对应的节点集合，已选父级会覆盖子级，避免批量移动时重复处理。 */
+function getDragNodeIds(
+  dragNode: SceneNodeSummary,
+  nodes: SceneNodeSummary[],
+  nodeById: Map<number, SceneNodeSummary>
+): number[] {
+  if (!dragNode.selected) {
+    return [dragNode.id];
   }
 
-  const id = Number(rawId);
-  return Number.isInteger(id) ? id : null;
+  const selectedNodes = nodes.filter((node) => node.selected);
+  const selectedIds = new Set(selectedNodes.map((node) => node.id));
+  return selectedNodes.filter((node) => !hasAncestorInSet(node, selectedIds, nodeById)).map((node) => node.id);
+}
+
+/** 判断节点是否已经被指定祖先集合覆盖，用于构造顶层拖拽集合。 */
+function hasAncestorInSet(node: SceneNodeSummary, ancestorIds: Set<number>, nodeById: Map<number, SceneNodeSummary>): boolean {
+  let parentId = node.parentId;
+  while (parentId !== undefined) {
+    if (ancestorIds.has(parentId)) {
+      return true;
+    }
+
+    parentId = nodeById.get(parentId)?.parentId;
+  }
+  return false;
+}
+
+/** 从拖拽事件中读取节点 ID 集合，兼容旧版单 ID payload。 */
+function readDraggedNodeIds(event: DragEvent): number[] {
+  const rawPayload = event.dataTransfer.getData(nodeDragMimeType);
+  if (!rawPayload) {
+    return [];
+  }
+
+  const legacyId = Number(rawPayload);
+  if (Number.isInteger(legacyId)) {
+    return [legacyId];
+  }
+
+  try {
+    const payload = JSON.parse(rawPayload) as Partial<DraggedNodePayload>;
+    return Array.isArray(payload.ids) ? uniqueNodeIds(payload.ids) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 规范化拖拽 ID，防止异常 payload 触发重复移动或非整数节点查找。 */
+function uniqueNodeIds(ids: unknown[]): number[] {
+  const output: number[] = [];
+  const seen = new Set<number>();
+  ids.forEach((id) => {
+    if (!Number.isInteger(id) || seen.has(id as number)) {
+      return;
+    }
+
+    seen.add(id as number);
+    output.push(id as number);
+  });
+  return output;
 }
 
 /** 生成锁按钮提示，区分自身锁定和父级继承锁定。 */
