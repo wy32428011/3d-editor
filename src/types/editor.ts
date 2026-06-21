@@ -597,6 +597,9 @@ export interface AssetRecord {
   modelPackage?: ModelPackageManifest;
 }
 
+/** 渲染画质模式，控制 Babylon 后备缓冲缩放和高负载自适应策略。 */
+export type RenderQualityMode = "lossless" | "auto" | "balanced" | "performance";
+
 /** 视口底部状态栏展示的运行指标。 */
 export interface EditorStats {
   fps: number;
@@ -609,6 +612,11 @@ export interface EditorStats {
   renderHeight: number;
   gpuVendor: string;
   gpuRenderer: string;
+  webGLVersion: number;
+  maxTextureSize: number;
+  renderQualityMode: RenderQualityMode;
+  adaptiveQualityActive: boolean;
+  softwareRenderer: boolean;
   contextLost: boolean;
 }
 

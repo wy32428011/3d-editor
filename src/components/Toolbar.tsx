@@ -24,11 +24,11 @@ import {
   type LucideIcon
 } from "lucide-react";
 import { useRef } from "react";
-import type { EditorStats, EditorTool, PrimitiveKind } from "../types/editor";
+import type { EditorStats, EditorTool, PrimitiveKind, RenderQualityMode } from "../types/editor";
 
 interface ToolbarProps {
   tool: EditorTool;
-  performanceMode: boolean;
+  renderQualityMode: RenderQualityMode;
   previewMode: boolean;
   overheadMode: boolean;
   stats: EditorStats;
@@ -52,7 +52,7 @@ interface ToolbarProps {
   cadImportDisabled?: boolean;
   cadImportDisabledReason?: string;
   onToggleInspector: () => void;
-  onTogglePerformance: () => void;
+  onRenderQualityModeChange: (mode: RenderQualityMode) => void;
   onTogglePreview: () => void;
   onToggleOverheadMode: () => void;
 }
@@ -73,10 +73,21 @@ const primitiveButtons: Array<{ kind: PrimitiveKind; label: string; icon: Lucide
   { kind: "light", label: "点光源", icon: Lightbulb }
 ];
 
+const renderQualityOptions: Array<{ mode: RenderQualityMode; label: string; title: string }> = [
+  { mode: "lossless", label: "无损", title: "无损高清：保持 4K 目标后备缓冲，不自动降画质" },
+  { mode: "auto", label: "自动", title: "自动：先按无损高清渲染，低帧率时临时降压" },
+  { mode: "balanced", label: "均衡", title: "均衡：约 1440p 目标像素，兼顾清晰度和流畅度" },
+  { mode: "performance", label: "流畅", title: "流畅：降低分辨率并减少辅助动画开销" }
+];
+
 /** 压缩 GPU 名称，避免长 renderer 字符串撑开工具栏。 */
 function formatGpuRendererLabel(stats: EditorStats): string {
   if (stats.contextLost) {
     return "WebGL 丢失";
+  }
+
+  if (stats.softwareRenderer) {
+    return "软件渲染";
   }
 
   const renderer = stats.gpuRenderer
@@ -90,12 +101,21 @@ function formatGpuRendererLabel(stats: EditorStats): string {
   return renderer.length > 24 ? `${renderer.slice(0, 24)}...` : renderer;
 }
 
+/** 返回当前画质模式的中文标签，状态栏和 tooltip 共用同一套文案。 */
+function getRenderQualityLabel(mode: RenderQualityMode): string {
+  return renderQualityOptions.find((item) => item.mode === mode)?.label ?? "无损";
+}
+
 /** 拼装 GPU 诊断提示，便于确认是否跑在硬件 GPU、高清模式和当前渲染分辨率。 */
-function formatGpuRendererTitle(stats: EditorStats, performanceMode: boolean): string {
+function formatGpuRendererTitle(stats: EditorStats, renderQualityMode: RenderQualityMode): string {
+  const quality = stats.adaptiveQualityActive ? `${getRenderQualityLabel(renderQualityMode)} / 自动降压中` : getRenderQualityLabel(renderQualityMode);
   return [
     `GPU Vendor: ${stats.gpuVendor}`,
     `GPU Renderer: ${stats.gpuRenderer}`,
-    `Quality: ${performanceMode ? "performance preview" : "4K high quality"}`,
+    `GPU Path: ${stats.softwareRenderer ? "software renderer warning" : "hardware renderer expected"}`,
+    `WebGL: ${stats.webGLVersion || "unknown"}`,
+    `Max Texture: ${stats.maxTextureSize || "unknown"}`,
+    `Quality: ${quality}`,
     `Render Size: ${stats.renderWidth}x${stats.renderHeight}`,
     `Hardware Scaling: ${stats.hardwareScalingLevel}`,
     `Context: ${stats.contextLost ? "lost" : "ok"}`
@@ -105,7 +125,7 @@ function formatGpuRendererTitle(stats: EditorStats, performanceMode: boolean): s
 /** 顶部工具栏负责工具切换、基础对象创建、导入、保存和调试入口。 */
 export function Toolbar({
   tool,
-  performanceMode,
+  renderQualityMode,
   previewMode,
   overheadMode,
   stats,
@@ -129,7 +149,7 @@ export function Toolbar({
   cadImportDisabled = false,
   cadImportDisabledReason,
   onToggleInspector,
-  onTogglePerformance,
+  onRenderQualityModeChange,
   onTogglePreview,
   onToggleOverheadMode
 }: ToolbarProps) {
@@ -165,6 +185,14 @@ export function Toolbar({
       event.target.value = "";
     }
   };
+
+  /** 将工具栏下拉值收敛为稳定的渲染画质枚举，并交给上层同步到 Babylon 引擎。 */
+  const handleRenderQualitySelectChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    onRenderQualityModeChange(event.target.value as RenderQualityMode);
+  };
+
+  const activeRenderQualityMode = stats.renderQualityMode ?? renderQualityMode;
+  const activeRenderQualityOption = renderQualityOptions.find((item) => item.mode === renderQualityMode) ?? renderQualityOptions[0];
 
   return (
     <header className="toolbar">
@@ -274,14 +302,16 @@ export function Toolbar({
         <button className="icon-button" title="Babylon Inspector" type="button" onClick={onToggleInspector}>
           <Bug size={18} />
         </button>
-        <button
-          className={`icon-button ${performanceMode ? "is-active" : ""}`}
-          title={performanceMode ? "退出性能预览，恢复高清 4K" : "性能预览（降低清晰度）"}
-          type="button"
-          onClick={onTogglePerformance}
-        >
-          <Gauge size={18} />
-        </button>
+        <label className="quality-select" title={activeRenderQualityOption.title}>
+          <Gauge size={16} aria-hidden="true" />
+          <select aria-label="渲染画质" value={renderQualityMode} onChange={handleRenderQualitySelectChange}>
+            {renderQualityOptions.map((item) => (
+              <option key={item.mode} value={item.mode}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       <div className="stats-strip" aria-label="状态">
@@ -289,8 +319,10 @@ export function Toolbar({
         <span>{stats.meshes} Mesh</span>
         <span>{stats.drawCalls} Draw</span>
         <span>{stats.vertices.toLocaleString()} Vtx</span>
-        <span title={formatGpuRendererTitle(stats, performanceMode)}>{formatGpuRendererLabel(stats)}</span>
-        <span title={`渲染分辨率 ${stats.renderWidth}x${stats.renderHeight}`}>{performanceMode ? "Perf" : "4K"} {stats.hardwareScalingLevel}x</span>
+        <span title={formatGpuRendererTitle(stats, activeRenderQualityMode)}>{formatGpuRendererLabel(stats)}</span>
+        <span title={`渲染分辨率 ${stats.renderWidth}x${stats.renderHeight}`}>
+          {stats.adaptiveQualityActive ? "自动降压" : getRenderQualityLabel(activeRenderQualityMode)} {stats.hardwareScalingLevel}x
+        </span>
       </div>
 
       <input

@@ -39,6 +39,7 @@ import type {
   ModelPackageManifest,
   ModelPackageProjectFile,
   PrimitiveKind,
+  RenderQualityMode,
   SceneDataConnectionStatusSnapshot,
   SceneDataDrivenSnapshot,
   SceneInspectorUpdate,
@@ -123,6 +124,11 @@ const initialStats: EditorStats = {
   renderHeight: 0,
   gpuVendor: "未知 GPU",
   gpuRenderer: "未知渲染器",
+  webGLVersion: 0,
+  maxTextureSize: 0,
+  renderQualityMode: "lossless",
+  adaptiveQualityActive: false,
+  softwareRenderer: false,
   contextLost: false
 };
 
@@ -1079,7 +1085,7 @@ export function App() {
   const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget | null>(null);
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [stats, setStats] = useState<EditorStats>(initialStats);
-  const [performanceMode, setPerformanceMode] = useState(false);
+  const [renderQualityMode, setRenderQualityMode] = useState<RenderQualityMode>("lossless");
   const [previewMode, setPreviewMode] = useState(false);
   const [overheadMode, setOverheadMode] = useState(false);
   const [recentProjects, setRecentProjects] = useState<RecentProjectRecord[]>([]);
@@ -2553,9 +2559,9 @@ export function App() {
     void engine?.toggleInspector();
   }, [engine]);
 
-  /** 切换性能预览模式，并交给 Babylon 引擎调整渲染策略。 */
-  const handleTogglePerformance = useCallback(() => {
-    setPerformanceMode((value) => !value);
+  /** 切换渲染画质模式，并交给 Babylon 引擎调整后备缓冲策略。 */
+  const handleRenderQualityModeChange = useCallback((mode: RenderQualityMode) => {
+    setRenderQualityMode(mode);
   }, []);
 
   /** 更新当前场景环境背景色，色值会写入 Babylon 场景并随保存恢复。 */
@@ -2919,7 +2925,7 @@ export function App() {
     <div className="editor-root" aria-busy={cadBusy}>
       <Toolbar
         tool={tool}
-        performanceMode={performanceMode}
+        renderQualityMode={renderQualityMode}
         previewMode={previewMode}
         overheadMode={overheadMode}
         stats={stats}
@@ -2943,7 +2949,7 @@ export function App() {
         cadImportDisabled={cadBusy}
         cadImportDisabledReason={cadImportDisabledReason}
         onToggleInspector={handleToggleInspector}
-        onTogglePerformance={handleTogglePerformance}
+        onRenderQualityModeChange={handleRenderQualityModeChange}
         onTogglePreview={handleTogglePreview}
         onToggleOverheadMode={handleToggleOverheadMode}
       />
@@ -3062,7 +3068,7 @@ export function App() {
           key={activeScene?.id ?? "empty-scene"}
           callbacks={callbacks}
           tool={tool}
-          performanceMode={performanceMode}
+          renderQualityMode={renderQualityMode}
           previewMode={previewMode}
           overheadMode={overheadMode}
           onEngineReady={handleEngineReady}

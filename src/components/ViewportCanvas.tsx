@@ -2,12 +2,12 @@ import { useEffect, useRef } from "react";
 import type { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { BabylonEditorEngine } from "../engine/BabylonEditorEngine";
 import { isPoiKind } from "../editor/poiCatalog";
-import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind, TransformSnapshot } from "../types/editor";
+import type { EditorEngineCallbacks, EditorTool, PoiKind, PrimitiveKind, RenderQualityMode, TransformSnapshot } from "../types/editor";
 
 interface ViewportCanvasProps {
   callbacks: EditorEngineCallbacks;
   tool: EditorTool;
-  performanceMode: boolean;
+  renderQualityMode: RenderQualityMode;
   previewMode: boolean;
   overheadMode: boolean;
   onEngineReady: (engine: BabylonEditorEngine | null) => void;
@@ -33,7 +33,7 @@ type PointerLike = Pick<PointerEvent, "altKey" | "button" | "clientX" | "clientY
 export function ViewportCanvas({
   callbacks,
   tool,
-  performanceMode,
+  renderQualityMode,
   previewMode,
   overheadMode,
   onEngineReady,
@@ -80,8 +80,8 @@ export function ViewportCanvas({
   }, [tool]);
 
   useEffect(() => {
-    engineRef.current?.setPerformanceMode(performanceMode);
-  }, [performanceMode]);
+    engineRef.current?.setRenderQualityMode(renderQualityMode);
+  }, [renderQualityMode]);
 
   useEffect(() => {
     engineRef.current?.setPreviewMode(previewMode);

@@ -133,6 +133,7 @@ import type {
   PoiConfigSnapshot,
   PoiKind,
   PrimitiveKind,
+  RenderQualityMode,
   SceneDataDrivenSnapshot,
   SceneDataSourceType,
   SceneEditorSettingsSnapshot,
@@ -157,9 +158,25 @@ const GRID_RENDER_ELEVATION_METERS = 0.015;
 const EDITOR_LENGTH_UNIT = "meter";
 const IMPORTED_MODEL_UNIT_POLICY = "imported-model-coordinates-are-meters";
 const TARGET_HIGH_QUALITY_RENDER_PIXELS = 3840 * 2160;
+const TARGET_BALANCED_RENDER_PIXELS = 2560 * 1440;
 const MAX_HIGH_QUALITY_RENDER_SCALE = 4;
-const PERFORMANCE_PREVIEW_MIN_HARDWARE_SCALING_LEVEL = 1.25;
+const PERFORMANCE_MODE_MIN_HARDWARE_SCALING_LEVEL = 1.25;
 const HARDWARE_SCALING_LEVEL_EPSILON = 0.01;
+const ADAPTIVE_RENDER_QUALITY_DROP_FPS = 50;
+const ADAPTIVE_RENDER_QUALITY_FAST_DROP_FPS = 35;
+const ADAPTIVE_RENDER_QUALITY_RECOVER_FPS = 57;
+const ADAPTIVE_RENDER_QUALITY_SAMPLE_MS = 1000;
+const ADAPTIVE_RENDER_QUALITY_RECOVER_SAMPLES = 3;
+const ADAPTIVE_RENDER_QUALITY_STEP = 0.12;
+const ADAPTIVE_RENDER_QUALITY_FAST_STEP = 0.28;
+const ADAPTIVE_RENDER_QUALITY_MAX_HARDWARE_SCALING_LEVEL = 2;
+const ADAPTIVE_GRID_FLASH_THROTTLE_MS = 120;
+const EDITOR_STATS_INTERVAL_MS = 1000;
+const LARGE_SCENE_EFFECT_MESH_THRESHOLD = 1200;
+const LARGE_SCENE_EFFECT_VERTEX_THRESHOLD = 500000;
+const LOW_FPS_EFFECT_REDUCTION_THRESHOLD = 50;
+const LARGE_SCENE_EFFECT_ACTIVE_MESH_THRESHOLD = 900;
+const LARGE_SCENE_EFFECT_DRAW_CALL_THRESHOLD = 1200;
 const SELECTION_OUTLINE_COLOR = "#63d7ff";
 const SELECTION_OUTLINE_THICKNESS = 1.8;
 const SELECTION_OUTLINE_TEXTURE_RATIO = 0.5;
@@ -1232,6 +1249,12 @@ interface CloneSourceTokenMarkResult {
   snapshots: CloneSourceTokenSnapshot[];
 }
 
+/** 缓存场景规模统计，避免状态栏刷新时频繁全量遍历高模场景。 */
+interface SceneContentStatsCache {
+  meshCount: number;
+  vertexCount: number;
+}
+
 /** 管理 Babylon.js 运行时、编辑器交互、资产导入与场景序列化。 */
 export class BabylonEditorEngine {
   private readonly canvas: HTMLCanvasElement;
@@ -1255,7 +1278,11 @@ export class BabylonEditorEngine {
   private selectedNodeIds = new Set<number>();
   private selectedNode: TransformNode | null = null;
   private currentTool: EditorTool = "move";
-  private performanceMode = false;
+  private renderQualityMode: RenderQualityMode = "lossless";
+  private adaptiveHardwareScalingLevel: number | null = null;
+  private adaptiveRenderQualityActive = false;
+  private adaptiveQualityStamp = 0;
+  private adaptiveQualityRecoverSamples = 0;
   private webglContextLost = false;
   private gpuVendor = "未知 GPU";
   private gpuRenderer = "未知渲染器";
@@ -1273,6 +1300,11 @@ export class BabylonEditorEngine {
   private cloneTokenSeed = 1;
   private readonly sceneUndoStack: SceneUndoSnapshot[] = [];
   private sceneUndoRestoring = false;
+  private sceneContentStatsCache: SceneContentStatsCache | null = null;
+  private scenePoiNodesCache: TransformNode[] | null = null;
+  private editableRuntimeRootsCache: TransformNode[] | null = null;
+  private dataDrivenTargetsCache: SceneDataDrivenTarget[] | null = null;
+  private dataDrivenDropTargetsCache: SceneDataDrivenDropTarget[] | null = null;
   private statsStamp = 0;
   private dataDrivenSelectionSyncStamp = 0;
   private primitiveSeed = 1;
@@ -1291,6 +1323,8 @@ export class BabylonEditorEngine {
   private readonly gridGlowMeshes: Mesh[] = [];
   private readonly gridGlowColors = new Map<number, Color3>();
   private gridGlowPulse = 0;
+  private gridFlashStamp = 0;
+  private gridReducedEffectsApplied = false;
   private readonly observedTransformGizmos = new WeakSet<object>();
   private readonly handleResize = () => this.resize();
   private readonly handleWebglContextLost = (event: Event) => {
@@ -1341,7 +1375,10 @@ export class BabylonEditorEngine {
       getTargets: () => this.createSceneDataDrivenTargets(),
       getDropTargets: () => this.createSceneDataDrivenDropTargets(),
       createRuntimeCargoBox: (request) => this.createRuntimeCargoBox(request),
-      disposeRuntimeNode: (node) => node.dispose(false, true),
+      disposeRuntimeNode: (node) => {
+        node.dispose(false, true);
+        this.markScenePerformanceCachesDirty();
+      },
       onTargetsChanged: (roots, now) => this.handleSceneDataDrivenTargetsChanged(roots, now),
       onConnectionStatusChanged: (status) => this.callbacks.onDataConnectionStatusChange(status)
     });
@@ -1364,7 +1401,11 @@ export class BabylonEditorEngine {
       const now = performance.now();
       this.updateSceneDataDrivenRuntime(now);
       this.updateSceneBusinessRuntime(now);
-      this.updateDynamicGridForCamera();
+      this.updateAdaptiveRenderQuality(now);
+      this.syncPointerMovePickingMode();
+      if (this.shouldUpdateDynamicGridForFrame()) {
+        this.updateDynamicGridForCamera();
+      }
       this.updateGridFlash();
       this.syncEditorCameraPanSpeed();
       this.scene.render();
@@ -1522,12 +1563,17 @@ export class BabylonEditorEngine {
     this.sceneUndoStack.splice(0, this.sceneUndoStack.length);
   }
 
-  /** 开关性能预览模式，在流畅度和编辑精度之间切换。 */
-  public setPerformanceMode(enabled: boolean): void {
-    this.performanceMode = enabled;
+  /** 切换渲染画质模式，并同步 WebGL 后备缓冲与辅助效果策略。 */
+  public setRenderQualityMode(mode: RenderQualityMode): void {
+    if (this.renderQualityMode === mode) {
+      return;
+    }
+
+    this.renderQualityMode = mode;
+    this.resetAdaptiveRenderQuality();
     this.applyRenderQuality();
     this.updateGridGlow(this.gridGlowPulse);
-    this.scene.skipPointerMovePicking = enabled;
+    this.syncPointerMovePickingMode();
     this.callbacks.onStatsChange(this.collectStats());
   }
 
@@ -1553,13 +1599,29 @@ export class BabylonEditorEngine {
       return;
     }
 
-    const nextLevel = this.performanceMode
-      ? this.calculatePerformancePreviewHardwareScalingLevel()
-      : this.calculateHighQualityHardwareScalingLevel();
+    const nextLevel = this.getTargetHardwareScalingLevel();
     const currentLevel = this.engine.getHardwareScalingLevel();
     if (!Number.isFinite(currentLevel) || Math.abs(currentLevel - nextLevel) > HARDWARE_SCALING_LEVEL_EPSILON) {
       this.engine.setHardwareScalingLevel(nextLevel);
     }
+  }
+
+  /** 读取当前目标后备缓冲缩放，自动质量模式只会在高清基线之上降采样。 */
+  private getTargetHardwareScalingLevel(): number {
+    if (this.renderQualityMode === "performance") {
+      return this.calculatePerformanceHardwareScalingLevel();
+    }
+
+    if (this.renderQualityMode === "balanced") {
+      return this.calculateBalancedHardwareScalingLevel();
+    }
+
+    const highQualityLevel = this.calculateHighQualityHardwareScalingLevel();
+    if (this.renderQualityMode !== "auto" || this.adaptiveHardwareScalingLevel === null) {
+      return highQualityLevel;
+    }
+
+    return Math.max(highQualityLevel, this.adaptiveHardwareScalingLevel);
   }
 
   /** 计算高清模式的硬件缩放值：低于 4K 的视口自动超采样，避免默认画面发糊。 */
@@ -1572,10 +1634,95 @@ export class BabylonEditorEngine {
     return 1 / renderScale;
   }
 
-  /** 计算性能预览的硬件缩放值，保留用户主动降画质换流畅度的能力。 */
-  private calculatePerformancePreviewHardwareScalingLevel(): number {
+  /** 计算均衡模式缩放值，把大窗口限制到约 1440p 目标像素，小窗口保持原生清晰度。 */
+  private calculateBalancedHardwareScalingLevel(): number {
+    const cssWidth = Math.max(1, this.canvas.clientWidth || this.canvas.width || this.engine.getRenderWidth(true) || 1);
+    const cssHeight = Math.max(1, this.canvas.clientHeight || this.canvas.height || this.engine.getRenderHeight(true) || 1);
+    const cssPixels = cssWidth * cssHeight;
+    const targetRenderScale = Math.sqrt(TARGET_BALANCED_RENDER_PIXELS / cssPixels);
+    return targetRenderScale < 1 ? 1 / targetRenderScale : 1;
+  }
+
+  /** 计算流畅模式的硬件缩放值，保留用户主动降画质换帧率的能力。 */
+  private calculatePerformanceHardwareScalingLevel(): number {
     const devicePixelRatio = Math.max(1, window.devicePixelRatio || 1);
-    return Math.max(PERFORMANCE_PREVIEW_MIN_HARDWARE_SCALING_LEVEL, devicePixelRatio);
+    return Math.max(PERFORMANCE_MODE_MIN_HARDWARE_SCALING_LEVEL, devicePixelRatio);
+  }
+
+  /** 根据实时 FPS 自动降低或恢复渲染后备缓冲；只有自动模式允许降低无损高清基线。 */
+  private updateAdaptiveRenderQuality(now: number): void {
+    if (!this.isAutoRenderQualityMode() || this.webglContextLost || now - this.adaptiveQualityStamp < ADAPTIVE_RENDER_QUALITY_SAMPLE_MS) {
+      return;
+    }
+
+    this.adaptiveQualityStamp = now;
+    const fps = this.engine.getFps();
+    if (!Number.isFinite(fps) || fps <= 0) {
+      return;
+    }
+
+    const highQualityLevel = this.calculateHighQualityHardwareScalingLevel();
+    if (this.adaptiveHardwareScalingLevel !== null && this.adaptiveHardwareScalingLevel < highQualityLevel) {
+      this.adaptiveHardwareScalingLevel = highQualityLevel;
+    }
+
+    if (fps < ADAPTIVE_RENDER_QUALITY_DROP_FPS) {
+      const currentLevel = this.adaptiveHardwareScalingLevel ?? this.engine.getHardwareScalingLevel() ?? highQualityLevel;
+      const step = fps < ADAPTIVE_RENDER_QUALITY_FAST_DROP_FPS ? ADAPTIVE_RENDER_QUALITY_FAST_STEP : ADAPTIVE_RENDER_QUALITY_STEP;
+      const nextLevel = Math.min(
+        Math.max(highQualityLevel, ADAPTIVE_RENDER_QUALITY_MAX_HARDWARE_SCALING_LEVEL),
+        Math.max(highQualityLevel, currentLevel + step)
+      );
+      this.adaptiveQualityRecoverSamples = 0;
+      if (Math.abs(nextLevel - currentLevel) > HARDWARE_SCALING_LEVEL_EPSILON) {
+        this.adaptiveHardwareScalingLevel = Number(nextLevel.toFixed(2));
+        this.adaptiveRenderQualityActive = true;
+        this.applyRenderQuality();
+        this.syncPointerMovePickingMode();
+      }
+      return;
+    }
+
+    if (this.adaptiveHardwareScalingLevel === null || fps < ADAPTIVE_RENDER_QUALITY_RECOVER_FPS) {
+      this.adaptiveQualityRecoverSamples = 0;
+      return;
+    }
+
+    this.adaptiveQualityRecoverSamples += 1;
+    if (this.adaptiveQualityRecoverSamples < ADAPTIVE_RENDER_QUALITY_RECOVER_SAMPLES) {
+      return;
+    }
+
+    this.adaptiveQualityRecoverSamples = 0;
+    const nextLevel = Math.max(highQualityLevel, this.adaptiveHardwareScalingLevel - ADAPTIVE_RENDER_QUALITY_STEP);
+    if (Math.abs(nextLevel - highQualityLevel) <= HARDWARE_SCALING_LEVEL_EPSILON) {
+      this.adaptiveHardwareScalingLevel = null;
+      this.adaptiveRenderQualityActive = false;
+    } else {
+      this.adaptiveHardwareScalingLevel = Number(nextLevel.toFixed(2));
+      this.adaptiveRenderQualityActive = true;
+    }
+    this.applyRenderQuality();
+    this.syncPointerMovePickingMode();
+  }
+
+  /** 重置自动质量状态，用户显式切换画质时重新从高清基线评估。 */
+  private resetAdaptiveRenderQuality(): void {
+    this.adaptiveHardwareScalingLevel = null;
+    this.adaptiveRenderQualityActive = false;
+    this.adaptiveQualityStamp = 0;
+    this.adaptiveQualityRecoverSamples = 0;
+    this.syncPointerMovePickingMode();
+  }
+
+  /** 高负载时暂停指针移动拾取，点击、右键和拖放仍走显式拾取以保留核心编辑能力。 */
+  private syncPointerMovePickingMode(): void {
+    this.scene.skipPointerMovePicking = this.shouldReduceEditorVisualEffects();
+  }
+
+  /** 判断当前是否允许运行时自动降低分辨率。 */
+  private isAutoRenderQualityMode(): boolean {
+    return this.renderQualityMode === "auto";
   }
 
   /** 读取当前场景环境背景色，供 React 项目条色块和项目加载后同步显示。 */
@@ -1827,6 +1974,10 @@ export class BabylonEditorEngine {
 
   /** 收集当前场景中可由外部数据匹配的模型根节点。 */
   private createSceneDataDrivenTargets(): SceneDataDrivenTarget[] {
+    if (this.dataDrivenTargetsCache) {
+      return this.dataDrivenTargetsCache;
+    }
+
     const targets = new Map<number, SceneDataDrivenTarget>();
     const visit = (node: Node): void => {
       if (node.metadata?.[HELPER_FLAG]) {
@@ -1860,11 +2011,16 @@ export class BabylonEditorEngine {
     };
 
     this.scene.rootNodes.forEach(visit);
-    return [...targets.values()];
+    this.dataDrivenTargetsCache = [...targets.values()];
+    return this.dataDrivenTargetsCache;
   }
 
   /** 收集可作为 Stacker 放货目标的定位框；只要求填写资产编号，不要求启用动画连接。 */
   private createSceneDataDrivenDropTargets(): SceneDataDrivenDropTarget[] {
+    if (this.dataDrivenDropTargetsCache) {
+      return this.dataDrivenDropTargetsCache;
+    }
+
     const targets = new Map<number, SceneDataDrivenDropTarget>();
     const visit = (node: Node): void => {
       if (node.metadata?.[HELPER_FLAG]) {
@@ -1883,7 +2039,8 @@ export class BabylonEditorEngine {
     };
 
     this.scene.rootNodes.forEach(visit);
-    return [...targets.values()];
+    this.dataDrivenDropTargetsCache = [...targets.values()];
+    return this.dataDrivenDropTargetsCache;
   }
 
   /** 将定位框资产编号转换成放货目标匹配字段。 */
@@ -1968,17 +2125,26 @@ export class BabylonEditorEngine {
 
   /** 收集当前场景中的 POI 根节点，运行态只消费这些轻量业务组件。 */
   private getScenePoiNodes(): TransformNode[] {
+    if (this.scenePoiNodesCache) {
+      return this.scenePoiNodesCache;
+    }
+
     const nodes = new Map<number, TransformNode>();
     [...this.scene.rootNodes, ...this.scene.transformNodes, ...this.scene.meshes].forEach((node) => {
       if (node instanceof TransformNode && !node.metadata?.[HELPER_FLAG] && this.isPoiNode(node)) {
         nodes.set(node.uniqueId, node);
       }
     });
-    return [...nodes.values()];
+    this.scenePoiNodesCache = [...nodes.values()];
+    return this.scenePoiNodesCache;
   }
 
   /** 收集运行态可绑定的业务根节点，排除 POI 自身和临时生成节点。 */
   private getEditableRuntimeRoots(): TransformNode[] {
+    if (this.editableRuntimeRootsCache) {
+      return this.editableRuntimeRootsCache;
+    }
+
     const nodes = new Map<number, TransformNode>();
     [...this.scene.rootNodes, ...this.scene.transformNodes, ...this.scene.meshes].forEach((node) => {
       if (
@@ -1992,7 +2158,8 @@ export class BabylonEditorEngine {
         nodes.set(node.uniqueId, node);
       }
     });
-    return [...nodes.values()];
+    this.editableRuntimeRootsCache = [...nodes.values()];
+    return this.editableRuntimeRootsCache;
   }
 
   /** 从节点 metadata 和模型包动态参数中生成数据驱动匹配字段。 */
@@ -2264,7 +2431,7 @@ export class BabylonEditorEngine {
     this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
-    this.refreshSceneGraph();
+    this.refreshSceneGraph(false);
     this.scene.render();
     return true;
   }
@@ -7000,15 +7167,17 @@ export class BabylonEditorEngine {
     this.gridGlowMeshes.length = 0;
     this.gridGlowColors.clear();
     this.gridGlowPulse = 0;
+    this.gridReducedEffectsApplied = false;
     this.gridGlowLayer.intensity = 0;
     this.gridGlowLayer.isEnabled = false;
   }
 
-  /** 按当前呼吸相位同步光晕强度；性能预览模式下关闭后处理，仅保留线段呼吸。 */
+  /** 按当前呼吸相位同步光晕强度；高负载模式下关闭后处理，把 GPU 时间留给场景主体。 */
   private updateGridGlow(pulse: number): void {
     const hasGlowMeshes = this.gridGlowMeshes.some((mesh) => !mesh.isDisposed());
-    this.gridGlowPulse = this.performanceMode || !hasGlowMeshes ? 0 : pulse;
-    this.gridGlowLayer.isEnabled = !this.performanceMode && hasGlowMeshes;
+    const reduceEffects = this.shouldReduceEditorVisualEffects();
+    this.gridGlowPulse = reduceEffects || !hasGlowMeshes ? 0 : pulse;
+    this.gridGlowLayer.isEnabled = !reduceEffects && hasGlowMeshes;
     this.gridGlowLayer.intensity = this.gridGlowLayer.isEnabled
       ? GRID_GLOW_MIN_INTENSITY + (GRID_GLOW_MAX_INTENSITY - GRID_GLOW_MIN_INTENSITY) * pulse
       : 0;
@@ -7269,7 +7438,7 @@ export class BabylonEditorEngine {
   private bindStatsLoop(): void {
     this.scene.onAfterRenderObservable.add(() => {
       const now = performance.now();
-      if (now - this.statsStamp < 500) {
+      if (now - this.statsStamp < EDITOR_STATS_INTERVAL_MS) {
         return;
       }
 
@@ -7306,6 +7475,33 @@ export class BabylonEditorEngine {
     return typeof value === "string" && value.trim() ? value.trim() : fallback;
   }
 
+  /** 判断 WebGL renderer 是否疑似软件路径，用于在状态栏直接暴露显卡未命中的风险。 */
+  private isSoftwareGpuRenderer(): boolean {
+    const renderer = `${this.gpuVendor} ${this.gpuRenderer}`.toLowerCase();
+    return (
+      renderer.includes("swiftshader") ||
+      renderer.includes("llvmpipe") ||
+      renderer.includes("software") ||
+      renderer.includes("microsoft basic render")
+    );
+  }
+
+  /** 读取 WebGL 主版本，缺失时回退 0，避免不同 Babylon 版本字段差异导致统计崩溃。 */
+  private getWebGlVersion(): number {
+    const engineWithVersion = this.engine as unknown as { webGLVersion?: number };
+    return typeof engineWithVersion.webGLVersion === "number" ? engineWithVersion.webGLVersion : 0;
+  }
+
+  /** 读取当前 GPU 的最大纹理尺寸，用来辅助判断 WebGL 是否落到低能力渲染路径。 */
+  private getMaxTextureSize(): number {
+    try {
+      const caps = this.engine.getCaps() as { maxTextureSize?: number };
+      return typeof caps.maxTextureSize === "number" ? caps.maxTextureSize : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /** 创建数据驱动运行态货箱 cube，只存在于预览内存中，不进入撤销栈和场景保存。 */
   private createRuntimeCargoBox(request: RuntimeCargoBoxRequest): TransformNode {
     const cargoCode = request.cargoCode.trim() || `Cargo-${Date.now()}`;
@@ -7335,6 +7531,7 @@ export class BabylonEditorEngine {
     material.specularColor = new Color3(0.22, 0.2, 0.16);
     material.doNotSerialize = true;
     mesh.material = material;
+    this.markScenePerformanceCachesDirty();
     return mesh;
   }
 
@@ -8043,6 +8240,11 @@ export class BabylonEditorEngine {
     }
   }
 
+  /** 只有相机主动运动或预览相机运行时才按帧检查动态网格，静止编辑态避免无效几何计算。 */
+  private shouldUpdateDynamicGridForFrame(): boolean {
+    return this.previewMode || this.cameraNavigationActive;
+  }
+
   /** 让所有可见网格线按同一节奏整体闪烁，帮助用户在大视野中快速定位编辑平面。 */
   private updateGridFlash(): void {
     if (this.gridVisualMeshes.length === 0) {
@@ -8050,20 +8252,75 @@ export class BabylonEditorEngine {
       return;
     }
 
-    const cycle = (performance.now() % GRID_FLASH_PERIOD_MS) / GRID_FLASH_PERIOD_MS;
+    if (this.shouldReduceEditorVisualEffects()) {
+      if (!this.gridReducedEffectsApplied) {
+        this.applyGridFlashVisibility(1);
+        this.updateGridGlow(0);
+        this.gridReducedEffectsApplied = true;
+      }
+      return;
+    }
+
+    this.gridReducedEffectsApplied = false;
+    const now = performance.now();
+    if (now - this.gridFlashStamp < ADAPTIVE_GRID_FLASH_THROTTLE_MS) {
+      return;
+    }
+
+    this.gridFlashStamp = now;
+    const cycle = (now % GRID_FLASH_PERIOD_MS) / GRID_FLASH_PERIOD_MS;
     const pulse = (Math.sin(cycle * Math.PI * 2) + 1) / 2;
     const easedPulse = pulse * pulse * (3 - 2 * pulse);
     const synchronizedVisibility =
       GRID_FLASH_MIN_VISIBILITY + (GRID_FLASH_MAX_VISIBILITY - GRID_FLASH_MIN_VISIBILITY) * easedPulse;
+    this.applyGridFlashVisibility(synchronizedVisibility);
+    this.updateGridGlow(easedPulse);
+  }
+
+  /** 高负载场景下关闭非必要编辑辅助动画，把算力留给模型和场景本体。 */
+  private shouldReduceEditorVisualEffects(): boolean {
+    return (
+      this.renderQualityMode === "performance" ||
+      this.adaptiveRenderQualityActive ||
+      this.isLargeSceneForEditorEffects() ||
+      this.isCurrentRenderLoadHighForEditorEffects() ||
+      this.isCurrentFpsLowForEditorEffects()
+    );
+  }
+
+  /** 大场景默认关闭网格光晕和闪烁动画，但不降低无损画质的后备缓冲分辨率。 */
+  private isLargeSceneForEditorEffects(): boolean {
+    const stats = this.getSceneContentStats();
+    return stats.meshCount >= LARGE_SCENE_EFFECT_MESH_THRESHOLD || stats.vertexCount >= LARGE_SCENE_EFFECT_VERTEX_THRESHOLD;
+  }
+
+  /** 通过上一帧 active mesh 和 draw call 判断大量小模型造成的渲染提交压力。 */
+  private isCurrentRenderLoadHighForEditorEffects(): boolean {
+    const activeMeshes = Number((this.scene.getActiveMeshes() as unknown as { length: number }).length ?? 0);
+    const drawCalls = this.sceneInstrumentation.drawCallsCounter.current;
+    return (
+      activeMeshes >= LARGE_SCENE_EFFECT_ACTIVE_MESH_THRESHOLD ||
+      (Number.isFinite(drawCalls) && drawCalls >= LARGE_SCENE_EFFECT_DRAW_CALL_THRESHOLD)
+    );
+  }
+
+  /** FPS 已经偏低时优先停掉编辑辅助后处理，避免继续挤占场景主体帧预算。 */
+  private isCurrentFpsLowForEditorEffects(): boolean {
+    const fps = this.engine.getFps();
+    return Number.isFinite(fps) && fps > 0 && fps < LOW_FPS_EFFECT_REDUCTION_THRESHOLD;
+  }
+
+  /** 批量设置网格线和扫线可见性，避免不同路径重复遍历同一批辅助 mesh。 */
+  private applyGridFlashVisibility(visibility: number): void {
     this.gridVisualMeshes.forEach((mesh) => {
       if (!mesh.isDisposed()) {
-        mesh.visibility = synchronizedVisibility;
+        mesh.visibility = visibility;
       }
     });
 
     this.gridFlashPulseMeshes.forEach((mesh) => {
       if (!mesh.isDisposed()) {
-        mesh.visibility = synchronizedVisibility;
+        mesh.visibility = visibility;
       }
     });
 
@@ -8071,10 +8328,9 @@ export class BabylonEditorEngine {
       if (!mesh.isDisposed()) {
         mesh.position.x = this.gridCenter.x;
         mesh.position.z = this.gridCenter.z;
-        mesh.visibility = synchronizedVisibility;
+        mesh.visibility = visibility;
       }
     });
-    this.updateGridGlow(easedPulse);
   }
 
   /** 根据网格覆盖范围选择易读的单元格尺寸，控制线段数量并保留 1m 默认精度。 */
@@ -8339,7 +8595,7 @@ export class BabylonEditorEngine {
     this.applyHighlight();
     this.syncGizmoMode();
     this.emitSelectionSnapshot();
-    this.refreshSceneGraph();
+    this.refreshSceneGraph(false);
   }
 
   /** 根据当前主选中对象同步 ArcRotateCamera 轨道中心，避免左键旋转继续绕世界原点。 */
@@ -12518,6 +12774,7 @@ export class BabylonEditorEngine {
         ...editorPatch
       }
     };
+    this.markScenePerformanceCachesDirty();
   }
 
   /** 读取节点可见性，导入模型根节点会以任一子网格可见作为可见状态。 */
@@ -12576,11 +12833,23 @@ export class BabylonEditorEngine {
   }
 
   /** 重新构建层级树数据，并过滤编辑器辅助对象。 */
-  private refreshSceneGraph(): void {
+  private refreshSceneGraph(sceneContentChanged = true): void {
+    if (sceneContentChanged) {
+      this.markScenePerformanceCachesDirty();
+    }
     const nodes: SceneNodeSummary[] = [];
     const roots = this.scene.rootNodes.filter((node) => !node.metadata?.[HELPER_FLAG]);
     roots.forEach((node) => this.pushSceneNodeSummary(nodes, node, 0));
     this.callbacks.onSceneGraphChange(nodes);
+  }
+
+  /** 场景结构或业务 metadata 变化后清理派生缓存，下一帧按最新内容重建。 */
+  private markScenePerformanceCachesDirty(): void {
+    this.sceneContentStatsCache = null;
+    this.scenePoiNodesCache = null;
+    this.editableRuntimeRootsCache = null;
+    this.dataDrivenTargetsCache = null;
+    this.dataDrivenDropTargetsCache = null;
   }
 
   /** 将可展示节点递归压入层级列表，导入模型内部节点仍保持折叠为单个模型。 */
@@ -12714,21 +12983,40 @@ export class BabylonEditorEngine {
 
   /** 汇总当前场景性能指标，便于用户判断编辑器压力。 */
   private collectStats(): EditorStats {
-    const meshes = this.scene.meshes.filter((mesh) => !mesh.metadata?.[HELPER_FLAG]);
+    const sceneContentStats = this.getSceneContentStats();
     const drawCalls = this.sceneInstrumentation.drawCallsCounter.current;
     return {
       fps: Math.round(this.engine.getFps()),
-      meshes: meshes.length,
+      meshes: sceneContentStats.meshCount,
       activeMeshes: Number((this.scene.getActiveMeshes() as unknown as { length: number }).length ?? 0),
-      vertices: meshes.reduce((total, mesh) => total + mesh.getTotalVertices(), 0),
+      vertices: sceneContentStats.vertexCount,
       drawCalls: Number.isFinite(drawCalls) ? Math.round(drawCalls) : 0,
       hardwareScalingLevel: Number(this.engine.getHardwareScalingLevel().toFixed(2)),
       renderWidth: this.engine.getRenderWidth(true),
       renderHeight: this.engine.getRenderHeight(true),
       gpuVendor: this.gpuVendor,
       gpuRenderer: this.gpuRenderer,
+      webGLVersion: this.getWebGlVersion(),
+      maxTextureSize: this.getMaxTextureSize(),
+      renderQualityMode: this.renderQualityMode,
+      adaptiveQualityActive: this.adaptiveRenderQualityActive,
+      softwareRenderer: this.isSoftwareGpuRenderer(),
       contextLost: this.webglContextLost
     };
+  }
+
+  /** 计算并缓存结构性场景规模，避免状态栏刷新时反复遍历全部 mesh 和顶点。 */
+  private getSceneContentStats(): SceneContentStatsCache {
+    if (this.sceneContentStatsCache) {
+      return this.sceneContentStatsCache;
+    }
+
+    const meshes = this.scene.meshes.filter((mesh) => !mesh.metadata?.[HELPER_FLAG]);
+    this.sceneContentStatsCache = {
+      meshCount: meshes.length,
+      vertexCount: meshes.reduce((total, mesh) => total + mesh.getTotalVertices(), 0)
+    };
+    return this.sceneContentStatsCache;
   }
 
   /** 创建右侧属性面板需要的场景级快照，缺失 metadata 时回退默认配置。 */

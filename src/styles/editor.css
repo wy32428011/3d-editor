@@ -23,7 +23,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -447,6 +448,41 @@ input {
   border-color: #72b87a;
   background: #253b2a;
   color: #aaf0a2;
+}
+
+.quality-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  min-width: 92px;
+  padding: 0 7px;
+  border: 1px solid #465041;
+  background: #171a18;
+  color: #d8d4c7;
+  cursor: pointer;
+}
+
+.quality-select:hover {
+  border-color: #72b87a;
+  background: #253b2a;
+  color: #aaf0a2;
+}
+
+.quality-select select {
+  width: 58px;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.quality-select option {
+  background: #171a18;
+  color: #eee8d8;
 }
 
 .stats-strip {

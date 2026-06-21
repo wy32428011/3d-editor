@@ -9,6 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isDevelopment = Boolean(process.env.ELECTRON_RENDERER_URL);
 const rendererUrl = process.env.ELECTRON_RENDERER_URL ?? "";
+const openDevToolsByDefault = process.env.ELECTRON_OPEN_DEVTOOLS === "1";
 const rendererDist = path.join(__dirname, "../dist");
 const preloadPath = path.join(__dirname, "preload.js");
 const projectMetaDir = ".babylon-editor";
@@ -67,7 +68,11 @@ let publishBuildPromise = null;
 function configureGpuAcceleration() {
     app.commandLine.appendSwitch("ignore-gpu-blocklist");
     app.commandLine.appendSwitch("enable-gpu-rasterization");
+    app.commandLine.appendSwitch("enable-zero-copy");
     app.commandLine.appendSwitch("force_high_performance_gpu");
+    if (process.platform === "win32") {
+        app.commandLine.appendSwitch("use-angle", "d3d11");
+    }
 }
 /** 判断未知值是否为普通对象，便于安全读取磁盘 JSON 字段。 */
 function isRecord(value) {
@@ -142,12 +147,13 @@ async function createMainWindow() {
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: false,
-            webSecurity: true
+            webSecurity: true,
+            backgroundThrottling: false
         }
     });
     mainWindow.once("ready-to-show", () => {
         mainWindow?.show();
-        if (isDevelopment) {
+        if (isDevelopment && openDevToolsByDefault) {
             mainWindow?.webContents.openDevTools({ mode: "detach" });
         }
     });
