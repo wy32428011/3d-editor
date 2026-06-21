@@ -10,6 +10,8 @@ interface ViewportCanvasProps {
   renderQualityMode: RenderQualityMode;
   previewMode: boolean;
   overheadMode: boolean;
+  gridVisible: boolean;
+  gridBreathingEffectEnabled: boolean;
   onEngineReady: (engine: BabylonEditorEngine | null) => void;
   onDropAsset: (assetId: string, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
   onDropFiles: (files: FileList, position: Vector3, engine: BabylonEditorEngine) => void | Promise<void>;
@@ -36,6 +38,8 @@ export function ViewportCanvas({
   renderQualityMode,
   previewMode,
   overheadMode,
+  gridVisible,
+  gridBreathingEffectEnabled,
   onEngineReady,
   onDropAsset,
   onDropFiles,
@@ -82,6 +86,14 @@ export function ViewportCanvas({
   useEffect(() => {
     engineRef.current?.setRenderQualityMode(renderQualityMode);
   }, [renderQualityMode]);
+
+  useEffect(() => {
+    engineRef.current?.setGridVisible(gridVisible);
+  }, [gridVisible]);
+
+  useEffect(() => {
+    engineRef.current?.setGridBreathingEffectEnabled(gridBreathingEffectEnabled);
+  }, [gridBreathingEffectEnabled]);
 
   useEffect(() => {
     engineRef.current?.setPreviewMode(previewMode);

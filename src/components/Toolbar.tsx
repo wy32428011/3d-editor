@@ -7,6 +7,8 @@ import {
   FileAxis3d,
   Gauge,
   Grid3X3,
+  Eye,
+  EyeOff,
   Lightbulb,
   Map,
   MousePointer2,
@@ -18,6 +20,7 @@ import {
   Rotate3D,
   Save,
   Scaling,
+  Sparkles,
   Square,
   Undo2,
   Upload,
@@ -31,6 +34,8 @@ interface ToolbarProps {
   renderQualityMode: RenderQualityMode;
   previewMode: boolean;
   overheadMode: boolean;
+  gridVisible: boolean;
+  gridBreathingEffectEnabled: boolean;
   stats: EditorStats;
   onToolChange: (tool: EditorTool) => void;
   onAddPrimitive: (kind: PrimitiveKind) => void;
@@ -55,6 +60,8 @@ interface ToolbarProps {
   onRenderQualityModeChange: (mode: RenderQualityMode) => void;
   onTogglePreview: () => void;
   onToggleOverheadMode: () => void;
+  onToggleGridVisible: () => void;
+  onToggleGridBreathingEffect: () => void;
 }
 
 const toolButtons: Array<{ tool: EditorTool; label: string; icon: typeof MousePointer2 }> = [
@@ -77,7 +84,7 @@ const renderQualityOptions: Array<{ mode: RenderQualityMode; label: string; titl
   { mode: "lossless", label: "无损", title: "无损高清：保持 4K 目标后备缓冲，不自动降画质" },
   { mode: "auto", label: "自动", title: "自动：先按无损高清渲染，低帧率时临时降压" },
   { mode: "balanced", label: "均衡", title: "均衡：约 1440p 目标像素，兼顾清晰度和流畅度" },
-  { mode: "performance", label: "流畅", title: "流畅：降低分辨率并减少辅助动画开销" }
+  { mode: "performance", label: "流畅", title: "流畅：降低分辨率并减少指针移动拾取开销" }
 ];
 
 /** 压缩 GPU 名称，避免长 renderer 字符串撑开工具栏。 */
@@ -128,6 +135,8 @@ export function Toolbar({
   renderQualityMode,
   previewMode,
   overheadMode,
+  gridVisible,
+  gridBreathingEffectEnabled,
   stats,
   onToolChange,
   onAddPrimitive,
@@ -151,7 +160,9 @@ export function Toolbar({
   onToggleInspector,
   onRenderQualityModeChange,
   onTogglePreview,
-  onToggleOverheadMode
+  onToggleOverheadMode,
+  onToggleGridVisible,
+  onToggleGridBreathingEffect
 }: ToolbarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const cadInputRef = useRef<HTMLInputElement>(null);
@@ -298,6 +309,24 @@ export function Toolbar({
           onClick={onToggleOverheadMode}
         >
           <Map size={18} />
+        </button>
+        <button
+          className={`icon-button ${gridVisible ? "is-active" : ""}`}
+          title={gridVisible ? "隐藏工作网格" : "显示工作网格"}
+          type="button"
+          aria-pressed={gridVisible}
+          onClick={onToggleGridVisible}
+        >
+          {gridVisible ? <Grid3X3 size={18} /> : <EyeOff size={18} />}
+        </button>
+        <button
+          className={`icon-button ${gridBreathingEffectEnabled ? "is-active" : ""}`}
+          title={gridBreathingEffectEnabled ? "关闭网格呼吸效果" : "开启网格呼吸效果"}
+          type="button"
+          aria-pressed={gridBreathingEffectEnabled}
+          onClick={onToggleGridBreathingEffect}
+        >
+          {gridBreathingEffectEnabled ? <Sparkles size={18} /> : <Eye size={18} />}
         </button>
         <button className="icon-button" title="Babylon Inspector" type="button" onClick={onToggleInspector}>
           <Bug size={18} />

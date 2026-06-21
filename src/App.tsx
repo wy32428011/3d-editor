@@ -1088,6 +1088,8 @@ export function App() {
   const [renderQualityMode, setRenderQualityMode] = useState<RenderQualityMode>("lossless");
   const [previewMode, setPreviewMode] = useState(false);
   const [overheadMode, setOverheadMode] = useState(false);
+  const [gridVisible, setGridVisible] = useState(true);
+  const [gridBreathingEffectEnabled, setGridBreathingEffectEnabled] = useState(true);
   const [recentProjects, setRecentProjects] = useState<RecentProjectRecord[]>([]);
   const [activeProject, setActiveProject] = useState<DesktopProjectRecord | null>(null);
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
@@ -2928,6 +2930,8 @@ export function App() {
         renderQualityMode={renderQualityMode}
         previewMode={previewMode}
         overheadMode={overheadMode}
+        gridVisible={gridVisible}
+        gridBreathingEffectEnabled={gridBreathingEffectEnabled}
         stats={stats}
         onToolChange={setTool}
         onAddPrimitive={handleAddPrimitive}
@@ -2952,6 +2956,8 @@ export function App() {
         onRenderQualityModeChange={handleRenderQualityModeChange}
         onTogglePreview={handleTogglePreview}
         onToggleOverheadMode={handleToggleOverheadMode}
+        onToggleGridVisible={() => setGridVisible((value) => !value)}
+        onToggleGridBreathingEffect={() => setGridBreathingEffectEnabled((value) => !value)}
       />
 
       <div className="project-strip">
@@ -3071,6 +3077,8 @@ export function App() {
           renderQualityMode={renderQualityMode}
           previewMode={previewMode}
           overheadMode={overheadMode}
+          gridVisible={gridVisible}
+          gridBreathingEffectEnabled={gridBreathingEffectEnabled}
           onEngineReady={handleEngineReady}
           onDropAsset={handleDropAsset}
           onDropFiles={handleDropFiles}

@@ -1323,8 +1323,10 @@ export class BabylonEditorEngine {
   private readonly gridGlowMeshes: Mesh[] = [];
   private readonly gridGlowColors = new Map<number, Color3>();
   private gridGlowPulse = 0;
+  private gridVisible = true;
+  private gridBreathingEffectEnabled = true;
   private gridFlashStamp = 0;
-  private gridReducedEffectsApplied = false;
+  private gridStaticVisibilityApplied = false;
   private readonly observedTransformGizmos = new WeakSet<object>();
   private readonly handleResize = () => this.resize();
   private readonly handleWebglContextLost = (event: Event) => {
@@ -1572,9 +1574,34 @@ export class BabylonEditorEngine {
     this.renderQualityMode = mode;
     this.resetAdaptiveRenderQuality();
     this.applyRenderQuality();
-    this.updateGridGlow(this.gridGlowPulse);
     this.syncPointerMovePickingMode();
     this.callbacks.onStatsChange(this.collectStats());
+  }
+
+  /** 显式显示或隐藏工作网格；透明拖放平面保持可用，避免隐藏网格后资源无法落点。 */
+  public setGridVisible(enabled: boolean): void {
+    if (this.gridVisible === enabled) {
+      return;
+    }
+
+    this.gridVisible = enabled;
+    this.applyGridVisibilityState();
+    if (enabled) {
+      this.updateDynamicGridForCamera();
+    }
+    this.scene.render();
+  }
+
+  /** 显式开关工作网格呼吸效果，呼吸不再跟随画质或降载模式自动变化。 */
+  public setGridBreathingEffectEnabled(enabled: boolean): void {
+    if (this.gridBreathingEffectEnabled === enabled) {
+      return;
+    }
+
+    this.gridBreathingEffectEnabled = enabled;
+    this.gridFlashStamp = 0;
+    this.applyGridVisibilityState();
+    this.scene.render();
   }
 
   /** 开关正顶俯瞰模式；开启后只锁定俯仰角，主动旋转、平移和缩放仍可用。 */
@@ -7183,20 +7210,78 @@ export class BabylonEditorEngine {
     this.gridGlowMeshes.length = 0;
     this.gridGlowColors.clear();
     this.gridGlowPulse = 0;
-    this.gridReducedEffectsApplied = false;
+    this.gridStaticVisibilityApplied = false;
     this.gridGlowLayer.intensity = 0;
     this.gridGlowLayer.isEnabled = false;
   }
 
-  /** 按当前呼吸相位同步光晕强度；高负载模式下关闭后处理，把 GPU 时间留给场景主体。 */
+  /** 按当前呼吸相位同步光晕强度；是否呼吸只由工具栏显式开关控制。 */
   private updateGridGlow(pulse: number): void {
     const hasGlowMeshes = this.gridGlowMeshes.some((mesh) => !mesh.isDisposed());
-    const reduceEffects = this.shouldReduceEditorVisualEffects();
-    this.gridGlowPulse = reduceEffects || !hasGlowMeshes ? 0 : pulse;
-    this.gridGlowLayer.isEnabled = !reduceEffects && hasGlowMeshes;
+    const enabled = this.gridVisible && this.gridBreathingEffectEnabled && hasGlowMeshes;
+    this.gridGlowPulse = enabled ? pulse : 0;
+    this.gridGlowLayer.isEnabled = enabled;
     this.gridGlowLayer.intensity = this.gridGlowLayer.isEnabled
       ? GRID_GLOW_MIN_INTENSITY + (GRID_GLOW_MAX_INTENSITY - GRID_GLOW_MIN_INTENSITY) * pulse
       : 0;
+  }
+
+  /** 根据工具栏开关统一应用网格视觉层状态，保留透明拖放平面用于落点计算。 */
+  private applyGridVisibilityState(): void {
+    if (!this.gridVisible || !this.gridBreathingEffectEnabled) {
+      this.applyGridStaticVisibility();
+      this.gridStaticVisibilityApplied = true;
+      return;
+    }
+
+    this.gridStaticVisibilityApplied = false;
+    this.gridVisualMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.visibility = 1;
+      }
+    });
+
+    this.gridFlashPulseMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.visibility = mesh.visibility > 0 ? mesh.visibility : GRID_FLASH_MIN_VISIBILITY;
+      }
+    });
+
+    this.gridFlashSweepMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.position.x = this.gridCenter.x;
+        mesh.position.z = this.gridCenter.z;
+        mesh.visibility = mesh.visibility > 0 ? mesh.visibility : GRID_FLASH_MIN_VISIBILITY;
+      }
+    });
+
+    this.updateGridGlow(this.gridGlowPulse);
+  }
+
+  /** 静态网格状态只显示基础线段，隐藏呼吸闪光层和 GlowLayer。 */
+  private applyGridStaticVisibility(): void {
+    const baseVisibility = this.gridVisible ? 1 : 0;
+    this.gridVisualMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.visibility = baseVisibility;
+      }
+    });
+
+    this.gridFlashPulseMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.visibility = 0;
+      }
+    });
+
+    this.gridFlashSweepMeshes.forEach((mesh) => {
+      if (!mesh.isDisposed()) {
+        mesh.position.x = this.gridCenter.x;
+        mesh.position.z = this.gridCenter.z;
+        mesh.visibility = 0;
+      }
+    });
+
+    this.updateGridGlow(0);
   }
 
   /** 创建随相机动态覆盖的线段工作网格和透明拖放平面，避免视口看到固定边界。 */
@@ -7267,6 +7352,7 @@ export class BabylonEditorEngine {
     this.gridCoverageSizeMeters = coverageSize;
     this.gridCellSizeMeters = cellSize;
     this.gridCenter = snappedCenter;
+    this.applyGridVisibilityState();
   }
 
   /** 释放旧网格辅助对象，供导入超大模型后重建更大参考网格。 */
@@ -8261,23 +8347,27 @@ export class BabylonEditorEngine {
     return this.previewMode || this.cameraNavigationActive;
   }
 
-  /** 让所有可见网格线按同一节奏整体闪烁，帮助用户在大视野中快速定位编辑平面。 */
+  /** 让所有可见网格线按用户开关呼吸闪烁，画质模式不再接管呼吸效果。 */
   private updateGridFlash(): void {
     if (this.gridVisualMeshes.length === 0) {
       this.updateGridGlow(0);
       return;
     }
 
-    if (this.shouldReduceEditorVisualEffects()) {
-      if (!this.gridReducedEffectsApplied) {
-        this.applyGridFlashVisibility(1);
-        this.updateGridGlow(0);
-        this.gridReducedEffectsApplied = true;
+    if (!this.gridVisible) {
+      if (!this.gridStaticVisibilityApplied) {
+        this.applyGridVisibilityState();
       }
       return;
     }
 
-    this.gridReducedEffectsApplied = false;
+    if (!this.gridBreathingEffectEnabled) {
+      if (!this.gridStaticVisibilityApplied) {
+        this.applyGridVisibilityState();
+      }
+      return;
+    }
+
     const now = performance.now();
     if (now - this.gridFlashStamp < ADAPTIVE_GRID_FLASH_THROTTLE_MS) {
       return;
@@ -8289,11 +8379,13 @@ export class BabylonEditorEngine {
     const easedPulse = pulse * pulse * (3 - 2 * pulse);
     const synchronizedVisibility =
       GRID_FLASH_MIN_VISIBILITY + (GRID_FLASH_MAX_VISIBILITY - GRID_FLASH_MIN_VISIBILITY) * easedPulse;
+
+    this.gridStaticVisibilityApplied = false;
     this.applyGridFlashVisibility(synchronizedVisibility);
     this.updateGridGlow(easedPulse);
   }
 
-  /** 高负载场景下关闭非必要编辑辅助动画，把算力留给模型和场景本体。 */
+  /** 高负载场景下减少非必要编辑交互开销，网格呼吸由工具栏开关独立控制。 */
   private shouldReduceEditorVisualEffects(): boolean {
     return (
       this.renderQualityMode === "performance" ||
@@ -8304,7 +8396,7 @@ export class BabylonEditorEngine {
     );
   }
 
-  /** 大场景默认关闭网格光晕和闪烁动画，但不降低无损画质的后备缓冲分辨率。 */
+  /** 判断是否进入编辑交互降载，主要用于暂停指针移动拾取，不接管网格呼吸效果。 */
   private isLargeSceneForEditorEffects(): boolean {
     const stats = this.getSceneContentStats();
     return stats.meshCount >= LARGE_SCENE_EFFECT_MESH_THRESHOLD || stats.vertexCount >= LARGE_SCENE_EFFECT_VERTEX_THRESHOLD;
