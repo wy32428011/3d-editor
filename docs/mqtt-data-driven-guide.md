@@ -48,9 +48,9 @@ Babylon 场景节点位姿变化（模型按真实数据运动）
 - `movement_z`：`0` 原位/停止，`1` 上升，`2` 下降；用于四向车等需要顶升的整车模型预留。
 - `front_movement_z` / `back_movement_z` / `forkState`：`0` 停止，`1/3` 伸出，`2/4` 缩回；用于 Stacker 和多穿小车货叉。
 - `rotation`：`0` 停止，`1` 正转，`2` 反转；可作为输送线辊筒、移载辊的正反转别名。
-- Stacker `distancex` 是行走绝对距离，单位毫米，运行时直接使用 MQTT 原值并以轨道起点为 0 点校准行走位置；`front_distanceY/back_distanceY` 是前/后叉载台高度校准值，单位毫米，运行时换算为米后校准 Stacker 升降位置；V5.2 标准 `front_forkLocation/back_forkLocation` 可校准货叉水平伸缩位置，运行时额外兼容非标准连续距离字段 `front_forkDistance/back_forkDistance`；通用 `distance_x/distance_y/distance_z` 与 `rpm_*` 当前只作为协议遥测字段保留，不直接换算模型位移或角速度。
+- Stacker `distancex/distance_x` 是行走绝对距离，运行时直接使用协议原值并以轨道起点为 0 点校准行走位置；新协议 `distance_y` 是米制载货台高度校准值，旧 `front_distanceY/back_distanceY` 仍按毫米换算为米后校准升降位置；新协议 `front_distance_z/back_distance_z`、V5.2 标准 `front_forkLocation/back_forkLocation` 和扩展 `front_forkDistance/back_forkDistance` 都可校准货叉水平伸缩位置；`rpm_*`、`workingHours_*`、`signalBits` 等字段作为遥测保留，不直接换算速度。
 - 设备号既支持旧字段 `e`，也支持 Excel 常用字段 `deviceCode`；现场 DDJ2 报文中的 `deviceCode` 会作为调度号和业务字段保留，默认不覆盖 `e` 设备匹配号，旧 `device_code` 仍兼容。规范 topic 缺少设备字段时仍会用 topic 中的 `{deviceId}` 兜底。
-- DDJ2 Stacker PLC 报文支持 `{data:[{e,p,v}],ts}` 包装：`action` bit0/bit1 转行走前进/后退，`front_action/back_action` bit2/bit3 转载货台上升/下降，`front_distanceY/back_distanceY` 校准载台高度，`front_forkLocation/back_forkLocation` 校准货叉水平位置，`front_forkAction/back_forkAction` 按 bit1 右伸、bit2 左缩、bit3 左伸、bit4 右缩驱动货叉。蓝色区域其他遥测和状态字段默认不驱动模型。
+- DDJ2 Stacker PLC 报文支持 `{data:[{e,p,v}],ts}` 包装：当前新字段 `movement_x/movement_y/front_movement_z/back_movement_z` 直接驱动行走、升降和伸叉，`distance_x/distance_y/front_distance_z/back_distance_z` 做绝对位置校准并优先于同帧动作积分；旧 V5.2 的 `action/front_action/back_action/front_forkAction/back_forkAction` 位信号和 `distancex/front_distanceY/back_distanceY/front_forkLocation/back_forkLocation` 仍兼容。其他遥测和状态字段默认不驱动模型。
 - 模型包新增 `valueMode:"action"`、`actionMap` 和 `target:"root"`。旧 `valueMode:"target"` 数值目标模式继续保留，已导入的旧场景不会自动切换到动作模式。
 - 新模型包或修改过 `dataDriven` 的模型包需要重新导入，编辑器才会重新解析模型脚本里的动作声明。
 
@@ -236,20 +236,29 @@ dt/factory/logistics/+/+/twindatadriven/#
 
 运行时会把 `{e,p,v}` 或 `{deviceCode,p,v}` 数组**按设备编号分组归一化**为 `{deviceCode, movement_x: 1, movement_y: 1}` 形式的帧再驱动模型；同一数组里多个设备的点位会拆成多帧分别匹配。也接受单对象 `{deviceCode:"Stacker01", movement_x:1}`。
 
-现场 DDJ2 Stacker PLC 报文可直接用附件中的外层包装：
+现场 DDJ2 Stacker PLC 报文可直接用当前新协议外层包装：
 
 ```json
 {
   "data": [
     {"e":"DDJ2","p":"deviceCode","v":"1"},
-    {"e":"DDJ2","p":"mode","v":"4"},
-    {"e":"DDJ2","p":"move","v":"0"},
-    {"e":"DDJ2","p":"action","v":"1"},
-    {"e":"DDJ2","p":"back_action","v":"4"},
-    {"e":"DDJ2","p":"front_forkAction","v":"2"},
-    {"e":"DDJ2","p":"back_forkAction","v":"2"}
+    {"e":"DDJ2","p":"front_command","v":0},
+    {"e":"DDJ2","p":"mode","v":4},
+    {"e":"DDJ2","p":"back_command","v":9},
+    {"e":"DDJ2","p":"front_x","v":36},
+    {"e":"DDJ2","p":"front_y","v":6},
+    {"e":"DDJ2","p":"movement_x","v":0},
+    {"e":"DDJ2","p":"movement_y","v":0},
+    {"e":"DDJ2","p":"front_movement_z","v":0},
+    {"e":"DDJ2","p":"back_movement_z","v":0},
+    {"e":"DDJ2","p":"distance_x","v":43.5726},
+    {"e":"DDJ2","p":"distance_y","v":7.6856},
+    {"e":"DDJ2","p":"front_distance_z","v":0},
+    {"e":"DDJ2","p":"back_distance_z","v":0},
+    {"e":"DDJ2","p":"normal","v":true},
+    {"e":"DDJ2","p":"message","v":"正常"}
   ],
-  "ts": "2026-06-16T13:16:28.782+08:00"
+  "ts": "2026-06-22T16:31:36.682961605+08:00"
 }
 ```
 
@@ -260,23 +269,29 @@ dt/factory/logistics/+/+/twindatadriven/#
 - `movement_z: 0/1/2` 表示原位/上升/下降，主要给四向车等有顶升动作的整车模型预留。
 - `front_movement_z`、`back_movement_z`、`forkState`：`0` 停止，`1/3` 伸出，`2/4` 缩回。
 - `rotation: 0/1/2` 表示停止/正转/反转，可作为输送线辊筒、移载辊的别名字段。
-- Stacker `distancex` 按 MQTT 毫米原值校准行走位置，不做单位转换，同帧存在 `action` 时优先使用 `distancex`；`front_distanceY/back_distanceY` 按毫米值换算为米后校准载台高度，并优先于同帧升降动作；V5.2 标准 `front_forkLocation/back_forkLocation` 或运行时扩展 `front_forkDistance/back_forkDistance` 命中时会校准货叉水平伸缩位置，并优先于同帧 forkAction 积分；通用 `distance_x/distance_y/distance_z` 和 `rpm_*` 只作为协议遥测字段保留，不直接换算位移或角速度。
+- Stacker `distancex/distance_x` 按协议原值校准行走位置，同帧存在行走动作时优先使用距离校准；`distance_y` 按米制值校准载台高度，旧 `front_distanceY/back_distanceY` 按毫米值换算为米后兼容；`front_distance_z/back_distance_z`、V5.2 标准 `front_forkLocation/back_forkLocation` 或运行时扩展 `front_forkDistance/back_forkDistance` 命中时会校准货叉水平伸缩位置，并优先于同帧货叉动作积分；`rpm_*`、`workingHours_*`、`signalBits` 只作为协议遥测字段保留。
 
 **DDJ2 PLC 点位映射**：
 
 | PLC 点位 | 位信号 | 标准动作字段 | 说明 |
 |---|---|---|---|
+| `movement_x` | `0` 停止，`1` 前进，`2` 后退 | Stacker travel 动作 | 当前新协议直接动作字段 |
+| `distance_x` | 协议原值绝对距离 | Stacker travel 目标 | 以轨道起点为 0 点校准行走位置；同帧优先于 `movement_x` |
+| `movement_y` | `0` 停止，`1` 上升，`2` 下降 | Stacker lift 动作 | 当前新协议直接动作字段 |
+| `distance_y` | 米制绝对高度 | Stacker lift 目标 | 校准载货台高度；同帧优先于 `movement_y` |
+| `front_movement_z` / `back_movement_z` | `0` 停止，`1/3` 伸出，`2/4` 缩回 | Stacker fork 动作 | 前后叉同组上报时优先采用非 0 动作 |
+| `front_distance_z` / `back_distance_z` | 米或毫米绝对距离 | Stacker fork 目标 | 校准货叉伸缩位置，最终夹紧在 `[-forkLength,+forkLength]` |
 | `action` | bit0 前进，bit1 后退 | `movement_x` | 两个位同时为 0 或冲突时按停止处理 |
 | `distancex` | 毫米绝对距离 | Stacker travel 目标 | 以轨道起点为 0 点，直接使用 MQTT 原值校准行走位置 |
 | `front_action` / `back_action` | bit2 上升，bit3 下降 | `movement_y` | 任一前/后叉升降信号可驱动载货台升降 |
 | `front_distanceY` / `back_distanceY` | 毫米绝对高度 | Stacker lift 目标 | 前叉值优先，缺失或非法时使用后叉值；同帧优先于升降动作 |
 | `front_forkLocation` / `back_forkLocation` | 原位、浅/深货位极限、换速位 | Stacker fork 目标 | 以 0 为原点，左负右正；前叉值优先 |
 | `front_forkDistance` / `back_forkDistance` | 米或毫米绝对距离 | Stacker fork 目标 | 运行时扩展字段，非 V5.2 标准；明显超过货叉行程时按毫米换算 |
-| `front_forkAction` | bit1 右伸，bit2 左缩，bit3 左伸，bit4 右缩 | `front_movement_z` | 按左右方向持续积分；缩叉朝原点回收 |
-| `back_forkAction` | bit1 右伸，bit2 左缩，bit3 左伸，bit4 右缩 | `back_movement_z` | 按左右方向持续积分；缩叉朝原点回收 |
+| `front_forkAction` | bit1 右伸，bit2 左缩，bit3 左伸，bit4 右缩 | `front_movement_z` | 旧 V5.2 位信号；缩叉朝原点回收 |
+| `back_forkAction` | bit1 右伸，bit2 左缩，bit3 左伸，bit4 右缩 | `back_movement_z` | 旧 V5.2 位信号；缩叉朝原点回收 |
 | `deviceCode` / `device_code` | 调度号 | 保留业务字段 | 不覆盖 `e=DDJ2` 设备匹配号 |
 
-运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`frontForkLocation/backForkLocation`、`front_forkDistance/back_forkDistance`、`deviceCode/device_code`、`distanceX/distance_x`、`frontDistanceY/backDistanceY`、`front_distanceY/back_distanceY` 都能被识别。对 Stacker 来说，`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`*_rpm`、`*_electric Current`、`*_workingHours`、`*_runingTimes` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算。截图蓝色区域属于非程序逻辑信号，非必要时不作为模型驱动输入。
+运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`frontForkLocation/backForkLocation`、`front_forkDistance/back_forkDistance`、`front_distance_z/back_distance_z`、`deviceCode/device_code`、`distanceX/distance_x`、`distanceY/distance_y`、`frontDistanceY/backDistanceY`、`front_distanceY/back_distanceY` 都能被识别。对 Stacker 来说，`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`to_x/to_y/to_z`、`front_containerCode/back_containerCode`、`*_rpm`、`*_workingHours`、`signalBits`、`normal/errorCode/message` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算。
 
 **辊道机 PLC 点位映射**：
 
@@ -397,10 +412,12 @@ payload 示例：
 | 点位 | 动作枚举 | kind/axis | 默认速度 | 效果 |
 |---|---|---|---|---|
 | `movement_x` | `0` 停止，`1` 前进，`2` 后退 | translate / z | `0.8m/s` | 行走机构沿轨道方向持续移动；上下轨道 `fixedNodes` 保持固定 |
-| `distancex` | 毫米绝对距离 | translate / z | `0.8m/s` | 以轨道起点为 0 点校准行走位置；同帧优先于 `action/movement_x` |
+| `distance_x` / `distancex` | 协议原值绝对距离 | translate / z | `0.8m/s` | 以轨道起点为 0 点校准行走位置；同帧优先于 `movement_x/action` |
 | `movement_y` | `0` 停止，`1` 上升，`2` 下降 | translate / y | `0.3m/s` | 载货台 + 货叉垂直升降 |
-| `front_distanceY` / `back_distanceY` | 毫米绝对高度 | translate / y | `0.3m/s` | 校准载台 + 货叉垂直位置；同帧优先于 `front_action/back_action` |
+| `distance_y` | 米制绝对高度 | translate / y | `0.3m/s` | 校准载台 + 货叉垂直位置；同帧优先于 `movement_y` |
+| `front_distanceY` / `back_distanceY` | 毫米绝对高度 | translate / y | `0.3m/s` | 旧 V5.2 兼容字段，换算成米后校准升降 |
 | `front_forkLocation` / `back_forkLocation` | 位置位信号 | translate / x | `0.25m/s` | 校准货叉水平伸缩位置；左负右正 |
+| `front_distance_z` / `back_distance_z` | 米或毫米距离 | translate / x | `0.25m/s` | 当前新协议伸叉距离校准字段；同帧优先于货叉动作 |
 | `front_forkDistance` / `back_forkDistance` | 米或毫米距离 | translate / x | `0.25m/s` | 运行时扩展字段，校准货叉水平伸缩距离；同帧优先于 forkAction |
 | `front_movement_z` / `back_movement_z` / `forkState` | `0` 停止，`1/3` 伸，`2/4` 缩 | translate / x | `0.25m/s` | 货叉水平伸缩；PLC V5.2 位域会按左右方向映射 |
 | `cargo_action` | 字符串 | — | — | `pickup`/`drop`，见第 7 章 |
@@ -409,19 +426,18 @@ payload 示例：
 
 ```json
 [
-  {"deviceCode":"Stacker01","p":"movement_x","v":1,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"distancex","v":260928,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"movement_y","v":1,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"front_distanceY","v":2366,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"front_forkDistance","v":600,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"front_movement_z","v":1,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"back_movement_z","v":1,"ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"cargo_action","v":"pickup","ts":1746991234567},
-  {"deviceCode":"Stacker01","p":"cargo","v":"Box01","ts":1746991234567}
+  {"e":"DDJ2","p":"movement_x","v":1,"ts":1746991234567},
+  {"e":"DDJ2","p":"distance_x","v":44.3726,"ts":1746991234567},
+  {"e":"DDJ2","p":"movement_y","v":2,"ts":1746991234567},
+  {"e":"DDJ2","p":"distance_y","v":7.3856,"ts":1746991234567},
+  {"e":"DDJ2","p":"front_movement_z","v":1,"ts":1746991234567},
+  {"e":"DDJ2","p":"front_distance_z","v":0.55,"ts":1746991234567},
+  {"e":"DDJ2","p":"cargo_action","v":"pickup","ts":1746991234567},
+  {"e":"DDJ2","p":"cargo","v":"Box01","ts":1746991234567}
 ]
 ```
 
-Stacker 行走会按固定轨道节点推导行程边界；没有端部挡块节点时，运行时会用上下轨道 `fixedNodes` 的整体几何范围兜底。`distancex`、`movement_x` 持续动作和 `twinspawn` 平面位置都会被限制在进入预览时的轨道范围内；`front_distanceY/back_distanceY` 会换算为米制高度并按 lift 限位截断；货叉伸缩在运行态会把旧 `0..max` 限位扩展为 `-max..max`，支持左右两侧伸叉，距离/位置校准和动作积分都会按该范围截断。
+Stacker 行走会按固定轨道节点推导行程边界；没有端部挡块节点时，运行时会用上下轨道 `fixedNodes` 的整体几何范围兜底。`distance_x/distancex`、`movement_x` 持续动作和 `twinspawn` 平面位置都会被限制在进入预览时的轨道范围内；`distance_y` 和旧 `front_distanceY/back_distanceY` 会按 lift 限位截断；货叉伸缩在运行态会把旧 `0..max` 限位扩展为 `-max..max`，支持左右两侧伸叉，距离/位置校准和动作积分都会按该范围截断。
 
 DDJ2 PLC 点位示例：
 
@@ -429,15 +445,14 @@ DDJ2 PLC 点位示例：
 {
   "data": [
     {"e":"DDJ2","p":"deviceCode","v":"1"},
-    {"e":"DDJ2","p":"action","v":"1"},
-    {"e":"DDJ2","p":"distancex","v":"260928"},
-    {"e":"DDJ2","p":"front_action","v":"4"},
-    {"e":"DDJ2","p":"back_action","v":"4"},
-    {"e":"DDJ2","p":"front_forkLocation","v":"1"},
-    {"e":"DDJ2","p":"front_forkAction","v":"2"},
-    {"e":"DDJ2","p":"back_forkAction","v":"2"}
+    {"e":"DDJ2","p":"movement_x","v":1},
+    {"e":"DDJ2","p":"distance_x","v":44.3726},
+    {"e":"DDJ2","p":"movement_y","v":2},
+    {"e":"DDJ2","p":"distance_y","v":7.3856},
+    {"e":"DDJ2","p":"front_movement_z","v":1},
+    {"e":"DDJ2","p":"front_distance_z","v":0.55}
   ],
-  "ts": "2026-06-16T13:16:28.782+08:00"
+  "ts": "2026-06-22T16:31:36.682961605+08:00"
 }
 ```
 
@@ -632,8 +647,8 @@ motion: {
 
 - 显式 `min`/`max` 优先；缺省端点时，运行时沿运动轴投影**移动部件**和**防撞物体**的几何包围盒，取防撞物体内侧面（含 `clearance`）作为边界；
 - Stacker 行走组没有真实端部挡块、只声明上下轨道 `fixedNodes` 时，运行时会在防撞物体内侧面推导失败后改用轨道整体包围盒推导边界，并把 `twinspawn` 平面位置同步夹紧到同一轨道范围；
-- Stacker `distancex` 使用同一条行程边界，超过轨道范围的毫米距离只会被截断到最近端点；
-- Stacker `front_distanceY/back_distanceY` 会先从毫米换算到米，再使用 lift 组同一条升降边界截断；
+- Stacker `distance_x/distancex` 使用同一条行程边界，超过轨道范围的距离只会被截断到最近端点；
+- Stacker `distance_y` 和旧 `front_distanceY/back_distanceY` 会使用 lift 组同一条升降边界截断；
 - Stacker V5.2 `front_forkLocation/back_forkLocation` 和运行时扩展 `front_forkDistance/back_forkDistance` 使用 fork 组同一条伸缩边界，旧单向限位在运行态扩展为左负右正的双向限位；
 - 超范围的 payload 值**只截断不报错**，预览不中断；
 - 仅对 `translate` 运动组生效；
@@ -778,7 +793,7 @@ node scripts/stacker-mqtt-demo-bridge.mjs
 
 ### 9.3 DDJ2 新现场报文脚本
 
-`scripts/stacker-ddj2-plc-message.mjs` 按附件里的新 PLC 报文字段集合输出完整 DDJ2 Stacker joint 包。脚本默认每帧都保留 `mode/move/command/task/error/rpm/current/workingHours/runingTimes/cache` 等字段，只覆盖 `action/back_action/front_forkAction/back_forkAction` 形成一组可观察的行走、升降、伸叉和缩叉动作：
+`scripts/stacker-ddj2-plc-message.mjs` 按当前截图里的新 PLC 报文字段集合输出完整 DDJ2 Stacker joint 包。脚本默认每帧都保留 `mode/command/task/containerCode/signalBits/rpm/workingHours/normal/errorCode/message/to_*` 等字段，只覆盖 `movement_x/movement_y/front_movement_z/back_movement_z` 和 `distance_x/distance_y/front_distance_z/back_distance_z` 形成一组可观察的行走、升降、伸叉和缩叉动作：
 
 ```bash
 npm run demo:stacker-ddj2-plc
@@ -794,11 +809,14 @@ npm run demo:stacker-ddj2-plc:dry-run
 
 ### 9.4 Stacker 场景流程报文脚本
 
-`scripts/stacker-scene-mqtt-sequence.mjs` 用于验证「货箱放在辊道入口 → Stacker 伸叉取货 → 载货台移动 → 放入定位线框 1-1-1」的完整外部报文流程。脚本会按多 Topic 顺序发送以下数据：
+`scripts/stacker-scene-mqtt-sequence.mjs` 用于验证 test2 的「链条机 1005 前端有货 → 货箱输送到后端 → DDJ2 伸叉取货 → 载货台移动 → 放入定位线框 1-1-1」完整外部报文流程。脚本会按多 Topic 顺序发送以下数据：
 
-- `dt/factory/logistics/material/Box01/twinspawn`：仅把场景中已有资产编号为 `Box01` 的 cube 货箱放到辊道入口。
-- `dt/factory/logistics/stacker/Stacker01/twinspawn`：标准模式初始化 Stacker 整机位姿；PLC 模式默认设备号切为 `DDJ2`。
-- `dt/factory/logistics/stacker/Stacker01/twindatadriven/joint`：标准模式驱动 Stacker 货叉、载货台、取放货箱和 `target=1-1-1` 定点放货；PLC 模式会转换为 `action/front_action/back_action/front_forkAction/back_forkAction`。
+- `dt/factory/logistics/material/Box01/twinspawn`：把场景中已有资产编号为 `Box01` 的 cube 货箱放到 1005 前端默认位置。
+- `dt/factory/logistics/conveyor/1005/twindatadriven/status`：发送 `front_has_cargo`、`rear_has_cargo` 前后端有货状态。
+- `dt/factory/logistics/conveyor/1005/twindatadriven/payload`：发送 `payload=Box01`，把货箱绑定到链条机 1005。
+- `dt/factory/logistics/conveyor/1005/twindatadriven/joint`：发送 `movement_x=1/0`，驱动链条机运动并推进已绑定货箱。
+- `dt/factory/logistics/stacker/DDJ2/twinspawn`：初始化 DDJ2 设备上下文，不强行改写整机位置。
+- `dt/factory/logistics/stacker/DDJ2/twindatadriven/joint`：驱动 DDJ2 行走、升降、伸缩叉、取放货箱和 `target=1-1-1` 定点放货；PLC 模式只转换 DDJ2 joint 帧，链条机和货箱帧保持标准协议。
 
 ```bash
 npm run demo:stacker-scene
@@ -816,7 +834,7 @@ npm run demo:stacker-scene:dry-run
 npm run demo:stacker-scene:dry-run -- --plc
 ```
 
-前置条件：场景中需要有资产编号为 `Box01` 的货箱 cube、资产编号为 `1-1-1` 的定位线框，以及可匹配当前脚本设备号的 Stacker；PLC 模式默认绑定 `DDJ2`，标准模式默认绑定 `Stacker01`。当前 `material/{boxId}/twinspawn` 的 `action:"create"` 仍是保留业务帧，不会自动生成可被 Stacker 吸附的货箱；本脚本只用 `Box01` 的一次位姿帧设置入口位置，不再发送辊道机 payload 或 movement 动作。
+前置条件：场景中需要有资产编号为 `1005` 的链条机、资产编号为 `DDJ2` 的 Stacker、资产编号为 `Box01` 的货箱 cube，以及资产编号为 `1-1-1` 的定位线框。当前 `material/{boxId}/twinspawn` 仍只移动已有货箱，不自动生成新货箱；如果现场货位或链条机端点坐标不同，可通过 `STACKER_SCENE_BOX_FRONT`、`STACKER_SCENE_BOX_REAR`、`STACKER_SCENE_PICKUP_DISTANCE_X`、`STACKER_SCENE_DROP_DISTANCE_X`、`STACKER_SCENE_FORK_EXTEND` 等环境变量微调，位置变量支持 `x,y,z` 逗号格式或 JSON 对象。
 
 ### 9.5 排错清单：模型不动怎么查
 
@@ -837,7 +855,7 @@ npm run demo:stacker-scene:dry-run -- --plc
 | 11 | 整机动但内部机构不动（或反之） | 点位名与模型包 `motion.*.fields` 不一致；或运动组节点名失配 | 核对第 6 章点位名；用层级面板核对 glTF 节点名与 `dataDriven.motion.*.nodes` |
 | 12 | 数据包了一层 `data`/`result` | 包装未解开 | 设置「数据路径」；`data`/`payload`/`message` 包装会自动递归展开 |
 | 13 | 模型瞬移不平滑 | 插值设为 0，或发布间隔远大于插值时长 | 调大「插值(ms)」（如 200–500） |
-| 14 | 行走到一半停住 | 触发行程限制截断（不是故障），或 `distancex` 已超过轨道可行走范围 | 核对 `limits` 配置、轨道长度和 `distancex` 毫米值；Stacker 无端部挡块时会按上下轨道几何范围截断 |
+| 14 | 行走到一半停住 | 触发行程限制截断（不是故障），或 `distance_x/distancex` 已超过轨道可行走范围 | 核对 `limits` 配置、轨道长度和距离编码值；Stacker 无端部挡块时会按上下轨道几何范围截断 |
 | 15 | 货箱不吸附 | 伸叉量 < 0.45m、货箱超 2.5m、编号不匹配 | 核对 7.2 阈值与货箱资产编号 |
 | 16 | 「启动 Stacker 模拟」按钮置灰 | 模型被锁定 | 层级面板解锁后重试 |
 | 17 | 选中后没有「数据驱动」分区 | 选中的是 Group/POI/CAD 节点 | 选择拖入场景的模型实例本体 |

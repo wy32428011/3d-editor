@@ -32,95 +32,75 @@ let isShuttingDown = false;
 
 const BASE_RECORDS = [
   ["deviceCode", DEVICE_CODE],
-  ["mode", "4"],
-  ["stacker_error", "0"],
-  ["move", "0"],
-  ["action", "0"],
-  ["distancex", "260928"],
-  ["special1", "0"],
-  ["special2", "0"],
-  ["stacker_electric Current", "0"],
-  ["stacker_workingHours", "0"],
-  ["stacker_runing time", "0"],
-  ["front_command", "1"],
-  ["front_task", "10721"],
-  ["front_Yerror", "0"],
-  ["front_Zerror", "0"],
-  ["front_column", "31"],
-  ["front_layer", "1"],
-  ["front_row", "2"],
-  ["front_cargoMove", "0"],
-  ["front_action", "0"],
-  ["front_cargoError", "0"],
-  ["front_distanceY", "0"],
-  ["front_forkCargo", "0"],
-  ["front_forkCargo1", "false"],
-  ["front_forkLocation", "0"],
-  ["front_forkAction", "0"],
-  ["front_trayCode", ""],
-  ["front_y_electric Current", "0"],
-  ["front_y_workingHours", "0"],
-  ["front_y_runingTimes", "0"],
-  ["front_z_electric Current", "0"],
-  ["front_z_workingHours", "0"],
-  ["front_z_runingTimes", "0"],
-  ["back_command", "9"],
-  ["back_task", "0"],
-  ["back_Yerror", "0"],
-  ["back_Zerror", "0"],
-  ["back_column", "31"],
-  ["back_layer", "1"],
-  ["back_row", "2"],
-  ["back_cargoMove", "0"],
-  ["back_action", "4"],
-  ["back_cargoError", "0"],
-  ["back_distanceY", "0"],
-  ["back_forkCargo", "0"],
-  ["back_forkCargo1", "false"],
-  ["back_forkLocation", "0"],
-  ["back_forkAction", "0"],
-  ["back_trayCode", ""],
-  ["back_y_electric Current", "0"],
-  ["back_y_workingHours", "0"],
-  ["back_y_runingTimes", "0"],
-  ["back_z_electric Current", "0"],
-  ["back_z_workingHours", "0"],
-  ["back_z_runingTimes", "0"],
-  ["storage_cache", "0"]
+  ["front_command", 0],
+  ["mode", 4],
+  ["back_command", 9],
+  ["front_z", 0],
+  ["front_x", 36],
+  ["front_y", 6],
+  ["front_task", 0],
+  ["back_task", 0],
+  ["front_containerCode", ""],
+  ["back_containerCode", ""],
+  ["signalBits", 0],
+  ["front_signalBits", 0],
+  ["back_signalBits", 0],
+  ["movement_x", 0],
+  ["movement_y", 0],
+  ["front_movement_z", 0],
+  ["back_movement_z", 0],
+  ["rpm_x", 0],
+  ["rpm_y", 0],
+  ["front_rpm_z", 0],
+  ["back_rpm_z", 0],
+  ["distance_x", 43.5726],
+  ["distance_y", 7.6856],
+  ["front_distance_z", 0],
+  ["back_distance_z", 0],
+  ["workingHours_x", 0],
+  ["workingHours_y", 0],
+  ["front_workingHours_z", 0],
+  ["back_workingHours_z", 0],
+  ["normal", true],
+  ["errorCode", 0],
+  ["message", "正常"],
+  ["to_z", 0],
+  ["to_x", 0],
+  ["to_y", 0]
 ];
 
 const MOTION_STEPS = [
   {
-    label: "附件原始状态：后叉升降上升",
+    label: "现场原始状态：全机构停止",
     overrides: {}
   },
   {
-    label: "行走前进",
-    overrides: { action: "1", back_action: "0" }
+    label: "行走前进并更新水平编码",
+    overrides: { movement_x: 1, distance_x: 44.3726, to_x: 37 }
   },
   {
     label: "行走停止",
-    overrides: { action: "0", back_action: "0" }
+    overrides: { movement_x: 0, distance_x: 44.3726, front_x: 37 }
   },
   {
-    label: "载货台下降",
-    overrides: { back_action: "8" }
+    label: "载货台下降并更新垂直编码",
+    overrides: { movement_y: 2, distance_y: 7.3856, to_y: 5 }
   },
   {
-    label: "货叉伸出",
-    overrides: { back_action: "0", front_forkAction: "2", back_forkAction: "2" }
+    label: "前叉伸出并更新伸叉编码",
+    overrides: { movement_y: 0, front_movement_z: 1, front_distance_z: 0.55 }
   },
   {
     label: "货叉停止",
-    overrides: { front_forkAction: "0", back_forkAction: "0" }
+    overrides: { front_movement_z: 0, front_distance_z: 0.55 }
   },
   {
-    label: "货叉缩回",
-    overrides: { front_forkAction: "16", back_forkAction: "16" }
+    label: "前叉缩回",
+    overrides: { front_movement_z: 2, front_distance_z: 0 }
   },
   {
     label: "全机构停止",
-    overrides: { action: "0", back_action: "0", front_forkAction: "0", back_forkAction: "0" }
+    overrides: { movement_x: 0, movement_y: 0, front_movement_z: 0, back_movement_z: 0 }
   }
 ];
 
@@ -293,7 +273,7 @@ function handleCompleteMqttPacket(packet, fixedHeaderLength, remainingLength) {
   }
 }
 
-/** 生成一帧新现场报文，保留附件字段集合，只覆盖动作点位。 */
+/** 生成一帧新现场报文，保留截图字段集合，只覆盖动作和编码点位。 */
 function createStackerPlcPayload(step, timestampMs) {
   const overrides = step.overrides ?? {};
   return {

@@ -9,10 +9,19 @@ const WS_PORT = readNumberOption("STACKER_SCENE_WS_PORT", 18084, 1);
 const WS_PATH = normalizeWebSocketPath(process.env.STACKER_SCENE_WS_PATH ?? "/stacker-scene");
 const SCENE_PROTOCOL = normalizeSceneProtocol(process.env.STACKER_SCENE_PROTOCOL ?? (process.argv.includes("--plc") ? "plc" : "standard"));
 const PLC_MODE = SCENE_PROTOCOL === "plc";
-const STACKER_ID = process.env.STACKER_SCENE_STACKER_ID ?? (PLC_MODE ? "DDJ2" : "Stacker01");
+const STACKER_ID = process.env.STACKER_SCENE_STACKER_ID ?? "DDJ2";
 const STACKER_DEVICE_CODE = process.env.STACKER_SCENE_DEVICE_CODE ?? "1";
+const CONVEYOR_ID = process.env.STACKER_SCENE_CONVEYOR_ID ?? "1005";
 const BOX_ID = process.env.STACKER_SCENE_BOX_ID ?? "Box01";
 const LOCATOR_ID = process.env.STACKER_SCENE_LOCATOR_ID ?? "1-1-1";
+const BOX_FRONT_POSITION = readVectorOption("STACKER_SCENE_BOX_FRONT", { x: 11.85, y: 0.95, z: 1.39 });
+const BOX_REAR_POSITION = readVectorOption("STACKER_SCENE_BOX_REAR", { x: 15.1, y: 0.95, z: 1.39 });
+const STACKER_PICKUP_DISTANCE_X = readNumberOption("STACKER_SCENE_PICKUP_DISTANCE_X", -4.65, Number.NEGATIVE_INFINITY);
+const STACKER_DROP_DISTANCE_X = readNumberOption("STACKER_SCENE_DROP_DISTANCE_X", 9.02, Number.NEGATIVE_INFINITY);
+const STACKER_PICKUP_DISTANCE_Y = readNumberOption("STACKER_SCENE_PICKUP_DISTANCE_Y", 0, Number.NEGATIVE_INFINITY);
+const STACKER_DROP_DISTANCE_Y = readNumberOption("STACKER_SCENE_DROP_DISTANCE_Y", 0, Number.NEGATIVE_INFINITY);
+const STACKER_FORK_EXTEND = readNumberOption("STACKER_SCENE_FORK_EXTEND", 0.72, 0);
+const STACKER_FORK_RETRACT = readNumberOption("STACKER_SCENE_FORK_RETRACT", 0, 0);
 const STATIC_BASE_TS = readNumberOption("STACKER_SCENE_BASE_TS", 1781596800000, 0);
 const START_DELAY_MS = readNumberOption("STACKER_SCENE_START_DELAY_MS", 1500, 0);
 const TIME_SCALE = readNumberOption("STACKER_SCENE_TIME_SCALE", 1, 0.01);
@@ -40,6 +49,9 @@ let isShuttingDown = false;
 
 const stackerPoseTopic = `dt/factory/logistics/stacker/${STACKER_ID}/twinspawn`;
 const stackerJointTopic = `dt/factory/logistics/stacker/${STACKER_ID}/twindatadriven/joint`;
+const conveyorPayloadTopic = `dt/factory/logistics/conveyor/${CONVEYOR_ID}/twindatadriven/payload`;
+const conveyorJointTopic = `dt/factory/logistics/conveyor/${CONVEYOR_ID}/twindatadriven/joint`;
+const conveyorStatusTopic = `dt/factory/logistics/conveyor/${CONVEYOR_ID}/twindatadriven/status`;
 const boxPoseTopic = `dt/factory/logistics/material/${BOX_ID}/twinspawn`;
 
 /** 读取有限数字环境变量，非法值回退默认值，避免调度或端口变成 NaN。 */
@@ -51,6 +63,35 @@ function readNumberOption(name, fallback, minimum) {
 
   const value = Number(rawValue);
   return Number.isFinite(value) && value >= minimum ? value : fallback;
+}
+
+/** 读取 x,y,z 三轴位置环境变量，支持 JSON 或逗号分隔，非法值回退默认现场坐标。 */
+function readVectorOption(name, fallback) {
+  const rawValue = process.env[name];
+  if (!rawValue || !rawValue.trim()) {
+    return fallback;
+  }
+
+  const parsed = parseVectorOption(rawValue.trim());
+  return parsed ?? fallback;
+}
+
+/** 解析位置环境变量，兼容 {"x":1,"y":2,"z":3} 和 "1,2,3" 两种写法。 */
+function parseVectorOption(rawValue) {
+  if (rawValue.startsWith("{")) {
+    try {
+      const value = JSON.parse(rawValue);
+      const x = Number(value.x);
+      const y = Number(value.y);
+      const z = Number(value.z);
+      return [x, y, z].every(Number.isFinite) ? { x, y, z } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const parts = rawValue.split(",").map((part) => Number(part.trim()));
+  return parts.length === 3 && parts.every(Number.isFinite) ? { x: parts[0], y: parts[1], z: parts[2] } : null;
 }
 
 /** 规范化 WebSocket 路径，兼容用户环境变量漏写开头斜杠。 */
@@ -225,120 +266,238 @@ function createSceneMessages(baseTimestamp) {
   return [
     {
       atMs: 0,
-      label: "初始化 Stacker 位姿",
+      label: "初始化 DDJ2 位姿",
       topic: stackerPoseTopic,
-      payload: { s: "scene-001", e: STACKER_ID, x: 8, y: 0, h: 0, r: 0, ts: ts(0) }
+      payload: { s: "ddj2-ready", e: STACKER_ID, ts: ts(0) }
     },
     {
       atMs: 100,
-      label: "将货箱 cube 放到辊道机入口",
+      label: `货箱 ${BOX_ID} 出现在链条机 ${CONVEYOR_ID} 前端`,
       topic: boxPoseTopic,
-      payload: { s: "box-001", e: BOX_ID, x: 0, y: 0.5, z: 0, r: 0, ts: ts(100) }
+      payload: createBoxPosePayload("box-1005-front", BOX_FRONT_POSITION, ts(100))
     },
     {
-      atMs: 3400,
-      label: "Stacker 货叉伸出取货",
-      topic: stackerJointTopic,
+      atMs: 200,
+      label: `${CONVEYOR_ID} 前端有货信号`,
+      topic: conveyorStatusTopic,
+      payload: createConveyorStatusPayload({ frontHasCargo: true, rearHasCargo: false, timestamp: ts(200) })
+    },
+    {
+      atMs: 300,
+      label: `${CONVEYOR_ID} 绑定货箱 ${BOX_ID}`,
+      topic: conveyorPayloadTopic,
+      payload: [{ e: CONVEYOR_ID, p: "payload", v: BOX_ID, ts: ts(300) }]
+    },
+    {
+      atMs: 500,
+      label: `${CONVEYOR_ID} 启动链条输送`,
+      topic: conveyorJointTopic,
       payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 1, ts: ts(3400) },
-        { e: STACKER_ID, p: "back_movement_z", v: 1, ts: ts(3400) }
+        { e: CONVEYOR_ID, p: "movement_x", v: 1, ts: ts(500) },
+        { e: CONVEYOR_ID, p: "front_has_cargo", v: true, ts: ts(500) },
+        { e: CONVEYOR_ID, p: "rear_has_cargo", v: false, ts: ts(500) }
       ]
     },
     {
-      atMs: 5600,
-      label: "货叉到位后停止并吸附货箱",
-      topic: stackerJointTopic,
+      atMs: 2300,
+      label: `${CONVEYOR_ID} 后端有货并停止`,
+      topic: conveyorJointTopic,
       payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(5600) },
-        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(5600) },
-        { e: STACKER_ID, p: "cargo_action", v: "pickup", ts: ts(5600) },
-        { e: STACKER_ID, p: "cargo", v: BOX_ID, ts: ts(5600) }
+        { e: CONVEYOR_ID, p: "movement_x", v: 0, ts: ts(2300) },
+        { e: CONVEYOR_ID, p: "front_has_cargo", v: false, ts: ts(2300) },
+        { e: CONVEYOR_ID, p: "rear_has_cargo", v: true, ts: ts(2300) }
       ]
     },
     {
-      atMs: 5700,
-      label: "货叉缩回到载货台",
-      topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 2, ts: ts(5700) },
-        { e: STACKER_ID, p: "back_movement_z", v: 2, ts: ts(5700) }
-      ]
+      atMs: 2400,
+      label: `${BOX_ID} 到达 ${CONVEYOR_ID} 后端取货位`,
+      topic: boxPoseTopic,
+      payload: createBoxPosePayload("box-1005-rear", BOX_REAR_POSITION, ts(2400))
     },
     {
-      atMs: 7800,
-      label: "货叉缩回后停止",
+      atMs: 2600,
+      label: "DDJ2 移动到 1005 后端取货位",
       topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(7800) },
-        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(7800) }
-      ]
+      payload: createStackerTravelPayload({
+        movementX: 2,
+        distanceX: STACKER_PICKUP_DISTANCE_X,
+        distanceY: STACKER_PICKUP_DISTANCE_Y,
+        timestamp: ts(2600)
+      }),
+      plcConvertible: true
     },
     {
-      atMs: 7900,
-      label: "Stacker 载货台和行走机构移动到定位线框",
+      atMs: 8600,
+      label: "DDJ2 到达 1005 后端并停止",
       topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "movement_x", v: 1, ts: ts(7900) },
-        { e: STACKER_ID, p: "distancex", v: 1200, ts: ts(7900) },
-        { e: STACKER_ID, p: "movement_y", v: 1, ts: ts(7900) }
-      ]
+      payload: createStackerTravelPayload({
+        movementX: 0,
+        distanceX: STACKER_PICKUP_DISTANCE_X,
+        distanceY: STACKER_PICKUP_DISTANCE_Y,
+        timestamp: ts(8600)
+      }),
+      plcConvertible: true
     },
     {
-      atMs: 11900,
-      label: "Stacker 到位后停止",
+      atMs: 8800,
+      label: "DDJ2 货叉伸出到 1005 后端",
       topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "movement_x", v: 0, ts: ts(11900) },
-        { e: STACKER_ID, p: "distancex", v: 2200, ts: ts(11900) },
-        { e: STACKER_ID, p: "movement_y", v: 0, ts: ts(11900) }
-      ]
+      payload: createStackerForkPayload({ action: 1, distance: STACKER_FORK_EXTEND, timestamp: ts(8800) }),
+      plcConvertible: true
     },
     {
-      atMs: 12000,
-      label: "到达定位线框后伸叉",
+      atMs: 11200,
+      label: "DDJ2 货叉接触货箱并绑定到载货台",
       topic: stackerJointTopic,
       payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 1, ts: ts(12000) },
-        { e: STACKER_ID, p: "back_movement_z", v: 1, ts: ts(12000) }
-      ]
+        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(11200) },
+        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(11200) },
+        { e: STACKER_ID, p: "front_distance_z", v: STACKER_FORK_EXTEND, ts: ts(11200) },
+        { e: STACKER_ID, p: "back_distance_z", v: STACKER_FORK_EXTEND, ts: ts(11200) },
+        { e: STACKER_ID, p: "payload", v: BOX_ID, ts: ts(11200) }
+      ],
+      plcConvertible: true
+    },
+    {
+      atMs: 11400,
+      label: "DDJ2 取货确认",
+      topic: stackerJointTopic,
+      payload: [
+        { e: STACKER_ID, p: "cargo_action", v: "pickup", ts: ts(11400) },
+        { e: STACKER_ID, p: "cargo", v: BOX_ID, ts: ts(11400) }
+      ],
+      plcConvertible: true
+    },
+    {
+      atMs: 11600,
+      label: "DDJ2 货叉缩回到载货台",
+      topic: stackerJointTopic,
+      payload: createStackerForkPayload({ action: 2, distance: STACKER_FORK_RETRACT, timestamp: ts(11600) }),
+      plcConvertible: true
+    },
+    {
+      atMs: 14000,
+      label: "DDJ2 货叉缩回后停止",
+      topic: stackerJointTopic,
+      payload: createStackerForkPayload({ action: 0, distance: STACKER_FORK_RETRACT, timestamp: ts(14000) }),
+      plcConvertible: true
     },
     {
       atMs: 14200,
+      label: `DDJ2 移动到定位线框 ${LOCATOR_ID}`,
+      topic: stackerJointTopic,
+      payload: createStackerTravelPayload({
+        movementX: 1,
+        distanceX: STACKER_DROP_DISTANCE_X,
+        distanceY: STACKER_DROP_DISTANCE_Y,
+        timestamp: ts(14200)
+      }),
+      plcConvertible: true
+    },
+    {
+      atMs: 31600,
+      label: `DDJ2 到达定位线框 ${LOCATOR_ID} 并停止`,
+      topic: stackerJointTopic,
+      payload: createStackerTravelPayload({
+        movementX: 0,
+        distanceX: STACKER_DROP_DISTANCE_X,
+        distanceY: STACKER_DROP_DISTANCE_Y,
+        timestamp: ts(31600)
+      }),
+      plcConvertible: true
+    },
+    {
+      atMs: 31800,
+      label: `DDJ2 对准 ${LOCATOR_ID} 后伸叉`,
+      topic: stackerJointTopic,
+      payload: createStackerForkPayload({ action: 1, distance: STACKER_FORK_EXTEND, timestamp: ts(31800) }),
+      plcConvertible: true
+    },
+    {
+      atMs: 34400,
       label: `放入定位线框 ${LOCATOR_ID}`,
       topic: stackerJointTopic,
       payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(14200) },
-        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(14200) },
-        { e: STACKER_ID, p: "cargo_action", v: "drop", ts: ts(14200) },
-        { e: STACKER_ID, p: "cargo", v: BOX_ID, ts: ts(14200) },
-        { e: STACKER_ID, p: "target", v: LOCATOR_ID, ts: ts(14200) }
-      ]
+        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(34400) },
+        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(34400) },
+        { e: STACKER_ID, p: "front_distance_z", v: STACKER_FORK_EXTEND, ts: ts(34400) },
+        { e: STACKER_ID, p: "back_distance_z", v: STACKER_FORK_EXTEND, ts: ts(34400) },
+        { e: STACKER_ID, p: "cargo_action", v: "drop", ts: ts(34400) },
+        { e: STACKER_ID, p: "cargo", v: BOX_ID, ts: ts(34400) },
+        { e: STACKER_ID, p: "target", v: LOCATOR_ID, ts: ts(34400) }
+      ],
+      plcConvertible: true
     },
     {
-      atMs: 14300,
-      label: "放货后货叉缩回",
+      atMs: 34600,
+      label: "DDJ2 放货后货叉缩回",
       topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 2, ts: ts(14300) },
-        { e: STACKER_ID, p: "back_movement_z", v: 2, ts: ts(14300) }
-      ]
+      payload: createStackerForkPayload({ action: 2, distance: STACKER_FORK_RETRACT, timestamp: ts(34600) }),
+      plcConvertible: true
     },
     {
-      atMs: 16500,
-      label: "货叉缩回后停止",
+      atMs: 37000,
+      label: "DDJ2 货叉缩回后停止",
       topic: stackerJointTopic,
-      payload: [
-        { e: STACKER_ID, p: "front_movement_z", v: 0, ts: ts(16500) },
-        { e: STACKER_ID, p: "back_movement_z", v: 0, ts: ts(16500) }
-      ]
+      payload: createStackerForkPayload({ action: 0, distance: STACKER_FORK_RETRACT, timestamp: ts(37000) }),
+      plcConvertible: true
+    },
+    {
+      atMs: 37200,
+      label: `${CONVEYOR_ID} 后端有货信号复位`,
+      topic: conveyorStatusTopic,
+      payload: createConveyorStatusPayload({ frontHasCargo: false, rearHasCargo: false, timestamp: ts(37200) })
     }
+  ];
+}
+
+/** 创建货箱位姿帧；Box01 是编辑器 cube，使用 Babylon 世界坐标 x/y/z。 */
+function createBoxPosePayload(sequenceId, position, timestamp) {
+  return {
+    s: sequenceId,
+    e: BOX_ID,
+    x: position.x,
+    y: position.y,
+    z: position.z,
+    r: 0,
+    ts: timestamp
+  };
+}
+
+/** 创建链条机前后端有货状态，状态字段保留业务语义，运动仍由 movement_x 驱动。 */
+function createConveyorStatusPayload({ frontHasCargo, rearHasCargo, timestamp }) {
+  return [
+    { e: CONVEYOR_ID, p: "front_has_cargo", v: frontHasCargo, ts: timestamp },
+    { e: CONVEYOR_ID, p: "rear_has_cargo", v: rearHasCargo, ts: timestamp }
+  ];
+}
+
+/** 创建 DDJ2 行走/升降校准帧，distance_x 使用当前编辑器运行时的米制偏移语义。 */
+function createStackerTravelPayload({ movementX, distanceX, distanceY, timestamp }) {
+  return [
+    { e: STACKER_ID, p: "movement_x", v: movementX, ts: timestamp },
+    { e: STACKER_ID, p: "distance_x", v: distanceX, ts: timestamp },
+    { e: STACKER_ID, p: "movement_y", v: 0, ts: timestamp },
+    { e: STACKER_ID, p: "distance_y", v: distanceY, ts: timestamp }
+  ];
+}
+
+/** 创建 DDJ2 货叉伸缩帧，距离字段用于稳定落到伸出/缩回终点。 */
+function createStackerForkPayload({ action, distance, timestamp }) {
+  return [
+    { e: STACKER_ID, p: "front_movement_z", v: action, ts: timestamp },
+    { e: STACKER_ID, p: "back_movement_z", v: action, ts: timestamp },
+    { e: STACKER_ID, p: "front_distance_z", v: distance, ts: timestamp },
+    { e: STACKER_ID, p: "back_distance_z", v: distance, ts: timestamp }
   ];
 }
 
 /** 输出完整报文序列，供现场实施人员复制或审阅。 */
 function printDryRun() {
   const messages = createSceneMessages(STATIC_BASE_TS);
-  console.log(`Stacker 场景 MQTT 报文 dry-run（${SCENE_PROTOCOL}，wrap=${PAYLOAD_WRAP}）：`);
+  console.log(
+    `1005-DDJ2-1-1-1 场景 MQTT 报文 dry-run（${SCENE_PROTOCOL}，wrap=${PAYLOAD_WRAP}，conveyor=${CONVEYOR_ID}，stacker=${STACKER_ID}）：`
+  );
   messages.forEach((message, index) => {
     const payload = createPublishPayload(message);
     console.log(`\n# ${index + 1}. ${message.label} (+${message.atMs}ms)`);
@@ -481,7 +640,7 @@ function publishSceneMessage(message) {
 
 /** 创建实际发送 payload，PLC 模式会把标准点位转换成现场 bitfield。 */
 function createPublishPayload(message) {
-  const payload = PLC_MODE ? convertPayloadToPlc(message.payload) : message.payload;
+  const payload = PLC_MODE && message.plcConvertible ? convertPayloadToPlc(message.payload) : message.payload;
   if (PAYLOAD_WRAP === "none") {
     return payload;
   }

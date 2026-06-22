@@ -60,7 +60,7 @@ export const dataDriven = {
 			speed: 0.25,
 			nodes: ["huocha.9", "huocha2.10"],
 			fallbackPattern: "fork|叉|huocha|cha\d*",
-			limits: { min: 0, max: 0.8 }
+			limits: { min: 0, max: 0.941 }
 		}
 	},
 	fixedNodes: ["guidaoshang.1", "guidaoxia.2"],
@@ -69,7 +69,7 @@ export const dataDriven = {
 		travelRange: 2.8,
 		liftBase: 0.35,
 		liftRange: 2.1,
-		forkRange: 0.75,
+		forkRange: 0.941,
 		forkSideRange: 0.18
 	}
 } as const;
@@ -89,7 +89,7 @@ export class ParametricModelParamsComponent {
 	public deviceName: string = "叉式堆垛机";
 
 	@visibleAsString("参数说明")
-	public description: string = "支持堆垛机主体尺寸、载货台尺寸、货叉长度和货叉间距参数化。";
+	public description: string = "支持堆垛机主体尺寸、载货台尺寸和货叉间距参数化；货叉总长度仅作为动画伸叉最大长度。";
 
 	@visibleAsNumber("主体长度", { step: 0.1 })
 	public bodyLength: number = 23.012;
@@ -106,7 +106,7 @@ export class ParametricModelParamsComponent {
 	@visibleAsNumber("载货台高度", { step: 0.1 })
 	public platformHeight: number = 1.695;
 
-	@visibleAsNumber("货叉长度", { step: 0.1 })
+	@visibleAsNumber("货叉总长度", { step: 0.1 })
 	public forkLength: number = 0.941;
 
 	@visibleAsNumber("货叉间距", { step: 0.05 })
@@ -145,7 +145,7 @@ const DEFAULT_VALUES: ValueMap = {
 	"modelKey": "stacker",
 	"deviceType": "堆垛机",
 	"deviceName": "叉式堆垛机",
-	"description": "支持堆垛机主体尺寸、载货台尺寸、货叉长度和货叉间距参数化。",
+	"description": "支持堆垛机主体尺寸、载货台尺寸和货叉间距参数化；货叉总长度仅作为动画伸叉最大长度。",
 	"bodyLength": 23.012,
 	"bodyWidth": 0.452,
 	"bodyHeight": 7.837,
@@ -618,11 +618,10 @@ export class ParametricModelRuntimeComponent {
 	}
 
 	/**
-	 * 应用货叉长度和货叉间距参数，找不到货叉节点时跳过。
+	 * 应用货叉间距参数；货叉长度只作为运行态伸出总长度，不直接缩放静态模型。
 	 */
 	private applyForkParameters(values: ValueMap): void {
 		const forkNodes = this.findStackerForkNodes();
-		if ("forkLength" in values) { this.scaleNodesByWorldAxes(forkNodes, this.ratioForNodesByWorldAxis(forkNodes, values, "forkLength", "x"), 1, 1); }
 		if ("forkGap" in values && forkNodes.length >= 2) {
 			const gap = this.readNumber(values, "forkGap", Number(DEFAULT_VALUES.forkGap ?? 0));
 			forkNodes.slice(0, 2).forEach((node, index) => this.offsetNode(node, new Vector3(0, 0, (index === 0 ? -0.5 : 0.5) * gap)));

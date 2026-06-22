@@ -27,10 +27,12 @@ const MAX_FRAMES_PER_MESSAGE = 200;
 const DATA_CONNECTION_STALE_MS = 5000;
 const STACKER_DEMO_INTERVAL_MS = 250;
 const STACKER_DEMO_DEVICE_ID = "DDJ2";
+const STACKER_LEGACY_DEVICE_ID = "Stacker01";
 const STACKER_DEMO_CARGO_ID = "Box01";
 const STACKER_TRAVEL_FIELDS = ["travel_pos", "trackZ", "travelZ", "travel", "position.z", "pos.z", "location.z", "z"];
 const STACKER_TRAVEL_LIMIT_FIELDS = new Set([...STACKER_TRAVEL_FIELDS, "movement_x"].map((field) => field.toLowerCase()));
 const STACKER_DISTANCE_X_FIELD_COMPACT = "distancex";
+const STACKER_DISTANCE_Y_FIELD_COMPACT = "distancey";
 const STACKER_LIFT_FIELDS = ["lift_pos", "liftY", "lift", "platformY", "platform.y", "elevation"];
 const STACKER_LIFT_LIMIT_FIELDS = new Set([...STACKER_LIFT_FIELDS, "movement_y"].map((field) => field.toLowerCase()));
 const STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT = "frontdistancey";
@@ -94,7 +96,8 @@ const MAX_ACTION_DELTA_SECONDS = 1;
 const DEFAULT_ACTION_MAP_ENTRIES: Array<[string, number]> = [["0", 0], ["1", 1], ["2", -1]];
 const STACKER_FORK_ACTION_MAP_ENTRIES: Array<[string, number]> = [["3", 1], ["4", -1]];
 const DEFAULT_STACKER_FORK_ACTION_SPEED = 0.25;
-const DEFAULT_STACKER_FORK_EXTENSION_LIMIT = 0.75;
+const DEFAULT_STACKER_FORK_EXTENSION_LIMIT = 0.941;
+const STACKER_FORK_LENGTH_PARAMETER_NAMES = ["forkLength", "fork_length", "货叉长度", "货叉总长度"];
 const STACKER_FORK_FALLBACK_PATTERN_TEXT = "fork|叉|huocha|cha";
 
 type StackerMotionGroupKey = "travel" | "lift" | "fork" | "forkSide";
@@ -111,6 +114,8 @@ interface RuntimeMotionGroup {
   target: ModelDataDrivenMotionTarget;
   speed?: number;
   limits?: RuntimeMotionLimit;
+  /** Stacker 货叉参数化后的最大伸出长度，作为左右双向行程的权威来源。 */
+  stackerForkMaxExtension?: number;
 }
 
 /** 运行态运动行程限制，显式数值和防撞物体推导结果会合并成最终 min/max。 */
@@ -215,7 +220,7 @@ const DEFAULT_STACKER_SIMULATION_SETTINGS: StackerSimulationSettings = {
   travelRange: 2.8,
   liftBase: 0.35,
   liftRange: 2.1,
-  forkRange: 0.75,
+  forkRange: DEFAULT_STACKER_FORK_EXTENSION_LIMIT,
   forkSideRange: 0.18
 };
 
@@ -2237,8 +2242,11 @@ export class SceneDataDrivenRuntime {
       "distanceX",
       "DistanceX",
       "distance_x",
+      "distance_y",
       "front_distanceY",
       "back_distanceY",
+      "front_distance_z",
+      "back_distance_z",
       "front_movement_z",
       "back_movement_z",
       "front_action",
@@ -2318,6 +2326,9 @@ export class SceneDataDrivenRuntime {
       "deviceId",
       "deviceID",
       "id",
+      "ts",
+      "timestamp",
+      "time",
       "assetCode",
       "modelKey",
       ...CARGO_ACTION_FIELDS,
@@ -2394,12 +2405,35 @@ export class SceneDataDrivenRuntime {
       target.matchFields[assetCodeField],
       target.matchFields.assetCode,
       target.dataDriven?.device?.defaultAssetCode,
+      ...this.getStackerDeviceAliasMatchValues(target),
       target.matchFields.modelKey,
       target.matchFields.deviceId,
       target.matchFields.name,
       target.matchFields.sourceFile,
       target.matchFields.sourceFileStem
     ]);
+  }
+
+  /** Stacker 现场报文默认使用 DDJ2，旧模型包默认使用 Stacker01；两者都作为兜底设备号匹配。 */
+  private getStackerDeviceAliasMatchValues(target: SceneDataDrivenTarget): string[] {
+    return this.isStackerDeviceTarget(target) ? [STACKER_DEMO_DEVICE_ID, STACKER_LEGACY_DEVICE_ID] : [];
+  }
+
+  /** 判断目标是否是 Stacker 设备定义，避免把 DDJ2 别名扩散到其它模型。 */
+  private isStackerDeviceTarget(target: SceneDataDrivenTarget): boolean {
+    const device = target.dataDriven?.device;
+    if (device?.devType === "stacker") {
+      return true;
+    }
+
+    const matchValues = this.dedupeStrings([
+      device?.defaultAssetCode,
+      target.matchFields.modelKey,
+      target.matchFields.sourceFile,
+      target.matchFields.sourceFileStem
+    ]).map((value) => this.normalizeMatchValue(value));
+
+    return matchValues.some((value) => value === "stacker01" || value === "ddj2" || value.includes("stacker"));
   }
 
   /** 读取 target 模式运动组绑定的 payload 数字目标值。 */
@@ -2436,15 +2470,15 @@ export class SceneDataDrivenRuntime {
     return values;
   }
 
-  /** 读取 Stacker 前/后叉载台高度校准值，PLC 字段单位为毫米，场景内按米制高度驱动。 */
+  /** 读取 Stacker 载货台高度校准值，新协议 distance_y 用米，旧 front/back_distanceY 用毫米。 */
   private readStackerDistanceLiftMotionValues(frame: DataFrame, state: DataDrivenTargetState): Map<string, number> {
     const values = new Map<string, number>();
     if (!state.isStacker) {
       return values;
     }
 
-    const distanceValue = this.readStackerDistanceYValue(frame);
-    if (distanceValue === undefined) {
+    const distanceMeters = this.readStackerLiftDistanceMeters(frame);
+    if (distanceMeters === undefined) {
       return values;
     }
 
@@ -2453,7 +2487,7 @@ export class SceneDataDrivenRuntime {
       return values;
     }
 
-    values.set(liftGroup.key, this.createStackerLiftValueFromDistance(distanceValue, liftGroup));
+    values.set(liftGroup.key, this.createStackerLiftValueFromDistance(distanceMeters, liftGroup));
     return values;
   }
 
@@ -2493,16 +2527,21 @@ export class SceneDataDrivenRuntime {
     return undefined;
   }
 
-  /** 优先使用前叉高度校准值，前叉缺失或非法时再用后叉值。 */
-  private readStackerDistanceYValue(frame: DataFrame): number | undefined {
-    return (
-      this.readStackerDistanceYValueByField(frame, STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT) ??
-      this.readStackerDistanceYValueByField(frame, STACKER_BACK_DISTANCE_Y_FIELD_COMPACT)
-    );
+  /** 优先读取新协议米制 distance_y，缺失时兼容旧协议前/后叉毫米高度。 */
+  private readStackerLiftDistanceMeters(frame: DataFrame): number | undefined {
+    const directMeters = this.readStackerDistanceNumberByField(frame, STACKER_DISTANCE_Y_FIELD_COMPACT);
+    if (directMeters !== undefined) {
+      return directMeters;
+    }
+
+    const legacyMillimeters =
+      this.readStackerDistanceNumberByField(frame, STACKER_FRONT_DISTANCE_Y_FIELD_COMPACT) ??
+      this.readStackerDistanceNumberByField(frame, STACKER_BACK_DISTANCE_Y_FIELD_COMPACT);
+    return legacyMillimeters !== undefined ? legacyMillimeters / 1000 : undefined;
   }
 
-  /** 读取指定前/后叉高度字段，兼容大小写和下划线写法。 */
-  private readStackerDistanceYValueByField(frame: DataFrame, compactFieldName: string): number | undefined {
+  /** 读取指定距离字段，兼容大小写、空格、下划线和横线写法。 */
+  private readStackerDistanceNumberByField(frame: DataFrame, compactFieldName: string): number | undefined {
     const fieldValue = this.readFrameValueByCompactField(frame, compactFieldName);
     const numberValue = this.parseFiniteNumber(fieldValue);
     return Number.isFinite(numberValue) ? numberValue : undefined;
@@ -2518,24 +2557,25 @@ export class SceneDataDrivenRuntime {
     return undefined;
   }
 
-  /** 优先读取连续货叉距离值；没有距离值时再使用 front/back_forkLocation 位置信号。 */
+  /** 优先读取标准位置位信号；没有位置位时再兼容非标准连续货叉距离。 */
   private readStackerForkDistanceValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
-    const directValue = this.readStackerForkDistanceNumber(frame);
-    if (directValue !== undefined) {
-      return this.createStackerForkValueFromDistance(directValue, group);
+    const locationValue = this.readStackerForkLocationValue(frame, group);
+    if (locationValue !== undefined) {
+      return locationValue;
     }
 
-    return this.readStackerForkLocationValue(frame, group);
+    const directValue = this.readStackerForkDistanceNumber(frame);
+    if (directValue !== undefined) {
+      return this.createStackerForkValueFromDistance(directValue, group, this.readStackerForkDistanceDirection(frame));
+    }
+
+    return undefined;
   }
 
-  /** 读取 MQTT 中常见的货叉距离字段，字段名按大小写、下划线和横线归一化。 */
+  /** 读取 MQTT 中常见的货叉距离字段，按前叉、后叉和通用字段固定优先级解析。 */
   private readStackerForkDistanceNumber(frame: DataFrame): number | undefined {
-    for (const [fieldName, fieldValue] of Object.entries(frame)) {
-      const compactFieldName = this.compactProtocolFieldName(fieldName);
-      if (!STACKER_FORK_DISTANCE_FIELD_COMPACTS.includes(compactFieldName)) {
-        continue;
-      }
-
+    for (const compactFieldName of STACKER_FORK_DISTANCE_FIELD_COMPACTS) {
+      const fieldValue = this.readFrameValueByCompactField(frame, compactFieldName);
       const numberValue = this.parseFiniteNumber(fieldValue);
       if (Number.isFinite(numberValue)) {
         return numberValue;
@@ -2544,12 +2584,39 @@ export class SceneDataDrivenRuntime {
     return undefined;
   }
 
-  /** 读取前/后叉位置位信号，前叉有效时优先使用前叉。 */
+  /** 连续距离通常只表达取货深浅，左右方向只从原始 forkAction 位域推导。 */
+  private readStackerForkDistanceDirection(frame: DataFrame): number | undefined {
+    const bitfieldDirection = this.readStackerForkBitfieldSideDirection(this.readStackerForkActionRawValue(frame));
+    if (bitfieldDirection !== undefined) {
+      return bitfieldDirection;
+    }
+    return undefined;
+  }
+
+  /** 读取前/后叉位置位信号，深浅位优先于原位，避免空闲叉覆盖工作叉。 */
   private readStackerForkLocationValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
-    return (
-      this.readStackerForkLocationValueByField(frame, STACKER_FRONT_FORK_LOCATION_FIELD_COMPACT, group) ??
+    const candidates = [
+      this.readStackerForkLocationValueByField(frame, STACKER_FRONT_FORK_LOCATION_FIELD_COMPACT, group),
       this.readStackerForkLocationValueByField(frame, STACKER_BACK_FORK_LOCATION_FIELD_COMPACT, group)
-    );
+    ].filter((value): value is number => value !== undefined);
+    if (candidates.length === 0) {
+      return undefined;
+    }
+
+    const activeCandidates = candidates.filter((value) => Math.abs(value) > 1e-6);
+    if (activeCandidates.length === 0) {
+      return 0;
+    }
+
+    const sideDirection = this.readStackerForkBitfieldSideDirection(this.readStackerForkActionRawValue(frame));
+    if (sideDirection !== undefined) {
+      const directedValue = activeCandidates.find((value) => Math.sign(value) === sideDirection);
+      if (directedValue !== undefined) {
+        return directedValue;
+      }
+    }
+
+    return activeCandidates[0];
   }
 
   /** 将 PLC 货叉位置位信号转换成以原点为中心的货叉伸缩目标。 */
@@ -2580,17 +2647,18 @@ export class SceneDataDrivenRuntime {
     return travelOrigin + distanceValue;
   }
 
-  /** 前/后叉 distanceY 是毫米绝对高度，进入米制场景前统一换算为 m。 */
+  /** 载货台高度校准值进入此处前已统一为米。 */
   private createStackerLiftValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
     const liftOrigin = group.limits?.min ?? 0;
-    return liftOrigin + distanceValue / 1000;
+    return liftOrigin + distanceValue;
   }
 
-  /** 货叉距离字段可直接发米，也可发毫米；明显超过货叉行程时按毫米换算。 */
-  private createStackerForkValueFromDistance(distanceValue: number, group: RuntimeMotionGroup): number {
+  /** 货叉距离字段可直接发米，也可发毫米；无符号距离会结合同帧方向信号生成左右伸缩目标。 */
+  private createStackerForkValueFromDistance(distanceValue: number, group: RuntimeMotionGroup, direction: number | undefined): number {
     const maxTravel = this.resolveStackerForkTravelLimit(group);
     const meters = Math.abs(distanceValue) > Math.max(10, maxTravel * 2) ? distanceValue / 1000 : distanceValue;
-    return meters;
+    const signedMeters = meters > 0 && direction === -1 ? -meters : meters;
+    return Math.max(-maxTravel, Math.min(maxTravel, signedMeters));
   }
 
   /** PLC front/back_forkLocation 是位置位信号；换速位按半行程可视化，极限位按完整/半行程校准。 */
@@ -2624,6 +2692,10 @@ export class SceneDataDrivenRuntime {
 
   /** 读取货叉左右伸缩最大行程，用于距离单位判断和位置位信号换算。 */
   private resolveStackerForkTravelLimit(group: RuntimeMotionGroup): number {
+    if (group.stackerForkMaxExtension !== undefined && Number.isFinite(group.stackerForkMaxExtension) && group.stackerForkMaxExtension > 0) {
+      return group.stackerForkMaxExtension;
+    }
+
     const min = group.limits?.min;
     const max = group.limits?.max;
     const travel = Math.max(Math.abs(min ?? 0), Math.abs(max ?? 0), DEFAULT_STACKER_FORK_EXTENSION_LIMIT);
@@ -2636,13 +2708,33 @@ export class SceneDataDrivenRuntime {
       return undefined;
     }
 
+    let firstValue: unknown;
+    let hasValue = false;
+    let firstMappedValue: unknown;
+    let hasMappedValue = false;
     for (const field of group.fields) {
       const value = this.readPath(frame, field);
       if (value !== undefined) {
-        return value;
+        if (!hasValue) {
+          firstValue = value;
+          hasValue = true;
+        }
+
+        const key = this.createActionMapKey(value);
+        const direction = key !== undefined ? group.actionMap.get(key) : undefined;
+        if (direction !== undefined && !hasMappedValue) {
+          firstMappedValue = value;
+          hasMappedValue = true;
+        }
+        if (direction !== undefined && direction !== 0) {
+          return value;
+        }
       }
     }
-    return undefined;
+    if (hasMappedValue) {
+      return firstMappedValue;
+    }
+    return hasValue ? firstValue : undefined;
   }
 
   /** 把协议动作枚举转换为方向，未声明的枚举值不更新上一帧方向。 */
@@ -2770,6 +2862,24 @@ export class SceneDataDrivenRuntime {
       return [...candidates][0];
     }
     return 0;
+  }
+
+  /** 从 V5.2 forkAction 位域读取货叉所在侧，连续距离字段用它把深浅距离转成正负目标。 */
+  private readStackerForkBitfieldSideDirection(value: unknown): number | undefined {
+    const bitfield = this.readBitfieldNumber(value);
+    if (bitfield === undefined) {
+      return undefined;
+    }
+
+    const rightSide = (bitfield & (1 << 1)) !== 0 || (bitfield & (1 << 4)) !== 0;
+    const leftSide = (bitfield & (1 << 2)) !== 0 || (bitfield & (1 << 3)) !== 0;
+    if (rightSide && !leftSide) {
+      return 1;
+    }
+    if (leftSide && !rightSide) {
+      return -1;
+    }
+    return undefined;
   }
 
   /** 缩叉信号没有左右位移量时，以当前伸出方向决定回原点方向。 */
@@ -3217,6 +3327,7 @@ export class SceneDataDrivenRuntime {
       targetMode === "nodes" ? fallbackLimitNodeNames : [],
       targetMode === "nodes" && allowTrackBoundsLimitFallback
     );
+    const stackerForkMaxExtension = forceBidirectionalForkLimit ? this.readStackerForkMaxExtensionFromModelPackage(root) : undefined;
     return {
       key,
       kind: group?.kind ?? "translate",
@@ -3227,19 +3338,136 @@ export class SceneDataDrivenRuntime {
       actionMap: this.createRuntimeActionMap(key, group),
       target: targetMode,
       speed: group?.speed,
-      limits: forceBidirectionalForkLimit ? this.createBidirectionalStackerForkMotionLimit(limits) : limits
+      limits: forceBidirectionalForkLimit ? this.createBidirectionalStackerForkMotionLimit(limits, stackerForkMaxExtension) : limits,
+      stackerForkMaxExtension
     };
   }
 
-  /** Stacker 货叉可向左右两侧伸出，显式 0..max 限位在运行态扩展为 -max..max。 */
-  private createBidirectionalStackerForkMotionLimit(limit: RuntimeMotionLimit | undefined): RuntimeMotionLimit {
-    const travel = Math.max(Math.abs(limit?.min ?? 0), Math.abs(limit?.max ?? 0), DEFAULT_STACKER_FORK_EXTENSION_LIMIT);
+  /** Stacker 货叉可向左右两侧伸出，参数化 forkLength 优先作为 -max..max 的最大行程。 */
+  private createBidirectionalStackerForkMotionLimit(
+    limit: RuntimeMotionLimit | undefined,
+    configuredMaxExtension: number | undefined
+  ): RuntimeMotionLimit {
+    const fallbackTravel = Math.max(Math.abs(limit?.min ?? 0), Math.abs(limit?.max ?? 0), DEFAULT_STACKER_FORK_EXTENSION_LIMIT);
+    const travel =
+      configuredMaxExtension !== undefined && Number.isFinite(configuredMaxExtension) && configuredMaxExtension > 0 ? configuredMaxExtension : fallbackTravel;
     return {
       min: -travel,
       max: travel,
       blockerNodes: limit?.blockerNodes ?? [],
       clearance: limit?.clearance ?? 0
     };
+  }
+
+  /** 从模型包实例参数读取 Stacker 货叉最大伸出长度，兼容旧场景包装值和脚本 metadata。 */
+  private readStackerForkMaxExtensionFromModelPackage(root: TransformNode): number | undefined {
+    const metadata = this.isRecord(root.metadata) ? root.metadata : {};
+    const editorMetadata = this.isRecord(metadata.editor) ? metadata.editor : {};
+    const instance = this.isRecord(editorMetadata.modelPackageInstance) ? editorMetadata.modelPackageInstance : {};
+    const values = this.isRecord(instance.values) ? instance.values : {};
+    const instanceValue = this.readStackerForkMaxExtensionFromValues(values);
+    if (instanceValue !== undefined) {
+      return instanceValue;
+    }
+
+    const scripts = Array.isArray(metadata.scripts) ? metadata.scripts : [];
+    for (const script of scripts) {
+      const scriptRecord = this.isRecord(script) ? script : {};
+      const scriptValues = this.isRecord(scriptRecord.values) ? scriptRecord.values : {};
+      const scriptValue =
+        this.readStackerForkMaxExtensionFromValues(scriptValues) ??
+        this.readStackerForkMaxExtensionFromScriptFields(scriptRecord, scriptValues);
+      if (scriptValue !== undefined) {
+        return scriptValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 从参数值字典读取 Stacker 货叉长度，兼容英文键、旧下划线键和中文键。 */
+  private readStackerForkMaxExtensionFromValues(values: Record<string, unknown>): number | undefined {
+    for (const [key, value] of Object.entries(values)) {
+      if (!this.isStackerForkLengthParameterName(key)) {
+        continue;
+      }
+
+      const parameterValue = this.readPositiveNumberParameter(value);
+      if (parameterValue !== undefined) {
+        return parameterValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 从脚本字段声明兜底读取货叉长度默认值，避免旧场景缺少 values 时退回固定默认行程。 */
+  private readStackerForkMaxExtensionFromScriptFields(script: Record<string, unknown>, values: Record<string, unknown>): number | undefined {
+    const fields = Array.isArray(script.fields) ? script.fields : [];
+    for (const field of fields) {
+      const fieldRecord = this.isRecord(field) ? field : {};
+      if (![fieldRecord.key, fieldRecord.propertyKey, fieldRecord.label].some((name) => this.isStackerForkLengthParameterName(name))) {
+        continue;
+      }
+
+      for (const key of [fieldRecord.key, fieldRecord.propertyKey]) {
+        if (typeof key !== "string") {
+          continue;
+        }
+
+        const value = this.readPositiveNumberParameter(values[key]);
+        if (value !== undefined) {
+          return value;
+        }
+      }
+
+      const fieldDefaultValue = this.readPositiveNumberParameter(fieldRecord.defaultValue);
+      if (fieldDefaultValue !== undefined) {
+        return fieldDefaultValue;
+      }
+
+      const configuration = this.isRecord(fieldRecord.configuration) ? fieldRecord.configuration : {};
+      const configurationDefaultValue = this.readPositiveNumberParameter(configuration.defaultValue);
+      if (configurationDefaultValue !== undefined) {
+        return configurationDefaultValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 判断字段名是否表达 Stacker 参数面板中的货叉长度。 */
+  private isStackerForkLengthParameterName(value: unknown): boolean {
+    if (typeof value !== "string") {
+      return false;
+    }
+
+    const normalizedValue = this.compactProtocolFieldName(value);
+    return STACKER_FORK_LENGTH_PARAMETER_NAMES.some((name) => this.compactProtocolFieldName(name) === normalizedValue);
+  }
+
+  /** 读取参数面板中的正数值，支持裸数字、字符串数字和 { value/currentValue/defaultValue } 包装。 */
+  private readPositiveNumberParameter(value: unknown): number | undefined {
+    const numericValue = this.parseFiniteNumber(this.unwrapParameterValue(value));
+    return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : undefined;
+  }
+
+  /** 解开历史模型包参数包装，避免旧场景参数无法参与运行态行程计算。 */
+  private unwrapParameterValue(value: unknown): unknown {
+    let current = value;
+    for (let depth = 0; depth < 4 && this.isRecord(current); depth += 1) {
+      if ("value" in current) {
+        current = current.value;
+        continue;
+      }
+      if ("currentValue" in current) {
+        current = current.currentValue;
+        continue;
+      }
+      if ("defaultValue" in current) {
+        current = current.defaultValue;
+        continue;
+      }
+      break;
+    }
+    return current;
   }
 
   /** 创建 action 模式的协议枚举表，模型脚本可覆盖默认 0/1/2 方向。 */
