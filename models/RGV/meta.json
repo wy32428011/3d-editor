@@ -1,0 +1,314 @@
+{
+  "parameterScripts": [
+    {
+      "modelFilename": "RGV.glb",
+      "scriptFilename": "rgv.model.ts",
+      "className": "ParametricModelParamsComponent",
+      "fields": [
+        {
+          "key": "modelKey",
+          "label": "模型标识",
+          "type": "string",
+          "defaultValue": "rgv",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceType",
+          "label": "设备类型",
+          "type": "string",
+          "defaultValue": "RGV",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceName",
+          "label": "设备名称",
+          "type": "string",
+          "defaultValue": "异形环穿车",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "description",
+          "label": "参数说明",
+          "type": "string",
+          "defaultValue": "支持 RGV 长宽高、路径点、路线类型、开放闭合、轨道显示、轨道宽度和单双工模式参数化。",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "pathPoints",
+          "label": "路径点 JSON",
+          "type": "string",
+          "defaultValue": "[]",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "pathType",
+          "label": "路径类型",
+          "type": "string",
+          "defaultValue": "straight",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "straight",
+              "curve"
+            ]
+          }
+        },
+        {
+          "key": "lineMode",
+          "label": "线路模式",
+          "type": "string",
+          "defaultValue": "open",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "open",
+              "closed"
+            ]
+          }
+        },
+        {
+          "key": "routeClosed",
+          "label": "闭合路线",
+          "type": "boolean",
+          "defaultValue": false,
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        {
+          "key": "showTrack",
+          "label": "显示轨道",
+          "type": "boolean",
+          "defaultValue": true,
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        {
+          "key": "vehicleLength",
+          "label": "RGV长度",
+          "type": "number",
+          "defaultValue": 10.3118,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        {
+          "key": "vehicleWidth",
+          "label": "RGV宽度",
+          "type": "number",
+          "defaultValue": 1,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        {
+          "key": "vehicleHeight",
+          "label": "RGV高度",
+          "type": "number",
+          "defaultValue": 0.7938,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 20,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        {
+          "key": "trackWidth",
+          "label": "轨道宽度",
+          "type": "number",
+          "defaultValue": 0.2,
+          "configuration": {
+            "type": "number",
+            "min": 0.01,
+            "max": 10,
+            "step": 0.01
+          }
+        },
+        {
+          "key": "workMode",
+          "label": "工作模式",
+          "type": "string",
+          "defaultValue": "single",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "single",
+              "dual"
+            ]
+          }
+        }
+      ],
+      "values": {
+        "modelKey": {
+          "type": "string",
+          "value": "rgv",
+          "label": "模型标识",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceType": {
+          "type": "string",
+          "value": "RGV",
+          "label": "设备类型",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceName": {
+          "type": "string",
+          "value": "异形环穿车",
+          "label": "设备名称",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "value": "支持 RGV 长宽高、路径点、路线类型、开放闭合、轨道显示、轨道宽度和单双工模式参数化。",
+          "label": "参数说明",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "pathPoints": {
+          "type": "string",
+          "value": "[]",
+          "label": "路径点 JSON",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "pathType": {
+          "type": "string",
+          "value": "straight",
+          "label": "路径类型",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "straight",
+              "curve"
+            ]
+          }
+        },
+        "lineMode": {
+          "type": "string",
+          "value": "open",
+          "label": "线路模式",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "open",
+              "closed"
+            ]
+          }
+        },
+        "routeClosed": {
+          "type": "boolean",
+          "value": false,
+          "label": "闭合路线",
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        "showTrack": {
+          "type": "boolean",
+          "value": true,
+          "label": "显示轨道",
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        "vehicleLength": {
+          "type": "number",
+          "value": 10.3118,
+          "label": "RGV长度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        "vehicleWidth": {
+          "type": "number",
+          "value": 1,
+          "label": "RGV宽度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        "vehicleHeight": {
+          "type": "number",
+          "value": 0.7938,
+          "label": "RGV高度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 20,
+            "step": 0.1,
+            "unit": "m"
+          }
+        },
+        "trackWidth": {
+          "type": "number",
+          "value": 0.2,
+          "label": "轨道宽度",
+          "configuration": {
+            "type": "number",
+            "min": 0.01,
+            "max": 10,
+            "step": 0.01
+          }
+        },
+        "workMode": {
+          "type": "string",
+          "value": "single",
+          "label": "工作模式",
+          "configuration": {
+            "type": "string",
+            "options": [
+              "single",
+              "dual"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "animationScripts": [
+    {
+      "modelFilename": "RGV.glb",
+      "scriptFilename": "rgv.model.ts",
+      "className": "ParametricModelRuntimeComponent",
+      "fields": [],
+      "values": {}
+    }
+  ]
+}

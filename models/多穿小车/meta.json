@@ -1,0 +1,159 @@
+{
+  "parameterScripts": [
+    {
+      "modelFilename": "多穿小车.glb",
+      "scriptFilename": "multi-shuttle.model.ts",
+      "className": "ParametricModelParamsComponent",
+      "fields": [
+        {
+          "key": "modelKey",
+          "label": "模型标识",
+          "type": "string",
+          "defaultValue": "multi-shuttle",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceType",
+          "label": "设备类型",
+          "type": "string",
+          "defaultValue": "多穿库",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceName",
+          "label": "设备名称",
+          "type": "string",
+          "defaultValue": "穿梭车",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "description",
+          "label": "参数说明",
+          "type": "string",
+          "defaultValue": "支持车辆长度、货叉间距和数量参数化。",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "vehicleLength",
+          "label": "车辆长度",
+          "type": "number",
+          "defaultValue": 0.984,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "forkGap",
+          "label": "货叉间距",
+          "type": "number",
+          "defaultValue": 0.6,
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 50,
+            "step": 0.05
+          }
+        },
+        {
+          "key": "count",
+          "label": "数量",
+          "type": "number",
+          "defaultValue": 1,
+          "configuration": {
+            "type": "number",
+            "min": 1,
+            "max": 50,
+            "step": 1
+          }
+        }
+      ],
+      "values": {
+        "modelKey": {
+          "type": "string",
+          "value": "multi-shuttle",
+          "label": "模型标识",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceType": {
+          "type": "string",
+          "value": "多穿库",
+          "label": "设备类型",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceName": {
+          "type": "string",
+          "value": "穿梭车",
+          "label": "设备名称",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "value": "支持车辆长度、货叉间距和数量参数化。",
+          "label": "参数说明",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "vehicleLength": {
+          "type": "number",
+          "value": 0.984,
+          "label": "车辆长度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "forkGap": {
+          "type": "number",
+          "value": 0.6,
+          "label": "货叉间距",
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 50,
+            "step": 0.05
+          }
+        },
+        "count": {
+          "type": "number",
+          "value": 1,
+          "label": "数量",
+          "configuration": {
+            "type": "number",
+            "min": 1,
+            "max": 50,
+            "step": 1
+          }
+        }
+      }
+    }
+  ],
+  "animationScripts": [
+    {
+      "modelFilename": "多穿小车.glb",
+      "scriptFilename": "multi-shuttle.model.ts",
+      "className": "ParametricModelRuntimeComponent",
+      "fields": [],
+      "values": {}
+    }
+  ]
+}

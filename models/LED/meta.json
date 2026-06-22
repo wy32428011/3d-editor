@@ -1,0 +1,261 @@
+{
+  "parameterScripts": [
+    {
+      "modelFilename": "LED.glb",
+      "scriptFilename": "led.model.ts",
+      "className": "ParametricModelParamsComponent",
+      "fields": [
+        {
+          "key": "modelKey",
+          "label": "模型标识",
+          "type": "string",
+          "defaultValue": "led",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceType",
+          "label": "设备类型",
+          "type": "string",
+          "defaultValue": "状态灯",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceName",
+          "label": "设备名称",
+          "type": "string",
+          "defaultValue": "LED 状态灯",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "description",
+          "label": "参数说明",
+          "type": "string",
+          "defaultValue": "清单外状态灯资产，支持尺寸、状态颜色和显示开关参数化。",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "length",
+          "label": "长度",
+          "type": "number",
+          "defaultValue": 1.201,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "width",
+          "label": "宽度",
+          "type": "number",
+          "defaultValue": 0.073,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "height",
+          "label": "高度",
+          "type": "number",
+          "defaultValue": 1.726,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "runningColor",
+          "label": "运行颜色",
+          "type": "string",
+          "defaultValue": "#2ecc71",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "stoppedColor",
+          "label": "停止颜色",
+          "type": "string",
+          "defaultValue": "#95a5a6",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "faultColor",
+          "label": "故障颜色",
+          "type": "string",
+          "defaultValue": "#e74c3c",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "selectedColor",
+          "label": "选中颜色",
+          "type": "string",
+          "defaultValue": "#f1c40f",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "enableStatusHighlight",
+          "label": "启用状态高亮参数",
+          "type": "boolean",
+          "defaultValue": true,
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        {
+          "key": "showLight",
+          "label": "显示状态灯",
+          "type": "boolean",
+          "defaultValue": true,
+          "configuration": {
+            "type": "boolean"
+          }
+        }
+      ],
+      "values": {
+        "modelKey": {
+          "type": "string",
+          "value": "led",
+          "label": "模型标识",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceType": {
+          "type": "string",
+          "value": "状态灯",
+          "label": "设备类型",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceName": {
+          "type": "string",
+          "value": "LED 状态灯",
+          "label": "设备名称",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "value": "清单外状态灯资产，支持尺寸、状态颜色和显示开关参数化。",
+          "label": "参数说明",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "length": {
+          "type": "number",
+          "value": 1.201,
+          "label": "长度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "width": {
+          "type": "number",
+          "value": 0.073,
+          "label": "宽度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "height": {
+          "type": "number",
+          "value": 1.726,
+          "label": "高度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "runningColor": {
+          "type": "string",
+          "value": "#2ecc71",
+          "label": "运行颜色",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "stoppedColor": {
+          "type": "string",
+          "value": "#95a5a6",
+          "label": "停止颜色",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "faultColor": {
+          "type": "string",
+          "value": "#e74c3c",
+          "label": "故障颜色",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "selectedColor": {
+          "type": "string",
+          "value": "#f1c40f",
+          "label": "选中颜色",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "enableStatusHighlight": {
+          "type": "boolean",
+          "value": true,
+          "label": "启用状态高亮参数",
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        "showLight": {
+          "type": "boolean",
+          "value": true,
+          "label": "显示状态灯",
+          "configuration": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  ],
+  "animationScripts": [
+    {
+      "modelFilename": "LED.glb",
+      "scriptFilename": "led.model.ts",
+      "className": "ParametricModelRuntimeComponent",
+      "fields": [],
+      "values": {}
+    }
+  ]
+}

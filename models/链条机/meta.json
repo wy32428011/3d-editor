@@ -1,0 +1,193 @@
+{
+  "parameterScripts": [
+    {
+      "modelFilename": "链条机.glb",
+      "scriptFilename": "chain-conveyor.model.ts",
+      "className": "ParametricModelParamsComponent",
+      "fields": [
+        {
+          "key": "modelKey",
+          "label": "模型标识",
+          "type": "string",
+          "defaultValue": "chain-conveyor",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceType",
+          "label": "设备类型",
+          "type": "string",
+          "defaultValue": "输送",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "deviceName",
+          "label": "设备名称",
+          "type": "string",
+          "defaultValue": "链条输送机",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "description",
+          "label": "参数说明",
+          "type": "string",
+          "defaultValue": "支持链条机长、宽、位置和前后支架显示隐藏参数化。",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        {
+          "key": "chainLength",
+          "label": "链条机长度",
+          "type": "number",
+          "defaultValue": 1.826,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "chainWidth",
+          "label": "链条机宽度",
+          "type": "number",
+          "defaultValue": 1.271,
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "chainPosition",
+          "label": "链条机位置",
+          "type": "number",
+          "defaultValue": 0,
+          "configuration": {
+            "type": "number",
+            "min": -100,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        {
+          "key": "showFrontSupport",
+          "label": "显示前支架",
+          "type": "boolean",
+          "defaultValue": true,
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        {
+          "key": "showRearSupport",
+          "label": "显示后支架",
+          "type": "boolean",
+          "defaultValue": true,
+          "configuration": {
+            "type": "boolean"
+          }
+        }
+      ],
+      "values": {
+        "modelKey": {
+          "type": "string",
+          "value": "chain-conveyor",
+          "label": "模型标识",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceType": {
+          "type": "string",
+          "value": "输送",
+          "label": "设备类型",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "deviceName": {
+          "type": "string",
+          "value": "链条输送机",
+          "label": "设备名称",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "value": "支持链条机长、宽、位置和前后支架显示隐藏参数化。",
+          "label": "参数说明",
+          "configuration": {
+            "type": "string"
+          }
+        },
+        "chainLength": {
+          "type": "number",
+          "value": 1.826,
+          "label": "链条机长度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "chainWidth": {
+          "type": "number",
+          "value": 1.271,
+          "label": "链条机宽度",
+          "configuration": {
+            "type": "number",
+            "min": 0.1,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "chainPosition": {
+          "type": "number",
+          "value": 0,
+          "label": "链条机位置",
+          "configuration": {
+            "type": "number",
+            "min": -100,
+            "max": 100,
+            "step": 0.1
+          }
+        },
+        "showFrontSupport": {
+          "type": "boolean",
+          "value": true,
+          "label": "显示前支架",
+          "configuration": {
+            "type": "boolean"
+          }
+        },
+        "showRearSupport": {
+          "type": "boolean",
+          "value": true,
+          "label": "显示后支架",
+          "configuration": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  ],
+  "animationScripts": [
+    {
+      "modelFilename": "链条机.glb",
+      "scriptFilename": "chain-conveyor.model.ts",
+      "className": "ParametricModelRuntimeComponent",
+      "fields": [],
+      "values": {}
+    }
+  ]
+}

@@ -1114,6 +1114,12 @@ interface ModelPackageEditableStateSnapshot {
   values: Record<string, DynamicParameterValue>;
 }
 
+/** 控制模型包运行器停止时如何处理根节点上的参数化缩放。 */
+interface ModelPackageRuntimeStopOptions {
+  /** 保存场景时保留参数化缩放元数据，避免重新加载后把参数缩放误认为用户缩放。 */
+  preserveParametricRootScaling?: boolean;
+}
+
 /** 模型包 runtime 执行期临时写入的 metadata 标记，生命周期结束后必须恢复。 */
 interface ModelPackageRuntimeTemporaryMetadataFlag {
   node: TransformNode;
@@ -4591,7 +4597,7 @@ export class BabylonEditorEngine {
 
     const sceneInspector = this.createSceneInspectorSnapshot();
     this.sceneBusinessRuntime.stop(true);
-    this.stopAllModelPackageRuntimes(true);
+    this.stopAllModelPackageRuntimes(true, { preserveParametricRootScaling: true });
     try {
       const serialized = SceneSerializer.Serialize(this.scene) as Record<string, unknown>;
       this.stripEditorRuntimeSerialization(serialized);
@@ -4624,7 +4630,7 @@ export class BabylonEditorEngine {
     const previousSerializeBuffers = Texture.SerializeBuffers;
     const previousForceSerializeBuffers = Texture.ForceSerializeBuffers;
     this.sceneBusinessRuntime.stop(true);
-    this.stopAllModelPackageRuntimes(true);
+    this.stopAllModelPackageRuntimes(true, { preserveParametricRootScaling: true });
     try {
       const externalTextures = await this.persistProjectExternalTextures(options.persistExternalTexture);
       Texture.SerializeBuffers = false;
@@ -12303,7 +12309,11 @@ export class BabylonEditorEngine {
   }
 
   /** 停止单个模型包运行器，保存和克隆前会用它恢复基线并清理运行时生成节点。 */
-  private stopModelPackageRuntime(root: TransformNode, keepHandleForRestart: boolean): void {
+  private stopModelPackageRuntime(
+    root: TransformNode,
+    keepHandleForRestart: boolean,
+    options: ModelPackageRuntimeStopOptions = {}
+  ): void {
     const handle = this.modelPackageRuntimeHandles.get(root.uniqueId);
     if (!handle) {
       return;
@@ -12316,8 +12326,13 @@ export class BabylonEditorEngine {
       this.syncModelPackageScriptMetadata(root, manifest, values);
     }
     this.assignModelPackageRuntimeValues(handle.instance, values, manifest?.dynamicFields);
-    const warning = this.runModelPackageLifecycleWithEditableStateGuard(root, manifest, values, "stop", () =>
-      invokeModelPackageRuntimeLifecycle(handle.instance, "onStop", handle.scriptFile)
+    const warning = this.runModelPackageLifecycleWithEditableStateGuard(
+      root,
+      manifest,
+      values,
+      "stop",
+      () => invokeModelPackageRuntimeLifecycle(handle.instance, "onStop", handle.scriptFile),
+      options.preserveParametricRootScaling === true
     );
     if (warning) {
       this.setModelPackageRuntimeWarning(root, warning);
@@ -12332,8 +12347,13 @@ export class BabylonEditorEngine {
   }
 
   /** 停止所有模型包运行器，保存场景时清理运行时生成内容，销毁场景时直接释放句柄。 */
-  private stopAllModelPackageRuntimes(keepHandlesForRestart: boolean): void {
-    [...this.modelPackageRuntimeHandles.values()].forEach((handle) => this.stopModelPackageRuntime(handle.root, keepHandlesForRestart));
+  private stopAllModelPackageRuntimes(
+    keepHandlesForRestart: boolean,
+    options: ModelPackageRuntimeStopOptions = {}
+  ): void {
+    [...this.modelPackageRuntimeHandles.values()].forEach((handle) =>
+      this.stopModelPackageRuntime(handle.root, keepHandlesForRestart, options)
+    );
     if (!keepHandlesForRestart) {
       this.modelPackageRuntimeHandles.clear();
     }
@@ -12345,7 +12365,8 @@ export class BabylonEditorEngine {
     manifest: ModelPackageManifest | undefined,
     values: Record<string, DynamicParameterValue>,
     mode: "apply" | "stop",
-    action: () => string | undefined
+    action: () => string | undefined,
+    preserveParametricRootScaling = false
   ): string | undefined {
     const editableState = this.captureModelPackageEditableState(root, values);
     const temporaryMetadataFlags = this.markNonRenderableRuntimeBoundsNodes(root);
@@ -12360,7 +12381,10 @@ export class BabylonEditorEngine {
       }
       warning = action();
       if (mode === "stop") {
-        editableState.parametricRootScaling = this.createDefaultParametricRootScaling();
+        // 序列化保存时保留参数缩放，重新加载才不会把它误判为用户手动缩放。
+        if (!preserveParametricRootScaling) {
+          editableState.parametricRootScaling = this.createDefaultParametricRootScaling();
+        }
       } else if (!warning) {
         editableState.parametricRootScaling =
           this.normalizeModelPackageParametricRootScaling(root.scaling);
