@@ -1,7 +1,10 @@
 import type { Scene } from "@babylonjs/core/scene";
 import { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
+import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
+import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { Space } from "@babylonjs/core/Maths/math.axis";
+import { Color3 } from "@babylonjs/core/Maths/math.color";
 import { Matrix, Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import type {
   ModelDataDrivenAxis,
@@ -61,9 +64,49 @@ const STACKER_FORK_SIDE_FIELDS = ["fork_side", "forkZ", "fork.z"];
 const STACKER_PLC_DEVICE_CODE_FIELD = "device_code";
 const CARGO_ACTION_FIELDS = ["cargo_action", "cargoAction", "cargo.action", "action"];
 const CARGO_TARGET_FIELDS = ["cargo", "cargoId", "cargoCode", "payload", "box", "boxId", "boxCode", "targetCargo"];
-const CARGO_DROP_TARGET_FIELDS = ["target", "dropTarget", "targetLocator", "locator", "locatorAssetCode", "slot"];
-const ROLLER_CONTAINER_CODE_FIELDS = ["container_no", "containerNo", "container.no", "container_id", "containerId"];
-const ROLLER_TASK_CODE_FIELDS = ["task", "taskNo", "task_no", "taskId", "task_id"];
+const CARGO_DROP_TARGET_FIELDS = ["drop_target", "dropTarget", "target", "targetLocator", "locator", "locatorAssetCode", "slot"];
+const STACKER_TRAVEL_TARGET_FIELDS = ["travel_target", "travelTarget", "move_target", "moveTarget", "targetDevice", "targetAsset"];
+const STACKER_TARGET_ANCHOR_FIELDS = ["target_anchor", "targetAnchor", "travel_anchor", "travelAnchor", "anchor", "targetPort"];
+const STACKER_FORK_TARGET_FIELDS = ["fork_target", "forkTarget", "forkTargetAsset", "fork_target_asset"];
+const STACKER_FORK_ANCHOR_FIELDS = ["fork_anchor", "forkAnchor"];
+const STACKER_HOME_TARGET_VALUES = ["home", "origin", "zero", "retract", "retracted", "缩回", "原位", "零位"];
+const CHAIN_CONVEYOR_LENGTH_PARAMETER_FIELDS = ["chainLength", "chain_length", "length", "链条机长度"];
+const CHAIN_CONVEYOR_FRONT_ENDPOINT_RATIO_FIELDS = [
+  "chainFrontEndpointRatio",
+  "frontEndpointRatio",
+  "frontPositionRatio",
+  "frontPortRatio",
+  "前端位置比例"
+];
+const CHAIN_CONVEYOR_REAR_ENDPOINT_RATIO_FIELDS = [
+  "chainRearEndpointRatio",
+  "rearEndpointRatio",
+  "rearPositionRatio",
+  "rearPortRatio",
+  "后端位置比例"
+];
+const TRANSPORT_CONTAINER_CODE_FIELDS = [
+  "containerCode",
+  "container_code",
+  "container.code",
+  "container_no",
+  "containerNo",
+  "container.no",
+  "container_id",
+  "containerId"
+];
+const TRANSPORT_TASK_CODE_FIELDS = ["task", "taskNo", "task_no", "taskId", "task_id"];
+const TRANSPORT_FRONT_CARGO_FIELDS = [
+  "front_has_cargo",
+  "frontHasCargo",
+  "frontCargo",
+  "front_has_box",
+  "frontHasBox",
+  "hasFrontCargo",
+  "front_photoelectric",
+  "frontPhotoelectric",
+  "前端有货"
+];
 const CARGO_PICKUP_VALUES = ["pickup", "pick", "attach", "load", "carry", "take", "取货", "吸附", "装载"];
 const CARGO_DROP_VALUES = ["drop", "detach", "unload", "release", "put", "放货", "释放", "卸载"];
 const DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION = 0.45;
@@ -71,6 +114,14 @@ const DEFAULT_CARGO_PICKUP_MAX_DISTANCE = 2.5;
 const DEFAULT_CARGO_ANCHOR_OFFSET = new Vector3(0, 0.32, 0);
 // 辊筒模型只声明自转速度时，用该米/秒速度推进已绑定货箱。
 const DEFAULT_CONVEYOR_CARGO_SPEED = 2;
+const CHAIN_CONVEYOR_CHAIN_NODE_NAMES = ["Rail_01_M001", "Rail_02_M001"];
+const CHAIN_CONVEYOR_CARGO_AXIS: ModelDataDrivenAxis = "z";
+const CHAIN_CONVEYOR_CARGO_SPEED = 0.3;
+const CHAIN_CONVEYOR_DIRECTION_ARROW_SPEED = 0.75;
+const CHAIN_CONVEYOR_DIRECTION_ARROW_MIN_COUNT = 2;
+const CHAIN_CONVEYOR_DIRECTION_ARROW_MAX_COUNT = 6;
+const CHAIN_CONVEYOR_DIRECTION_ARROW_TRACK_SPACING = 1.05;
+const CHAIN_CONVEYOR_DIRECTION_ARROW_TOP_OFFSET = 0.08;
 const DEFAULT_RUNTIME_CARGO_BOX_SIZE = 1;
 const STACKER_TRACK_NODE_NAMES = ["guidaoshang.1", "guidaoxia.2"];
 const STACKER_TRAVEL_NODE_NAMES = [
@@ -113,6 +164,12 @@ interface RuntimeMotionGroup {
   actionMap: Map<string, number>;
   target: ModelDataDrivenMotionTarget;
   speed?: number;
+  /** 旋转类输送设备可单独声明货箱推进轴，避免把视觉旋转轴误当输送方向。 */
+  cargoAxis?: ModelDataDrivenAxis;
+  /** 旋转类输送设备可单独声明货箱米/秒速度，避免复用 deg/s 的视觉转速。 */
+  cargoSpeed?: number;
+  /** 仅消费动作字段和货箱输送语义，不把该组写回到模型节点变换。 */
+  nodeTransformDisabled?: boolean;
   limits?: RuntimeMotionLimit;
   /** Stacker 货叉参数化后的最大伸出长度，作为左右双向行程的权威来源。 */
   stackerForkMaxExtension?: number;
@@ -146,6 +203,13 @@ interface ProjectedBounds {
 interface NodeWorldBounds {
   minimum: Vector3;
   maximum: Vector3;
+}
+
+/** 链条机端点参数使用的模型根节点本地基线。 */
+interface ChainConveyorEndpointBaseline {
+  minimum: Vector3;
+  maximum: Vector3;
+  size: Vector3;
 }
 
 /** 旧 Stacker 兜底规则生成的四类运动组。 */
@@ -206,12 +270,40 @@ interface CargoTransportState {
   updatedAt: number;
   blockedDirection?: number;
   blockedBoundary?: "start" | "end";
+  /** 链条机按前后端点线段推进货箱，这里保存货箱中心在线段上的 0..1 进度。 */
+  chainPathProgress?: number;
 }
 
 /** 货箱沿输送方向投影后的可用范围。 */
 interface CargoTransportAxisRange {
   minimum: number;
   maximum: number;
+}
+
+/** 链条机货箱轨迹线段，front -> rear 对应 movement_x=1 的业务方向。 */
+interface ChainConveyorCargoPath {
+  front: Vector3;
+  rear: Vector3;
+  direction: Vector3;
+  length: number;
+}
+
+/** 链条机输送方向箭头使用的模型本地轨迹。 */
+interface ChainConveyorDirectionArrowTrack {
+  centerX: number;
+  topY: number;
+  frontZ: number;
+  rearZ: number;
+  length: number;
+}
+
+/** 预览态链条机输送方向箭头，不写入场景文件。 */
+interface ChainConveyorDirectionArrowVisual {
+  root: TransformNode;
+  arrowNodes: TransformNode[];
+  materials: StandardMaterial[];
+  arrowCount: number;
+  arrowLength: number;
 }
 
 const DEFAULT_STACKER_SIMULATION_SETTINGS: StackerSimulationSettings = {
@@ -314,7 +406,8 @@ export class SceneDataDrivenRuntime {
   private readonly cargoAttachments = new Map<number, CargoAttachmentState>();
   private readonly cargoTransports = new Map<number, CargoTransportState>();
   private readonly runtimeGeneratedCargoByCode = new Map<string, TransformNode>();
-  private readonly rollerFrontCargoPresence = new Map<number, boolean>();
+  private readonly transportFrontCargoPresence = new Map<number, boolean>();
+  private readonly chainConveyorDirectionArrowVisuals = new Map<number, ChainConveyorDirectionArrowVisual>();
   private simulationConfig: SceneDataDrivenSnapshot | null = null;
   private connectionGeneration = 0;
   private lastMessageAt = 0;
@@ -412,10 +505,11 @@ export class SceneDataDrivenRuntime {
     if (restoreTargets) {
       this.restoreTargets();
     }
+    this.disposeChainConveyorDirectionArrowVisuals();
     this.disposeRuntimeGeneratedCargoBoxes();
     this.cargoAttachments.clear();
     this.cargoTransports.clear();
-    this.rollerFrontCargoPresence.clear();
+    this.transportFrontCargoPresence.clear();
     this.targetStates.clear();
     this.running = false;
     this.lastMessageAt = 0;
@@ -437,6 +531,20 @@ export class SceneDataDrivenRuntime {
       }
     });
     this.runtimeGeneratedCargoByCode.clear();
+  }
+
+  /** 释放预览态链条机方向箭头，避免临时光效节点和材质残留。 */
+  private disposeChainConveyorDirectionArrowVisuals(): void {
+    this.chainConveyorDirectionArrowVisuals.forEach((visual) => this.disposeChainConveyorDirectionArrowVisual(visual));
+    this.chainConveyorDirectionArrowVisuals.clear();
+  }
+
+  /** 释放单个链条机方向箭头可视化实例。 */
+  private disposeChainConveyorDirectionArrowVisual(visual: ChainConveyorDirectionArrowVisual): void {
+    if (!visual.root.isDisposed()) {
+      visual.root.dispose(false, true);
+    }
+    visual.materials.forEach((material) => material.dispose(false, true));
   }
 
   /** 配置变更时重建连接，保持预览中的数据源和 UI 配置一致。 */
@@ -464,7 +572,11 @@ export class SceneDataDrivenRuntime {
 
       const interpolatedChanged = this.applyInterpolatedState(state, now);
       const actionChanged = this.applyActionState(state, now, actionFramesAreStale);
+      const directionArrowChanged = this.updateChainConveyorDirectionArrowsForState(state, now, actionFramesAreStale);
       if (interpolatedChanged || actionChanged) {
+        changedRoots.push(state.target.root);
+      }
+      if (directionArrowChanged) {
         changedRoots.push(state.target.root);
       }
       changedRoots.push(...this.updateCargoAttachmentsForState(state, now));
@@ -591,7 +703,8 @@ export class SceneDataDrivenRuntime {
     const rootMotionOnly = Boolean(target.rootMotionFields);
     const legacyStackerGroups = rootMotionOnly ? null : this.createStackerMotionGroups(target);
     const isStacker = legacyStackerGroups ? this.isStackerTarget(target, legacyStackerGroups) : false;
-    const motionGroups = legacyStackerGroups ? this.createMotionGroups(target, isStacker, legacyStackerGroups) : [];
+    const baseMotionGroups = legacyStackerGroups ? this.createMotionGroups(target, isStacker, legacyStackerGroups) : [];
+    const motionGroups = this.createChainConveyorMotionGroups(target, baseMotionGroups);
     const motionNodes = this.getMotionNodes(motionGroups);
     const motionBasePivots = this.captureNodePivots(motionNodes);
     this.applyRollerConveyorMotionPivots(target, motionGroups);
@@ -700,6 +813,75 @@ export class SceneDataDrivenRuntime {
     rollerNodes.forEach((node) => this.setNodePivotToGeometryCenter(node));
   }
 
+  /** 链条机 Rail 是静态装配件，movement_x 只作为货箱输送动作，不再驱动 Rail 整体位移或旋转。 */
+  private createChainConveyorMotionGroups(target: SceneDataDrivenTarget, motionGroups: RuntimeMotionGroup[]): RuntimeMotionGroup[] {
+    if (!this.isChainConveyorTarget(target)) {
+      return motionGroups;
+    }
+
+    const groups: RuntimeMotionGroup[] = motionGroups.map((group): RuntimeMotionGroup => {
+      if (!this.isChainConveyorRailMotionGroup(group)) {
+        return group;
+      }
+
+      return this.createChainConveyorCargoOnlyMotionGroup(group);
+    });
+
+    if (!groups.some((group) => this.motionGroupUsesField(group, "movement_x"))) {
+      const fallbackGroup = this.createDefaultChainConveyorMotionGroup();
+      groups.push(fallbackGroup);
+    }
+    return groups;
+  }
+
+  /** 旧链条机模型包缺少 dataDriven.motion 时，补一个只推进货箱的 movement_x 动作组。 */
+  private createDefaultChainConveyorMotionGroup(): RuntimeMotionGroup {
+    return {
+      key: "chainConveyor",
+      kind: "translate",
+      fields: ["movement_x"],
+      axis: CHAIN_CONVEYOR_CARGO_AXIS,
+      nodes: [],
+      valueMode: "action",
+      actionMap: new Map(DEFAULT_ACTION_MAP_ENTRIES),
+      target: "nodes",
+      cargoAxis: CHAIN_CONVEYOR_CARGO_AXIS,
+      cargoSpeed: CHAIN_CONVEYOR_CARGO_SPEED,
+      nodeTransformDisabled: true,
+      limits: undefined
+    };
+  }
+
+  /** 把链条机 Rail 声明转换成货箱输送专用组，保留 movement_x action 语义。 */
+  private createChainConveyorCargoOnlyMotionGroup(group: RuntimeMotionGroup): RuntimeMotionGroup {
+    return {
+      ...group,
+      valueMode: "action",
+      speed: undefined,
+      cargoAxis: group.cargoAxis ?? CHAIN_CONVEYOR_CARGO_AXIS,
+      cargoSpeed: group.cargoSpeed ?? CHAIN_CONVEYOR_CARGO_SPEED,
+      nodeTransformDisabled: true,
+      limits: undefined
+    };
+  }
+
+  /** 判断运行时运动组是否会驱动链条机 Rail，避免影响其它输送设备。 */
+  private isChainConveyorRailMotionGroup(group: RuntimeMotionGroup): boolean {
+    return (
+      group.target === "nodes" &&
+      this.motionGroupUsesField(group, "movement_x") &&
+      group.nodes.some((node) => this.isChainConveyorChainNode(node))
+    );
+  }
+
+  /** 判断节点是否是链条机静态导轨/链条装配件。 */
+  private isChainConveyorChainNode(node: TransformNode): boolean {
+    const nodeName = String(node.name ?? "");
+    const metadata = this.isRecord(node.metadata) ? node.metadata : {};
+    const sourceNodeName = typeof metadata.sourceNodeName === "string" ? metadata.sourceNodeName : "";
+    return [nodeName, sourceNodeName].some((name) => CHAIN_CONVEYOR_CHAIN_NODE_NAMES.includes(name));
+  }
+
   /** 只处理 RollerConveyor 的 GT 辊筒和同源运行态克隆，避免影响其他输送设备的 rotate 组。 */
   private isRollerConveyorMotionNode(node: TransformNode): boolean {
     const nodeName = String(node.name ?? "");
@@ -792,13 +974,17 @@ export class SceneDataDrivenRuntime {
     const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const fallbackDuration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
     const nextMotionValues = this.readMotionGroupValues(frame, state.motionGroups);
-    const nextDistanceMotionValues = this.readStackerDistanceMotionValues(frame, state);
-    this.mergeMotionValues(nextMotionValues, nextDistanceMotionValues);
     const nextActionDirections = this.readMotionGroupActionDirections(frame, state.motionGroups);
     this.applyInterpolatedState(state, now);
     this.applyActionState(state, now, false);
     const currentMotionValues = this.createCurrentMotionValues(state, now);
+    const nextTargetMotionValues = this.readStackerTargetMotionValues(frame, state, currentMotionValues);
+    const nextDistanceMotionValues = this.readStackerDistanceMotionValues(frame, state);
+    this.mergeMotionValues(nextMotionValues, nextDistanceMotionValues);
+    // 目标定位由模型锚点实时计算，同帧出现历史距离字段时以模型目标为准。
+    this.mergeMotionValues(nextMotionValues, nextTargetMotionValues);
     this.mergeMotionValues(nextActionDirections, this.readStackerForkActionDirections(frame, state, currentMotionValues));
+    this.stopDistanceCalibratedActions(nextActionDirections, nextTargetMotionValues);
     this.stopDistanceCalibratedActions(nextActionDirections, nextDistanceMotionValues);
     const speedDuration = this.createSpeedDrivenMotionDuration(currentMotionValues, nextMotionValues, state.motionGroups);
     const duration = speedDuration !== undefined ? Math.max(speedDuration, fallbackDuration) : fallbackDuration;
@@ -917,7 +1103,7 @@ export class SceneDataDrivenRuntime {
         const position = base.clone();
         const worldDelta = Vector3.Zero();
         state.motionGroups
-          .filter((group) => group.kind === "translate" && group.target === "nodes")
+          .filter((group) => this.shouldApplyMotionGroupToNodes(group) && group.kind === "translate")
           .forEach((group) => this.addMotionGroupDelta(node, state.target.root, group, state.motionValues.get(group.key) ?? 0, worldDelta));
         position.addInPlace(this.worldDeltaToParentLocalDelta(node, worldDelta));
         return [node.uniqueId, position];
@@ -932,7 +1118,7 @@ export class SceneDataDrivenRuntime {
         const base = state.motionBaseRotations.get(node.uniqueId) ?? this.captureNodeRotation(node);
         let rotation = this.cloneRotationSnapshot(base);
         state.motionGroups
-          .filter((group) => group.kind === "rotate" && group.target === "nodes")
+          .filter((group) => this.shouldApplyMotionGroupToNodes(group) && group.kind === "rotate")
           .forEach((group) => {
             rotation = this.addMotionGroupRotation(node, group, state.motionValues.get(group.key) ?? 0, rotation);
           });
@@ -999,7 +1185,9 @@ export class SceneDataDrivenRuntime {
         return;
       }
 
-      nodeMotionChanged = true;
+      if (this.shouldApplyMotionGroupToNodes(group)) {
+        nodeMotionChanged = true;
+      }
     });
 
     if (nodeMotionChanged) {
@@ -1126,6 +1314,8 @@ export class SceneDataDrivenRuntime {
 
   /** 处理输送线负载绑定帧，货箱后续由输送线动作自动推进。 */
   private applyCargoTransportFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
+    this.applyTransportFrontCargoFrame(state, frame, now);
+
     if (!this.isCargoTransportCarrier(state)) {
       return;
     }
@@ -1137,49 +1327,53 @@ export class SceneDataDrivenRuntime {
       }
       return;
     }
-
-    this.applyRollerFrontCargoFrame(state, frame, now);
   }
 
-  /** 处理辊道机 PLC 光电信号，前端有货上升沿会生成运行态货箱。 */
-  private applyRollerFrontCargoFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
-    if (!this.isBoundedRollerConveyorTarget(state.target)) {
+  /** 处理输送线前端有货信号，上升沿会按模型前端生成运行态货箱。 */
+  private applyTransportFrontCargoFrame(state: DataDrivenTargetState, frame: DataFrame, now: number): void {
+    if (!this.canCreateRuntimeCargoFromFrontSignal(state.target)) {
       return;
     }
 
-    const frontPresent = this.isRollerFrontCargoPresent(frame);
+    const frontPresent = this.isTransportFrontCargoPresent(frame);
     if (frontPresent === undefined) {
       return;
     }
 
     const carrierId = state.target.root.uniqueId;
-    const wasPresent = this.rollerFrontCargoPresence.get(carrierId) ?? false;
-    this.rollerFrontCargoPresence.set(carrierId, frontPresent);
-    if (!frontPresent || wasPresent) {
+    const wasPresent = this.transportFrontCargoPresence.get(carrierId) ?? false;
+    if (!frontPresent) {
+      this.transportFrontCargoPresence.set(carrierId, false);
+      return;
+    }
+    if (wasPresent) {
       return;
     }
 
-    const cargoCode = this.createRollerCargoCode(frame, state);
+    const cargoCode = this.createTransportCargoCode(frame, state);
     const normalizedCargoCode = this.normalizeMatchValue(cargoCode);
     const existingCargo = this.findCargoTarget(cargoCode, state.target.root);
     if (existingCargo) {
       this.bindCargoRootToTransportCarrier(state, existingCargo.root, cargoCode, now);
+      this.transportFrontCargoPresence.set(carrierId, true);
       return;
     }
 
     const cargoRoot = this.runtimeGeneratedCargoByCode.get(normalizedCargoCode);
     if (cargoRoot && !cargoRoot.isDisposed()) {
       this.bindCargoRootToTransportCarrier(state, cargoRoot, cargoCode, now);
+      this.transportFrontCargoPresence.set(carrierId, true);
       return;
     }
 
-    const createdRoot = this.createRuntimeCargoBoxForRoller(state, cargoCode);
+    const createdRoot = this.createRuntimeCargoBoxForTransport(state, cargoCode);
     if (!createdRoot) {
       return;
     }
 
     this.runtimeGeneratedCargoByCode.set(normalizedCargoCode, createdRoot);
     this.bindCargoRootToTransportCarrier(state, createdRoot, cargoCode, now);
+    this.transportFrontCargoPresence.set(carrierId, true);
     this.options.onTargetsChanged([createdRoot], now);
   }
 
@@ -1230,9 +1424,14 @@ export class SceneDataDrivenRuntime {
     return this.readString(frame, ["p"]) === "payload" || frame.payload !== undefined;
   }
 
-  /** 读取辊道机前端光电位，move bit0 为 1 表示前端有货。 */
-  private isRollerFrontCargoPresent(frame: DataFrame): boolean | undefined {
-    return this.readBitFlag(frame, "move", 0);
+  /** 判断当前输送线是否支持由前端有货信号生成预览态货箱。 */
+  private canCreateRuntimeCargoFromFrontSignal(target: SceneDataDrivenTarget): boolean {
+    return this.isBoundedRollerConveyorTarget(target) || this.isChainConveyorTarget(target);
+  }
+
+  /** 读取输送线前端光电位；优先使用显式字段，新协议 signalBits bit0 和旧 PLC move bit0 都可触发。 */
+  private isTransportFrontCargoPresent(frame: DataFrame): boolean | undefined {
+    return this.readBoolean(frame, TRANSPORT_FRONT_CARGO_FIELDS) ?? this.readBitFlag(frame, "signalBits", 0) ?? this.readBitFlag(frame, "move", 0);
   }
 
   /** 从 Byte 位域字段中读取指定 bit，字段缺失或非法时返回 undefined。 */
@@ -1247,14 +1446,14 @@ export class SceneDataDrivenRuntime {
     return (bitfield & (1 << bitIndex)) !== 0;
   }
 
-  /** 为辊道机运行态货箱生成稳定编号，优先使用托盘号，其次使用任务号。 */
-  private createRollerCargoCode(frame: DataFrame, state: DataDrivenTargetState): string {
-    const containerCode = this.readString(frame, ROLLER_CONTAINER_CODE_FIELDS);
+  /** 为输送线运行态货箱生成稳定编号，优先使用托盘号，其次使用任务号。 */
+  private createTransportCargoCode(frame: DataFrame, state: DataDrivenTargetState): string {
+    const containerCode = this.readString(frame, TRANSPORT_CONTAINER_CODE_FIELDS);
     if (containerCode) {
       return containerCode;
     }
 
-    const taskCode = this.readString(frame, ROLLER_TASK_CODE_FIELDS);
+    const taskCode = this.readString(frame, TRANSPORT_TASK_CODE_FIELDS);
     if (taskCode && !this.isZeroLikeCode(taskCode)) {
       return `Task${taskCode}`;
     }
@@ -1279,13 +1478,13 @@ export class SceneDataDrivenRuntime {
     return Number.isFinite(numberValue) && numberValue === 0;
   }
 
-  /** 在辊道机前端创建临时 cube，创建失败时保持运行态不变。 */
-  private createRuntimeCargoBoxForRoller(state: DataDrivenTargetState, cargoCode: string): TransformNode | null {
+  /** 在输送线前端创建临时 cube，创建失败时保持运行态不变。 */
+  private createRuntimeCargoBoxForTransport(state: DataDrivenTargetState, cargoCode: string): TransformNode | null {
     if (!this.options.createRuntimeCargoBox) {
       return null;
     }
 
-    const position = this.createRollerFrontCargoPosition(state, DEFAULT_RUNTIME_CARGO_BOX_SIZE);
+    const position = this.createTransportFrontCargoPosition(state, DEFAULT_RUNTIME_CARGO_BOX_SIZE);
     return this.options.createRuntimeCargoBox({
       cargoCode,
       carrierRoot: state.target.root,
@@ -1294,8 +1493,8 @@ export class SceneDataDrivenRuntime {
     });
   }
 
-  /** 计算辊道机前端货箱中心点，保证 cube 一生成就在有效输送段内。 */
-  private createRollerFrontCargoPosition(state: DataDrivenTargetState, cargoSize: number): Vector3 {
+  /** 计算输送线前端货箱中心点，保证 cube 一生成就在有效输送段内。 */
+  private createTransportFrontCargoPosition(state: DataDrivenTargetState, cargoSize: number): Vector3 {
     const axis = this.resolveCargoTransportAxis(state);
     const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, axis);
     const carrierBounds = this.getNodeWorldBounds(state.target.root);
@@ -1305,6 +1504,13 @@ export class SceneDataDrivenRuntime {
       : fallbackPosition.clone();
     const halfSize = cargoSize / 2;
     const topY = carrierBounds ? carrierBounds.maximum.y : fallbackPosition.y;
+
+    if (this.isChainConveyorTarget(state.target)) {
+      const chainPosition = this.createChainConveyorFrontCargoPosition(state, basePosition, topY, halfSize);
+      if (chainPosition) {
+        return chainPosition;
+      }
+    }
 
     if (axisDirection.lengthSquared() <= 0) {
       return new Vector3(basePosition.x, topY + halfSize, basePosition.z);
@@ -1326,6 +1532,24 @@ export class SceneDataDrivenRuntime {
     const positioned = basePosition.add(axisDirection.scale(targetProjection - currentProjection));
     positioned.y = topY + halfSize;
     return positioned;
+  }
+
+  /** 链条机使用模型包前端/后端参数放置货箱，不把投影最小端硬编码成前端。 */
+  private createChainConveyorFrontCargoPosition(
+    state: DataDrivenTargetState,
+    fallbackPosition: Vector3,
+    topY: number,
+    halfSize: number
+  ): Vector3 | null {
+    const path = this.createChainConveyorCargoPath(state, fallbackPosition);
+    if (!path) {
+      return null;
+    }
+
+    const offsetDistance = Math.min(halfSize, path.length / 2);
+    const positioned = path.front.add(path.direction.scale(offsetDistance));
+    positioned.y = topY + halfSize;
+    return [positioned.x, positioned.y, positioned.z].every(Number.isFinite) ? positioned : null;
   }
 
   /** 解除指定货箱或当前 Stacker 所有货箱的运行态吸附关系，带 target 时先放入定位框。 */
@@ -1403,13 +1627,17 @@ export class SceneDataDrivenRuntime {
       return;
     }
 
+    const chainPathProgress = this.isChainConveyorTarget(state.target)
+      ? this.createChainConveyorCargoProgress(state, cargoRoot)
+      : undefined;
     this.cargoTransports.set(cargoRoot.uniqueId, {
       carrierRootId: state.target.root.uniqueId,
       cargoRoot,
       cargoCode: this.normalizeMatchValue(cargoCode),
       axis: this.resolveCargoTransportAxis(state),
       speed: this.resolveCargoTransportSpeed(state),
-      updatedAt: now
+      updatedAt: now,
+      chainPathProgress
     });
     this.syncCargoTargetStateToCurrentPose(cargoRoot, now);
   }
@@ -1435,7 +1663,7 @@ export class SceneDataDrivenRuntime {
         return;
       }
 
-      const direction = stale ? 0 : this.resolveCargoTransportDirection(state);
+      const direction = stale ? 0 : this.resolveCargoTransportMovementDirection(state);
       const elapsedSeconds = Math.min(MAX_ACTION_DELTA_SECONDS, Math.max(0, (now - transport.updatedAt) / 1000));
       transport.updatedAt = now;
       if (direction === 0 || elapsedSeconds <= 0) {
@@ -1450,17 +1678,238 @@ export class SceneDataDrivenRuntime {
         transport.blockedBoundary = undefined;
       }
 
-      const worldDelta = this.createCargoTransportWorldDelta(state, transport, direction, elapsedSeconds);
-      if (worldDelta.lengthSquared() <= 0) {
+      const nextPosition = this.createCargoTransportNextPosition(state, transport, direction, elapsedSeconds);
+      if (!nextPosition) {
         return;
       }
-      const nextPosition = transport.cargoRoot.getAbsolutePosition().add(worldDelta);
       if (this.setNodeAbsolutePosition(transport.cargoRoot, nextPosition)) {
         changedCargoRoots.push(transport.cargoRoot);
       }
       this.syncCargoTargetStateToCurrentPose(transport.cargoRoot, now);
     });
     return changedCargoRoots;
+  }
+
+  /** 按链条机 movement_x 状态更新输送面方向箭头，链条模型本体保持静止。 */
+  private updateChainConveyorDirectionArrowsForState(state: DataDrivenTargetState, now: number, stale: boolean): boolean {
+    if (!this.isChainConveyorTarget(state.target)) {
+      return false;
+    }
+
+    const direction = stale ? 0 : this.resolveCargoTransportSemanticDirection(state);
+    if (direction === 0) {
+      return this.setChainConveyorDirectionArrowEnabled(state.target.root.uniqueId, false);
+    }
+
+    const track = this.createChainConveyorDirectionArrowTrack(state);
+    if (!track) {
+      return this.setChainConveyorDirectionArrowEnabled(state.target.root.uniqueId, false);
+    }
+
+    const visual = this.ensureChainConveyorDirectionArrowVisual(state, track);
+    visual.root.setEnabled(true);
+    this.updateChainConveyorDirectionArrowPositions(visual, track, direction, now);
+    return true;
+  }
+
+  /** 显隐已创建的链条机方向箭头。 */
+  private setChainConveyorDirectionArrowEnabled(rootId: number, enabled: boolean): boolean {
+    const visual = this.chainConveyorDirectionArrowVisuals.get(rootId);
+    if (!visual) {
+      return false;
+    }
+
+    visual.root.setEnabled(enabled);
+    return true;
+  }
+
+  /** 获取或重建链条机方向箭头，轨迹长度变化时同步调整箭头数量和尺寸。 */
+  private ensureChainConveyorDirectionArrowVisual(
+    state: DataDrivenTargetState,
+    track: ChainConveyorDirectionArrowTrack
+  ): ChainConveyorDirectionArrowVisual {
+    const arrowCount = this.createChainConveyorDirectionArrowCount(track.length);
+    const arrowLength = this.createChainConveyorDirectionArrowLength(track.length, arrowCount);
+    const existing = this.chainConveyorDirectionArrowVisuals.get(state.target.root.uniqueId);
+    if (existing && existing.arrowCount === arrowCount && Math.abs(existing.arrowLength - arrowLength) <= 1e-6) {
+      return existing;
+    }
+
+    if (existing) {
+      this.disposeChainConveyorDirectionArrowVisual(existing);
+    }
+    const visual = this.createChainConveyorDirectionArrowVisual(state.target.root, arrowCount, arrowLength);
+    this.chainConveyorDirectionArrowVisuals.set(state.target.root.uniqueId, visual);
+    return visual;
+  }
+
+  /** 创建链条机输送面的光晕箭头节点。 */
+  private createChainConveyorDirectionArrowVisual(
+    targetRoot: TransformNode,
+    arrowCount: number,
+    arrowLength: number
+  ): ChainConveyorDirectionArrowVisual {
+    const root = new TransformNode(`${targetRoot.name} / 链条机输送方向箭头`, this.options.scene);
+    root.parent = targetRoot;
+    root.doNotSerialize = true;
+    root.metadata = { runtimeChainConveyorDirectionArrows: true };
+
+    const bodyMaterial = this.createChainConveyorArrowMaterial(`${targetRoot.name} / 输送方向箭头材质`, 0.95, 0.1);
+    const haloMaterial = this.createChainConveyorArrowMaterial(`${targetRoot.name} / 输送方向箭头光晕材质`, 0.24, 0.55);
+    const arrowNodes = Array.from({ length: arrowCount }, (_unused, index) =>
+      this.createChainConveyorDirectionArrowNode(root, index, arrowLength, bodyMaterial, haloMaterial)
+    );
+
+    root.setEnabled(false);
+    return {
+      root,
+      arrowNodes,
+      materials: [bodyMaterial, haloMaterial],
+      arrowCount,
+      arrowLength
+    };
+  }
+
+  /** 创建一个箭头，由箭身、两段箭头和半透明外层组成。 */
+  private createChainConveyorDirectionArrowNode(
+    parent: TransformNode,
+    index: number,
+    arrowLength: number,
+    bodyMaterial: StandardMaterial,
+    haloMaterial: StandardMaterial
+  ): TransformNode {
+    const arrowNode = new TransformNode(`${parent.name} #${index + 1}`, this.options.scene);
+    arrowNode.parent = parent;
+    arrowNode.doNotSerialize = true;
+
+    this.createChainConveyorArrowSegments(arrowNode, arrowLength * 1.22, 0.36, 0.018, haloMaterial, "光晕");
+    this.createChainConveyorArrowSegments(arrowNode, arrowLength, 0.2, 0.026, bodyMaterial, "箭头");
+    return arrowNode;
+  }
+
+  /** 创建箭头的三段几何，使用 Box 避免额外纹理和复杂网格。 */
+  private createChainConveyorArrowSegments(
+    parent: TransformNode,
+    arrowLength: number,
+    arrowWidth: number,
+    arrowHeight: number,
+    material: StandardMaterial,
+    label: string
+  ): void {
+    const shaftDepth = arrowLength * 0.58;
+    const headDepth = arrowLength * 0.44;
+    const shaft = MeshBuilder.CreateBox(
+      `${parent.name} / ${label} / 箭身`,
+      { width: arrowWidth * 0.34, height: arrowHeight, depth: shaftDepth },
+      this.options.scene
+    );
+    shaft.parent = parent;
+    shaft.position.z = -arrowLength * 0.14;
+
+    const leftHead = MeshBuilder.CreateBox(
+      `${parent.name} / ${label} / 左箭头`,
+      { width: arrowWidth * 0.28, height: arrowHeight, depth: headDepth },
+      this.options.scene
+    );
+    leftHead.parent = parent;
+    leftHead.position.x = -arrowWidth * 0.14;
+    leftHead.position.z = arrowLength * 0.18;
+    leftHead.rotation.y = -Math.PI / 4;
+
+    const rightHead = MeshBuilder.CreateBox(
+      `${parent.name} / ${label} / 右箭头`,
+      { width: arrowWidth * 0.28, height: arrowHeight, depth: headDepth },
+      this.options.scene
+    );
+    rightHead.parent = parent;
+    rightHead.position.x = arrowWidth * 0.14;
+    rightHead.position.z = arrowLength * 0.18;
+    rightHead.rotation.y = Math.PI / 4;
+
+    [shaft, leftHead, rightHead].forEach((mesh) => {
+      mesh.material = material;
+      mesh.isPickable = false;
+      mesh.doNotSerialize = true;
+    });
+  }
+
+  /** 创建输送方向箭头材质，自发光和透明外层共同形成光晕观感。 */
+  private createChainConveyorArrowMaterial(name: string, alpha: number, glowBoost: number): StandardMaterial {
+    const material = new StandardMaterial(name, this.options.scene);
+    const color = new Color3(0.04, 0.9, 1);
+    material.diffuseColor = color;
+    material.emissiveColor = new Color3(
+      Math.min(1, color.r + glowBoost),
+      Math.min(1, color.g + glowBoost),
+      Math.min(1, color.b + glowBoost)
+    );
+    material.alpha = alpha;
+    material.disableLighting = true;
+    material.backFaceCulling = false;
+    material.doNotSerialize = true;
+    return material;
+  }
+
+  /** 更新箭头在链条机本地轨迹上的循环位置。 */
+  private updateChainConveyorDirectionArrowPositions(
+    visual: ChainConveyorDirectionArrowVisual,
+    track: ChainConveyorDirectionArrowTrack,
+    direction: number,
+    now: number
+  ): void {
+    const frontToRearSign = Math.sign(track.rearZ - track.frontZ) || 1;
+    const travelSign = Math.sign(direction) * frontToRearSign;
+    const minZ = Math.min(track.frontZ, track.rearZ);
+    const maxZ = Math.max(track.frontZ, track.rearZ);
+    const spacing = track.length / Math.max(1, visual.arrowCount);
+    const phase = ((now / 1000) * CHAIN_CONVEYOR_DIRECTION_ARROW_SPEED) % spacing;
+    visual.arrowNodes.forEach((arrowNode, index) => {
+      const distance = (index * spacing + phase) % track.length;
+      arrowNode.position.x = track.centerX;
+      arrowNode.position.y = track.topY;
+      arrowNode.position.z = travelSign >= 0 ? minZ + distance : maxZ - distance;
+      arrowNode.rotation.y = travelSign >= 0 ? 0 : Math.PI;
+    });
+  }
+
+  /** 读取链条机箭头所需的本地输送面轨迹。 */
+  private createChainConveyorDirectionArrowTrack(state: DataDrivenTargetState): ChainConveyorDirectionArrowTrack | null {
+    const baseline = this.readChainConveyorEndpointBaseline(state.target.root);
+    if (!baseline) {
+      return null;
+    }
+
+    const chainLength = this.readChainConveyorCurrentLength(state.target.root, baseline);
+    const frontRatio = this.readChainConveyorEndpointRatio(state.target.root, "front");
+    const rearRatio = this.readChainConveyorEndpointRatio(state.target.root, "rear");
+    const frontZ = baseline.minimum.z + chainLength * frontRatio;
+    const rearZ = baseline.minimum.z + chainLength * rearRatio;
+    const length = Math.abs(rearZ - frontZ);
+    if (!Number.isFinite(length) || length <= 1e-6) {
+      return null;
+    }
+
+    return {
+      centerX: this.averageFiniteNumbers(baseline.minimum.x, baseline.maximum.x, 0),
+      topY: baseline.maximum.y + CHAIN_CONVEYOR_DIRECTION_ARROW_TOP_OFFSET,
+      frontZ,
+      rearZ,
+      length
+    };
+  }
+
+  /** 根据链条机长度生成箭头数量，长输送线显示更多箭头但保持上限。 */
+  private createChainConveyorDirectionArrowCount(trackLength: number): number {
+    const rawCount = Math.round(trackLength / CHAIN_CONVEYOR_DIRECTION_ARROW_TRACK_SPACING);
+    return Math.round(
+      this.clampNumber(rawCount, CHAIN_CONVEYOR_DIRECTION_ARROW_MIN_COUNT, CHAIN_CONVEYOR_DIRECTION_ARROW_MAX_COUNT)
+    );
+  }
+
+  /** 根据轨迹间距生成单个箭头尺寸，避免短链条机上箭头互相重叠。 */
+  private createChainConveyorDirectionArrowLength(trackLength: number, arrowCount: number): number {
+    const spacing = trackLength / Math.max(1, arrowCount);
+    return this.clampNumber(spacing * 0.5, 0.34, 0.62);
   }
 
   /** 判断目标是否是可承载货箱的输送线类设备。 */
@@ -1478,7 +1927,22 @@ export class SceneDataDrivenRuntime {
     return values.some((value) => value.includes("conveyor") || value.includes("roller") || value.includes("chain"));
   }
 
-  /** 生成输送线本帧货箱位移，辊道机额外按输送段范围夹紧。 */
+  /** 生成输送线货箱下一帧世界坐标；链条机沿配置端点线段插值，其他输送线沿轴位移。 */
+  private createCargoTransportNextPosition(
+    state: DataDrivenTargetState,
+    transport: CargoTransportState,
+    direction: number,
+    elapsedSeconds: number
+  ): Vector3 | null {
+    if (this.shouldUseChainConveyorPathTransport(state)) {
+      return this.createChainConveyorCargoNextPosition(state, transport, direction, elapsedSeconds);
+    }
+
+    const worldDelta = this.createCargoTransportWorldDelta(state, transport, direction, elapsedSeconds);
+    return worldDelta.lengthSquared() <= 0 ? null : transport.cargoRoot.getAbsolutePosition().add(worldDelta);
+  }
+
+  /** 生成输送线本帧货箱位移，带端点语义的输送线会按有效输送段范围夹紧。 */
   private createCargoTransportWorldDelta(
     state: DataDrivenTargetState,
     transport: CargoTransportState,
@@ -1491,13 +1955,75 @@ export class SceneDataDrivenRuntime {
       return Vector3.Zero();
     }
 
-    const distance = this.isBoundedRollerConveyorTarget(state.target)
+    const distance = this.shouldClampCargoTransportToTrack(state.target)
       ? this.clampBoundedCargoTransportDistance(state, transport, axisDirection, rawDistance)
       : rawDistance;
     return Math.abs(distance) <= 0 ? Vector3.Zero() : axisDirection.scale(distance);
   }
 
-  /** 辊道机货箱按当前辊筒输送段夹紧，整箱到末端后等待反向或重绑信号。 */
+  /** 链条机货箱按前端到后端的真实端点线段推进，避免只沿根节点轴移动造成偏轨。 */
+  private createChainConveyorCargoNextPosition(
+    state: DataDrivenTargetState,
+    transport: CargoTransportState,
+    direction: number,
+    elapsedSeconds: number
+  ): Vector3 | null {
+    const path = this.createChainConveyorCargoPath(state);
+    if (!path || path.length <= 0) {
+      return null;
+    }
+
+    const progressRange = this.createChainConveyorCargoProgressRange(transport.cargoRoot, path);
+    if (!progressRange) {
+      transport.blockedDirection = direction;
+      transport.blockedBoundary = direction > 0 ? "end" : "start";
+      return null;
+    }
+
+    const currentProgress =
+      transport.chainPathProgress ??
+      this.projectPositionToChainConveyorProgress(transport.cargoRoot.getAbsolutePosition(), path);
+    const deltaProgress = (direction * transport.speed * elapsedSeconds) / path.length;
+    const unclampedProgress = currentProgress + deltaProgress;
+    const nextProgress = this.clampNumber(unclampedProgress, progressRange.minimum, progressRange.maximum);
+    if (nextProgress === currentProgress) {
+      transport.blockedDirection = direction;
+      transport.blockedBoundary = direction > 0 ? "end" : "start";
+      return null;
+    }
+
+    transport.chainPathProgress = nextProgress;
+    transport.blockedDirection =
+      nextProgress !== unclampedProgress ? direction : undefined;
+    transport.blockedBoundary =
+      nextProgress !== unclampedProgress ? (direction > 0 ? "end" : "start") : undefined;
+
+    const pathPosition = path.front.add(path.direction.scale(path.length * nextProgress));
+    const currentPosition = transport.cargoRoot.getAbsolutePosition();
+    const nextPosition = new Vector3(pathPosition.x, currentPosition.y, pathPosition.z);
+    return [nextPosition.x, nextPosition.y, nextPosition.z].every(Number.isFinite) ? nextPosition : null;
+  }
+
+  /** 计算链条机货箱中心允许进度范围，确保整箱不会越过前后端点。 */
+  private createChainConveyorCargoProgressRange(cargoRoot: TransformNode, path: ChainConveyorCargoPath): CargoTransportAxisRange | null {
+    const cargoRange = this.createNodeProjectionRange(cargoRoot, path.direction);
+    const cargoLength = cargoRange ? cargoRange.maximum - cargoRange.minimum : DEFAULT_RUNTIME_CARGO_BOX_SIZE;
+    if (!Number.isFinite(cargoLength) || cargoLength < 0 || cargoLength > path.length) {
+      return null;
+    }
+
+    const margin = path.length > 0 ? cargoLength / (path.length * 2) : 0;
+    const minimum = this.clampNumber(margin, 0, 0.5);
+    const maximum = this.clampNumber(1 - margin, 0, 1);
+    return minimum <= maximum ? { minimum, maximum } : null;
+  }
+
+  /** 判断输送线货箱是否需要按模型输送段夹紧，防止整箱越过端点。 */
+  private shouldClampCargoTransportToTrack(target: SceneDataDrivenTarget): boolean {
+    return this.isBoundedRollerConveyorTarget(target) || this.isChainConveyorTarget(target);
+  }
+
+  /** 货箱按当前输送段夹紧，整箱到末端后等待反向或重绑信号。 */
   private clampBoundedCargoTransportDistance(
     state: DataDrivenTargetState,
     transport: CargoTransportState,
@@ -1541,8 +2067,13 @@ export class SceneDataDrivenRuntime {
     return rawDistance;
   }
 
-  /** 计算辊道机当前有效输送段；优先使用辊筒运动节点，缺失时回退整机几何。 */
+  /** 计算当前有效输送段；链条机优先使用端点参数，其他输送线优先使用运动节点几何。 */
   private createCargoTransportTrackRange(state: DataDrivenTargetState, axisDirection: Vector3): CargoTransportAxisRange | null {
+    const chainRange = this.createChainConveyorCargoTrackRange(state, axisDirection);
+    if (chainRange) {
+      return chainRange;
+    }
+
     const motionGroup = this.findCargoTransportMotionGroup(state);
     const ranges = (motionGroup?.nodes ?? [])
       .map((node) => this.createNodeProjectionRange(node, axisDirection))
@@ -1552,6 +2083,28 @@ export class SceneDataDrivenRuntime {
     }
 
     return this.createNodeProjectionRange(state.target.root, axisDirection);
+  }
+
+  /** 链条机输送段优先使用模型包前后端参数，确保 target_anchor 和货箱夹紧语义一致。 */
+  private createChainConveyorCargoTrackRange(state: DataDrivenTargetState, axisDirection: Vector3): CargoTransportAxisRange | null {
+    if (!this.isChainConveyorTarget(state.target) || axisDirection.lengthSquared() <= 0) {
+      return null;
+    }
+
+    const fallbackPosition = state.target.root.getAbsolutePosition();
+    const frontPosition = this.createChainConveyorEndpointWorldPosition(state.target.root, "front", fallbackPosition);
+    const rearPosition = this.createChainConveyorEndpointWorldPosition(state.target.root, "rear", fallbackPosition);
+    if (!frontPosition || !rearPosition) {
+      return null;
+    }
+
+    const frontProjection = Vector3.Dot(frontPosition, axisDirection);
+    const rearProjection = Vector3.Dot(rearPosition, axisDirection);
+    const minimum = Math.min(frontProjection, rearProjection);
+    const maximum = Math.max(frontProjection, rearProjection);
+    return Number.isFinite(minimum) && Number.isFinite(maximum) && maximum >= minimum
+      ? { minimum, maximum }
+      : null;
   }
 
   /** 将节点真实网格包围盒直接投影到输送方向，避免旋转后世界 AABB 放大输送范围。 */
@@ -1590,8 +2143,55 @@ export class SceneDataDrivenRuntime {
     return matchValues.some((value) => value === "rollerconveyor01" || value.includes("rollerconveyor"));
   }
 
+  /** 判断目标是否是链条机模型，兼容模型 key、默认编号、资产编号和中文源文件名。 */
+  private isChainConveyorTarget(target: SceneDataDrivenTarget): boolean {
+    const matchValues = this.dedupeStrings([
+      target.dataDriven?.device?.defaultAssetCode,
+      target.matchFields.assetCode,
+      target.matchFields.modelKey,
+      target.matchFields.deviceId,
+      target.matchFields.name,
+      target.matchFields.sourceFile,
+      target.matchFields.sourceFileStem
+    ]).map((value) => this.compactProtocolFieldName(value));
+
+    return matchValues.some(
+      (value) =>
+        value === "chainconveyor01" ||
+        value === "chainconveyor" ||
+        value.includes("chainconveyor") ||
+        value.includes("链条机") ||
+        value.includes("链条输送")
+    );
+  }
+
+  /** 读取货箱移动方向；链条机使用 front -> rear 的业务方向，普通输送线使用轴向方向。 */
+  private resolveCargoTransportMovementDirection(state: DataDrivenTargetState): number {
+    return this.shouldUseChainConveyorPathTransport(state)
+      ? this.resolveCargoTransportSemanticDirection(state)
+      : this.resolveCargoTransportDirection(state);
+  }
+
   /** 读取输送线当前动作方向，优先使用 movement_x 对应的 action 运动组。 */
   private resolveCargoTransportDirection(state: DataDrivenTargetState): number {
+    const group = this.findCargoTransportMotionGroup(state);
+    if (!group) {
+      return 0;
+    }
+
+    const direction = state.motionActionDirections.get(group.key) ?? 0;
+    const normalizedDirection = Number.isFinite(direction) ? Math.sign(direction) : 0;
+    if (normalizedDirection === 0) {
+      return 0;
+    }
+
+    return this.isChainConveyorTarget(state.target) && this.motionGroupUsesField(group, "movement_x")
+      ? this.resolveChainConveyorCargoDirection(state, group, normalizedDirection)
+      : normalizedDirection;
+  }
+
+  /** 读取输送线动作枚举的业务方向；movement_x=1 为正向，movement_x=2 为反向。 */
+  private resolveCargoTransportSemanticDirection(state: DataDrivenTargetState): number {
     const group = this.findCargoTransportMotionGroup(state);
     if (!group) {
       return 0;
@@ -1601,22 +2201,68 @@ export class SceneDataDrivenRuntime {
     return Number.isFinite(direction) ? Math.sign(direction) : 0;
   }
 
-  /** 货箱沿输送线本地轴移动，默认 movement_x 对应模型本地 X 轴。 */
+  /** 链条机货箱使用显式端点线段输送，和 target_anchor=front/rear 使用同一套模型参数。 */
+  private shouldUseChainConveyorPathTransport(state: DataDrivenTargetState): boolean {
+    const group = this.findCargoTransportMotionGroup(state);
+    return Boolean(
+      group &&
+      this.isChainConveyorTarget(state.target) &&
+      this.motionGroupUsesField(group, "movement_x") &&
+      this.createChainConveyorCargoPath(state)
+    );
+  }
+
+  /** 链条机 movement_x=1 永远表示从配置的前端送向后端，端点比例反向时也能保持语义。 */
+  private resolveChainConveyorCargoDirection(
+    state: DataDrivenTargetState,
+    group: RuntimeMotionGroup,
+    direction: number
+  ): number {
+    const cargoAxis = group.cargoAxis ?? CHAIN_CONVEYOR_CARGO_AXIS;
+    const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, cargoAxis);
+    if (axisDirection.lengthSquared() <= 0) {
+      return -direction;
+    }
+
+    const fallbackPosition = state.target.root.getAbsolutePosition();
+    const frontPosition = this.createChainConveyorEndpointWorldPosition(state.target.root, "front", fallbackPosition);
+    const rearPosition = this.createChainConveyorEndpointWorldPosition(state.target.root, "rear", fallbackPosition);
+    if (!frontPosition || !rearPosition) {
+      return -direction;
+    }
+
+    const endpointDirection = Math.sign(Vector3.Dot(rearPosition, axisDirection) - Vector3.Dot(frontPosition, axisDirection));
+    return endpointDirection === 0 ? -direction : direction * endpointDirection;
+  }
+
+  /** 解析普通输送线的货箱轴；链条机命中端点路径时仅作为旧几何兜底轴。 */
   private resolveCargoTransportAxis(state: DataDrivenTargetState): ModelDataDrivenAxis {
     const group = this.findCargoTransportMotionGroup(state);
     if (!group) {
       return "x";
     }
 
+    if (group.cargoAxis) {
+      return group.cargoAxis;
+    }
+    if (this.isChainConveyorTarget(state.target) && this.motionGroupUsesField(group, "movement_x")) {
+      return CHAIN_CONVEYOR_CARGO_AXIS;
+    }
     if (group.target === "root" && group.kind === "translate") {
       return group.axis;
     }
     return this.resolveAxisFromMotionFields(group.fields);
   }
 
-  /** 输送线载货速度优先复用平移运动组速度，辊筒旋转类模型使用运行态默认速度。 */
+  /** 输送线载货速度优先使用 cargoSpeed 或平移速度，纯旋转模型使用运行态默认速度。 */
   private resolveCargoTransportSpeed(state: DataDrivenTargetState): number {
     const group = this.findCargoTransportMotionGroup(state);
+    if (group?.cargoSpeed && group.cargoSpeed > 0) {
+      return group.cargoSpeed;
+    }
+    if (group && this.isChainConveyorTarget(state.target) && this.motionGroupUsesField(group, "movement_x")) {
+      return CHAIN_CONVEYOR_CARGO_SPEED;
+    }
     if (group?.kind === "translate" && group.speed && group.speed > 0) {
       return group.speed;
     }
@@ -1639,7 +2285,7 @@ export class SceneDataDrivenRuntime {
     return group.fields.some((field) => this.normalizeMatchValue(field) === normalizedField);
   }
 
-  /** 按 movement_x/y/z 点位名推导货箱输送轴，rotation 仍按 X 方向作为输送线默认流向。 */
+  /** 按 movement_x/y/z 点位名推导普通输送线货箱轴，特殊设备可在运动组上覆盖 cargoAxis。 */
   private resolveAxisFromMotionFields(fields: string[]): ModelDataDrivenAxis {
     const normalizedFields = fields.map((field) => this.normalizeMatchValue(field));
     if (normalizedFields.includes("movement_y")) {
@@ -2055,7 +2701,9 @@ export class SceneDataDrivenRuntime {
     }
 
     if (normalizedPointName === "action") {
-      this.writeMotionAlias(frame, "movement_x", this.readBitfieldAction(pointValue, [0], [1]));
+      if (frame.movement_x === undefined) {
+        this.writeMotionAlias(frame, "movement_x", this.readBitfieldAction(pointValue, [0], [1]));
+      }
       return;
     }
 
@@ -2271,6 +2919,19 @@ export class SceneDataDrivenRuntime {
       "backDistanceX",
       "forkState",
       "rotation",
+      "front_has_cargo",
+      "frontHasCargo",
+      "frontCargo",
+      "front_has_box",
+      "frontHasBox",
+      "hasFrontCargo",
+      "front_photoelectric",
+      "frontPhotoelectric",
+      "rear_has_cargo",
+      "rearHasCargo",
+      "rearCargo",
+      "rear_has_box",
+      "rearHasBox",
       "move",
       "action",
       "folding",
@@ -2289,6 +2950,18 @@ export class SceneDataDrivenRuntime {
       "forkX",
       "fork_side",
       "forkZ",
+      "travel_target",
+      "travelTarget",
+      "move_target",
+      "moveTarget",
+      "target_anchor",
+      "targetAnchor",
+      "travel_anchor",
+      "travelAnchor",
+      "fork_target",
+      "forkTarget",
+      "fork_anchor",
+      "forkAnchor",
       "cargo_action",
       "cargoAction",
       "cargo",
@@ -2296,6 +2969,8 @@ export class SceneDataDrivenRuntime {
       "cargoCode",
       "boxId",
       "boxCode",
+      "drop_target",
+      "dropTarget",
       "r",
       "yaw",
       "rotationY"
@@ -2331,6 +3006,10 @@ export class SceneDataDrivenRuntime {
       "time",
       "assetCode",
       "modelKey",
+      ...STACKER_TRAVEL_TARGET_FIELDS,
+      ...STACKER_TARGET_ANCHOR_FIELDS,
+      ...STACKER_FORK_TARGET_FIELDS,
+      ...STACKER_FORK_ANCHOR_FIELDS,
       ...CARGO_ACTION_FIELDS,
       ...CARGO_TARGET_FIELDS,
       ...CARGO_DROP_TARGET_FIELDS,
@@ -2362,6 +3041,29 @@ export class SceneDataDrivenRuntime {
 
       if (typeof value === "number" && Number.isFinite(value)) {
         return String(value);
+      }
+    }
+    return undefined;
+  }
+
+  /** 读取布尔字段，兼容现场常见的 true/false、1/0 和 yes/no 字符串。 */
+  private readBoolean(frame: DataFrame, paths: string[]): boolean | undefined {
+    for (const path of paths.filter(Boolean)) {
+      const value = this.readFrameValueByCompactField(frame, this.compactProtocolFieldName(path)) ?? this.readPath(frame, path);
+      if (typeof value === "boolean") {
+        return value;
+      }
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value !== 0;
+      }
+      if (typeof value === "string" && value.trim()) {
+        const normalized = this.normalizeMatchValue(value);
+        if (["true", "1", "yes", "y", "on", "present", "has", "有", "有货"].includes(normalized)) {
+          return true;
+        }
+        if (["false", "0", "no", "n", "off", "absent", "none", "无", "无货"].includes(normalized)) {
+          return false;
+        }
       }
     }
     return undefined;
@@ -2439,6 +3141,358 @@ export class SceneDataDrivenRuntime {
   /** 读取 target 模式运动组绑定的 payload 数字目标值。 */
   private readMotionGroupValue(frame: DataFrame, group: RuntimeMotionGroup): number | undefined {
     return group.valueMode === "target" && group.fields.length > 0 ? this.readNumber(frame, group.fields) : undefined;
+  }
+
+  /** 汇总 Stacker 模型目标定位值；由资产编号和锚点实时推导 travel/fork 目标位置。 */
+  private readStackerTargetMotionValues(
+    frame: DataFrame,
+    state: DataDrivenTargetState,
+    currentValues: Map<string, number>
+  ): Map<string, number> {
+    const values = this.readStackerTravelTargetMotionValues(frame, state, currentValues);
+    this.mergeMotionValues(values, this.readStackerForkTargetMotionValues(frame, state, currentValues));
+    return values;
+  }
+
+  /** 根据 travel_target 指向的模型锚点，计算 Stacker 行走机构应到达的模型内目标值。 */
+  private readStackerTravelTargetMotionValues(
+    frame: DataFrame,
+    state: DataDrivenTargetState,
+    currentValues: Map<string, number>
+  ): Map<string, number> {
+    const values = new Map<string, number>();
+    if (!state.isStacker) {
+      return values;
+    }
+
+    const targetCode = this.readString(frame, STACKER_TRAVEL_TARGET_FIELDS);
+    if (!targetCode) {
+      return values;
+    }
+
+    const travelGroup = state.motionGroups.find((group) => this.isStackerTravelRuntimeMotionGroup(group));
+    const targetRoot = this.findSceneMotionTargetRoot(targetCode, state.target.root);
+    if (!travelGroup || !targetRoot) {
+      return values;
+    }
+
+    const targetPosition = this.createSceneMotionTargetWorldPosition(
+      targetRoot,
+      this.readString(frame, STACKER_TARGET_ANCHOR_FIELDS)
+    );
+    const stackerAnchor = state.cargoHandling
+      ? this.getCargoAnchorWorldPosition(state, state.cargoHandling)
+      : state.target.root.getAbsolutePosition();
+    const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, travelGroup.axis);
+    const currentValue = currentValues.get(travelGroup.key) ?? state.motionValues.get(travelGroup.key) ?? 0;
+    const nextValue = this.createTargetMotionValueFromWorldProjection(currentValue, stackerAnchor, targetPosition, axisDirection);
+    if (nextValue !== undefined) {
+      values.set(travelGroup.key, nextValue);
+    }
+    return values;
+  }
+
+  /** 根据 fork_target 指向的货箱或定位框，计算货叉伸缩应到达的模型内目标值。 */
+  private readStackerForkTargetMotionValues(
+    frame: DataFrame,
+    state: DataDrivenTargetState,
+    currentValues: Map<string, number>
+  ): Map<string, number> {
+    const values = new Map<string, number>();
+    if (!state.isStacker) {
+      return values;
+    }
+
+    const targetCode = this.readString(frame, STACKER_FORK_TARGET_FIELDS);
+    if (!targetCode) {
+      return values;
+    }
+
+    const forkGroup = state.motionGroups.find((group) => this.isStackerForkRuntimeMotionGroup(group));
+    if (!forkGroup) {
+      return values;
+    }
+
+    if (this.isStackerHomeTargetCode(targetCode)) {
+      values.set(forkGroup.key, 0);
+      return values;
+    }
+
+    const targetRoot = this.findSceneMotionTargetRoot(targetCode, state.target.root);
+    if (!targetRoot || !state.cargoHandling) {
+      return values;
+    }
+
+    const targetPosition = this.createSceneMotionTargetWorldPosition(
+      targetRoot,
+      this.readString(frame, STACKER_FORK_ANCHOR_FIELDS)
+    );
+    const stackerAnchor = this.getCargoAnchorWorldPosition(state, state.cargoHandling);
+    const axisDirection = this.modelLocalAxisToWorldDirection(state.target.root, forkGroup.axis);
+    const currentValue = currentValues.get(forkGroup.key) ?? state.motionValues.get(forkGroup.key) ?? 0;
+    const nextValue = this.createTargetMotionValueFromWorldProjection(currentValue, stackerAnchor, targetPosition, axisDirection);
+    if (nextValue !== undefined) {
+      values.set(forkGroup.key, nextValue);
+    }
+    return values;
+  }
+
+  /** 判断 fork_target 是否表示回模型原位，避免缩叉继续依赖距离字段。 */
+  private isStackerHomeTargetCode(targetCode: string): boolean {
+    const normalizedCode = this.normalizeMatchValue(targetCode);
+    return STACKER_HOME_TARGET_VALUES.some((value) => this.normalizeMatchValue(value) === normalizedCode);
+  }
+
+  /** 通过资产编号、节点名或定位框编号查找可作为运动目标的场景节点。 */
+  private findSceneMotionTargetRoot(targetCode: string, carrierRoot: TransformNode): TransformNode | null {
+    const normalizedTargetCode = this.normalizeMatchValue(targetCode);
+    const runtimeCargoRoot = this.runtimeGeneratedCargoByCode.get(normalizedTargetCode);
+    if (runtimeCargoRoot?.isDisposed()) {
+      this.runtimeGeneratedCargoByCode.delete(normalizedTargetCode);
+    } else if (runtimeCargoRoot && runtimeCargoRoot.uniqueId !== carrierRoot.uniqueId) {
+      // 运行态货箱不会进入普通场景树缓存，Stacker 目标定位需要直接命中运行态索引。
+      return runtimeCargoRoot;
+    }
+
+    const sceneTarget = this.options.getTargets().find((target) => {
+      if (
+        target.root.uniqueId === carrierRoot.uniqueId ||
+        target.root.isDescendantOf?.(carrierRoot) ||
+        carrierRoot.isDescendantOf?.(target.root)
+      ) {
+        return false;
+      }
+      return this.getCargoMatchValues(target).some((value) => this.normalizeMatchValue(value) === normalizedTargetCode);
+    });
+    if (sceneTarget) {
+      return sceneTarget.root;
+    }
+
+    return this.findCargoDropTarget(targetCode)?.root ?? null;
+  }
+
+  /** 根据目标节点和锚点语义取世界坐标，链条机优先使用模型端点参数，其他模型沿用最长水平轴端点。 */
+  private createSceneMotionTargetWorldPosition(targetRoot: TransformNode, anchorValue: string | undefined): Vector3 {
+    const bounds = this.getNodeWorldBounds(targetRoot);
+    const position = bounds
+      ? bounds.minimum.add(bounds.maximum).scale(0.5)
+      : targetRoot.getAbsolutePosition();
+    const anchor = this.normalizeMatchValue(anchorValue ?? "center");
+    if (!["front", "rear", "start", "end"].includes(anchor)) {
+      return position;
+    }
+
+    const chainEndpointPosition = this.createChainConveyorEndpointWorldPosition(targetRoot, anchor, position);
+    if (chainEndpointPosition) {
+      return chainEndpointPosition;
+    }
+
+    const axisDirection = this.resolveTargetLongestHorizontalAxis(targetRoot);
+    const range = axisDirection ? this.createNodeProjectionRange(targetRoot, axisDirection) : null;
+    if (!axisDirection || !range) {
+      return position;
+    }
+
+    const targetProjection = anchor === "front" || anchor === "end" ? range.maximum : range.minimum;
+    const currentProjection = Vector3.Dot(position, axisDirection);
+    return position.add(axisDirection.scale(targetProjection - currentProjection));
+  }
+
+  /** 创建当前链条机货箱轨迹，front -> rear 是 movement_x=1 的业务方向。 */
+  private createChainConveyorCargoPath(state: DataDrivenTargetState, fallbackPosition = state.target.root.getAbsolutePosition()): ChainConveyorCargoPath | null {
+    const front = this.createChainConveyorEndpointWorldPosition(state.target.root, "front", fallbackPosition);
+    const rear = this.createChainConveyorEndpointWorldPosition(state.target.root, "rear", fallbackPosition);
+    if (!front || !rear) {
+      return null;
+    }
+
+    const delta = rear.subtract(front);
+    const length = delta.length();
+    if (!Number.isFinite(length) || length <= 1e-6) {
+      return null;
+    }
+
+    return {
+      front,
+      rear,
+      direction: delta.scale(1 / length),
+      length
+    };
+  }
+
+  /** 读取货箱中心在链条机轨迹上的进度，用于重绑已有货箱时不突然跳回前端。 */
+  private createChainConveyorCargoProgress(state: DataDrivenTargetState, cargoRoot: TransformNode): number | undefined {
+    const path = this.createChainConveyorCargoPath(state);
+    if (!path) {
+      return undefined;
+    }
+
+    return this.projectPositionToChainConveyorProgress(cargoRoot.getAbsolutePosition(), path);
+  }
+
+  /** 把世界坐标投影到链条机 front -> rear 线段，返回未夹紧的进度。 */
+  private projectPositionToChainConveyorProgress(position: Vector3, path: ChainConveyorCargoPath): number {
+    if (path.length <= 0) {
+      return 0;
+    }
+
+    const projectedDistance = Vector3.Dot(position.subtract(path.front), path.direction);
+    const progress = projectedDistance / path.length;
+    return Number.isFinite(progress) ? progress : 0;
+  }
+
+  /** 按链条机本地输送段比例生成前后端世界坐标，缺少基线时交给旧几何兜底。 */
+  private createChainConveyorEndpointWorldPosition(targetRoot: TransformNode, anchor: string, fallbackPosition: Vector3): Vector3 | null {
+    const baseline = this.readChainConveyorEndpointBaseline(targetRoot);
+    if (!baseline) {
+      return null;
+    }
+
+    const ratio = this.readChainConveyorEndpointRatio(targetRoot, anchor);
+    const chainLength = this.readChainConveyorCurrentLength(targetRoot, baseline);
+    const localPoint = new Vector3(
+      this.averageFiniteNumbers(baseline.minimum.x, baseline.maximum.x, 0),
+      this.averageFiniteNumbers(baseline.minimum.y, baseline.maximum.y, 0),
+      baseline.minimum.z + chainLength * ratio
+    );
+
+    targetRoot.computeWorldMatrix(true);
+    const worldPoint = Vector3.TransformCoordinates(localPoint, targetRoot.getWorldMatrix());
+    worldPoint.y = fallbackPosition.y;
+    return [worldPoint.x, worldPoint.y, worldPoint.z].every(Number.isFinite) ? worldPoint : null;
+  }
+
+  /** 读取链条机基线 metadata，只有明确存在 opaqueChainConveyorBaseline 时才启用端点参数。 */
+  private readChainConveyorEndpointBaseline(targetRoot: TransformNode): ChainConveyorEndpointBaseline | null {
+    const editorMetadata = this.readNodeEditorMetadata(targetRoot);
+    const runtimeMetadata = this.isRecord(editorMetadata.modelPackageRuntime) ? editorMetadata.modelPackageRuntime : {};
+    const baselineMetadata = this.isRecord(runtimeMetadata.opaqueChainConveyorBaseline)
+      ? runtimeMetadata.opaqueChainConveyorBaseline
+      : null;
+    if (!baselineMetadata) {
+      return null;
+    }
+
+    const minimum = this.readVector3Metadata(baselineMetadata.minimum);
+    const maximum = this.readVector3Metadata(baselineMetadata.maximum);
+    const size = this.readVector3Metadata(baselineMetadata.size) ?? (minimum && maximum ? maximum.subtract(minimum) : null);
+    if (!minimum || !maximum || !size || size.z <= 0) {
+      return null;
+    }
+    return { minimum, maximum, size };
+  }
+
+  /** 读取链条机端点比例，front/end 默认 1，rear/start 默认 0，非法值会夹紧到 0..1。 */
+  private readChainConveyorEndpointRatio(targetRoot: TransformNode, anchor: string): number {
+    const values = this.readModelPackageInstanceValues(targetRoot);
+    const fieldNames = anchor === "front" || anchor === "end"
+      ? CHAIN_CONVEYOR_FRONT_ENDPOINT_RATIO_FIELDS
+      : CHAIN_CONVEYOR_REAR_ENDPOINT_RATIO_FIELDS;
+    const fallback = anchor === "front" || anchor === "end" ? 1 : 0;
+    const value = this.readNumberParameterByFieldNames(values, fieldNames);
+    return this.clampNumber(value ?? fallback, 0, 1);
+  }
+
+  /** 读取链条机当前有效长度，缺少实例参数时回退到原始基线长度。 */
+  private readChainConveyorCurrentLength(targetRoot: TransformNode, baseline: ChainConveyorEndpointBaseline): number {
+    const values = this.readModelPackageInstanceValues(targetRoot);
+    const configuredLength = this.readNumberParameterByFieldNames(values, CHAIN_CONVEYOR_LENGTH_PARAMETER_FIELDS);
+    return configuredLength !== undefined && configuredLength > 0 ? configuredLength : baseline.size.z;
+  }
+
+  /** 读取模型包实例参数字典，兼容 metadata 缺失或旧场景未保存 values 的情况。 */
+  private readModelPackageInstanceValues(targetRoot: TransformNode): Record<string, unknown> {
+    const editorMetadata = this.readNodeEditorMetadata(targetRoot);
+    const instance = this.isRecord(editorMetadata.modelPackageInstance) ? editorMetadata.modelPackageInstance : {};
+    return this.isRecord(instance.values) ? instance.values : {};
+  }
+
+  /** 读取节点 editor metadata，避免直接访问链在旧场景中抛错。 */
+  private readNodeEditorMetadata(targetRoot: TransformNode): Record<string, unknown> {
+    const metadata = this.isRecord(targetRoot.metadata) ? targetRoot.metadata : {};
+    return this.isRecord(metadata.editor) ? metadata.editor : {};
+  }
+
+  /** 按字段名或字段别名读取数值参数，支持链条机旧键和中文标签兜底。 */
+  private readNumberParameterByFieldNames(values: Record<string, unknown>, fieldNames: string[]): number | undefined {
+    for (const fieldName of fieldNames) {
+      const value = this.readFiniteNumberParameter(values[fieldName]);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+
+    const compactFieldNames = new Set(fieldNames.map((fieldName) => this.compactProtocolFieldName(fieldName)));
+    for (const [key, value] of Object.entries(values)) {
+      if (!compactFieldNames.has(this.compactProtocolFieldName(key))) {
+        continue;
+      }
+      const numericValue = this.readFiniteNumberParameter(value);
+      if (numericValue !== undefined) {
+        return numericValue;
+      }
+    }
+    return undefined;
+  }
+
+  /** 读取有限数字参数，支持裸数字、字符串数字和历史包装结构。 */
+  private readFiniteNumberParameter(value: unknown): number | undefined {
+    const numericValue = this.parseFiniteNumber(this.unwrapParameterValue(value));
+    return Number.isFinite(numericValue) ? numericValue : undefined;
+  }
+
+  /** 读取序列化 Vector3 metadata，字段非法时返回 null 交给调用方兜底。 */
+  private readVector3Metadata(value: unknown): Vector3 | null {
+    if (!this.isRecord(value)) {
+      return null;
+    }
+    const x = this.parseFiniteNumber(value.x);
+    const y = this.parseFiniteNumber(value.y);
+    const z = this.parseFiniteNumber(value.z);
+    return [x, y, z].every(Number.isFinite) ? new Vector3(x, y, z) : null;
+  }
+
+  /** 计算两个有限数字的平均值，任一非法时使用兜底。 */
+  private averageFiniteNumbers(left: number, right: number, fallback: number): number {
+    return Number.isFinite(left) && Number.isFinite(right) ? (left + right) / 2 : fallback;
+  }
+
+  /** 将数值夹紧到指定区间，防止端点比例 NaN 或越界。 */
+  private clampNumber(value: number, minimum: number, maximum: number): number {
+    if (!Number.isFinite(value)) {
+      return minimum;
+    }
+    return Math.max(minimum, Math.min(maximum, value));
+  }
+
+  /** 选择目标模型自身最长的水平局部轴，用于推导输送线等设备的前后端。 */
+  private resolveTargetLongestHorizontalAxis(targetRoot: TransformNode): Vector3 | null {
+    const candidates = (["x", "z"] as ModelDataDrivenAxis[])
+      .map((axis) => this.normalizeHorizontalDirection(this.modelLocalAxisToWorldDirection(targetRoot, axis)))
+      .filter((axis): axis is Vector3 => Boolean(axis))
+      .map((axis) => ({ axis, range: this.createNodeProjectionRange(targetRoot, axis) }))
+      .filter((item): item is { axis: Vector3; range: CargoTransportAxisRange } => Boolean(item.range));
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    return candidates.sort((left, right) => (right.range.maximum - right.range.minimum) - (left.range.maximum - left.range.minimum))[0].axis;
+  }
+
+  /** 把当前锚点到目标锚点的世界投影差转换成运动组目标值。 */
+  private createTargetMotionValueFromWorldProjection(
+    currentValue: number,
+    currentPosition: Vector3,
+    targetPosition: Vector3,
+    axisDirection: Vector3
+  ): number | undefined {
+    if (axisDirection.lengthSquared() <= 1e-12) {
+      return undefined;
+    }
+
+    const delta = Vector3.Dot(targetPosition.subtract(currentPosition), axisDirection);
+    const nextValue = currentValue + delta;
+    return Number.isFinite(nextValue) ? nextValue : undefined;
   }
 
   /** 汇总 Stacker 绝对距离校准值；同帧校准值优先于对应 action 积分。 */
@@ -3742,7 +4796,12 @@ export class SceneDataDrivenRuntime {
 
   /** 汇总所有参与内部运动的节点并去重。 */
   private getMotionNodes(groups: RuntimeMotionGroup[]): TransformNode[] {
-    return this.dedupeTransformNodes(groups.filter((group) => group.target === "nodes").flatMap((group) => group.nodes));
+    return this.dedupeTransformNodes(groups.filter((group) => this.shouldApplyMotionGroupToNodes(group)).flatMap((group) => group.nodes));
+  }
+
+  /** 判断运动组是否应该真实写入模型节点变换。 */
+  private shouldApplyMotionGroupToNodes(group: RuntimeMotionGroup): boolean {
+    return group.target === "nodes" && group.nodeTransformDisabled !== true;
   }
 
   /** 判断目标是否按模型内部部件驱动，避免普通模型包含 fork/platform 名称时误套 Stacker 逻辑。 */

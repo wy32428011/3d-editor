@@ -36,7 +36,7 @@
           "key": "description",
           "label": "参数说明",
           "type": "string",
-          "defaultValue": "支持链条机长、宽、位置和前后支架显示隐藏参数化。",
+          "defaultValue": "支持链条机长、宽、位置、前后端点和前后支架显示隐藏参数化。",
           "configuration": {
             "type": "string"
           }
@@ -75,6 +75,32 @@
             "min": -100,
             "max": 100,
             "step": 0.1
+          }
+        },
+        {
+          "key": "chainFrontEndpointRatio",
+          "label": "前端位置比例",
+          "type": "number",
+          "defaultValue": 1,
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 1,
+            "step": 0.01,
+            "unit": "ratio"
+          }
+        },
+        {
+          "key": "chainRearEndpointRatio",
+          "label": "后端位置比例",
+          "type": "number",
+          "defaultValue": 0,
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 1,
+            "step": 0.01,
+            "unit": "ratio"
           }
         },
         {
@@ -123,7 +149,7 @@
         },
         "description": {
           "type": "string",
-          "value": "支持链条机长、宽、位置和前后支架显示隐藏参数化。",
+          "value": "支持链条机长、宽、位置、前后端点和前后支架显示隐藏参数化。",
           "label": "参数说明",
           "configuration": {
             "type": "string"
@@ -160,6 +186,30 @@
             "min": -100,
             "max": 100,
             "step": 0.1
+          }
+        },
+        "chainFrontEndpointRatio": {
+          "type": "number",
+          "value": 1,
+          "label": "前端位置比例",
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 1,
+            "step": 0.01,
+            "unit": "ratio"
+          }
+        },
+        "chainRearEndpointRatio": {
+          "type": "number",
+          "value": 0,
+          "label": "后端位置比例",
+          "configuration": {
+            "type": "number",
+            "min": 0,
+            "max": 1,
+            "step": 0.01,
+            "unit": "ratio"
           }
         },
         "showFrontSupport": {

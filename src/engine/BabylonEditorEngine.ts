@@ -593,7 +593,7 @@ interface PreviewCameraSnapshot {
   upperRadiusLimit: number | null;
 }
 
-type EditorCameraPointerAction = "orbit" | "pan" | "dolly" | "look";
+type EditorCameraPointerAction = "orbit" | "pan" | "dolly";
 
 interface EditorCameraPointerState {
   pointerId: number;
@@ -604,12 +604,15 @@ interface EditorCameraPointerState {
   lastY: number;
   moved: boolean;
   navigationStarted: boolean;
+  delayedStart: boolean;
 }
 
 interface EditorCameraPointerNavigationOptions {
   onNavigationStart?: (action: EditorCameraPointerAction) => void;
   onNavigationEnd?: (action: EditorCameraPointerAction, moved: boolean) => void;
   getLockedBeta?: () => number | null;
+  isTransformGizmoDragging?: () => boolean;
+  shouldIgnorePointerDown?: (event: PointerEvent) => boolean;
 }
 
 /** 根据 ArcRotateCamera 当前配置计算一次沿视线方向移动的距离。 */
@@ -627,7 +630,7 @@ function moveEditorCameraAlongView(camera: ArcRotateCamera, distance: number): v
   translateEditorCamera(camera, worldDelta);
 }
 
-/** 关闭 ArcRotateCamera 的惯性偏移，让自定义鼠标输入保持 Unity 式即时响应。 */
+/** 关闭 ArcRotateCamera 的惯性偏移，让自定义鼠标输入保持即时响应。 */
 function clearEditorCameraInertia(camera: ArcRotateCamera): void {
   camera.inertialAlphaOffset = 0;
   camera.inertialBetaOffset = 0;
@@ -649,7 +652,7 @@ function translateEditorCamera(camera: ArcRotateCamera, worldDelta: Vector3): vo
   camera.radius = radius;
 }
 
-/** 关闭 Babylon 9 ArcRotateCameraMovement 的默认输入映射，避免绕过自定义 Unity 鼠标输入。 */
+/** 关闭 Babylon 9 ArcRotateCameraMovement 的默认输入映射，避免绕过自定义鼠标输入。 */
 function disableEditorCameraDefaultMovementInputs(camera: ArcRotateCamera): void {
   camera.movement.input.inputMap = [];
 }
@@ -742,13 +745,12 @@ class EditorCameraWheelDollyInput implements ICameraInput<ArcRotateCamera> {
   }
 }
 
-/** Unity Scene View 风格鼠标输入：Alt+左键环绕、中键平移、Alt+右键缩放、右键观察。 */
-class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
+/** Orbit 查看器风格鼠标输入：左键环绕、右键/中键平移、Alt+右键缩放。 */
+class EditorCameraOrbitPointerInput implements ICameraInput<ArcRotateCamera> {
   public camera!: ArcRotateCamera;
   public angularSensibilityX = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
   public angularSensibilityY = DEFAULT_CAMERA_ROTATION_SENSIBILITY;
   public panningSensibility = DEFAULT_CAMERA_PANNING_SENSIBILITY;
-  private noPreventDefault = false;
   private attached = false;
   private activePointer: EditorCameraPointerState | null = null;
   private readonly pointerEventOptions: AddEventListenerOptions = { capture: true };
@@ -765,7 +767,7 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
 
   /** 返回 Babylon 输入类名，便于调试输入管理器状态。 */
   public getClassName(): string {
-    return "EditorCameraUnityPointerInput";
+    return "EditorCameraOrbitPointerInput";
   }
 
   /** 复用 pointers 简名，让 ArcRotateCamera 的兼容灵敏度 setter 继续作用到本输入。 */
@@ -774,8 +776,7 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
   }
 
   /** 监听指针事件，并通过 pointer capture 保证拖出画布后仍能收到释放事件。 */
-  public attachControl(noPreventDefault?: boolean): void {
-    this.noPreventDefault = Boolean(noPreventDefault);
+  public attachControl(): void {
     if (this.attached) {
       return;
     }
@@ -808,13 +809,18 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     return;
   }
 
-  /** 根据 Unity Scene View 鼠标语义开始一次导航操作。 */
+  /** 根据查看器鼠标语义开始一次导航操作。 */
   private handlePointerDown(event: PointerEvent): void {
     const action = this.resolveAction(event);
     if (!action) {
       return;
     }
 
+    if (this.options.shouldIgnorePointerDown?.(event)) {
+      return;
+    }
+
+    const delayedStart = this.shouldDelayNavigationStart(event);
     this.endActiveNavigation();
     this.activePointer = {
       pointerId: event.pointerId,
@@ -824,19 +830,25 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
       lastX: event.clientX,
       lastY: event.clientY,
       moved: false,
-      navigationStarted: action !== "look"
+      navigationStarted: !delayedStart,
+      delayedStart
     };
     this.trySetPointerCapture(event.pointerId);
     if (this.activePointer.navigationStarted) {
       this.options.onNavigationStart?.(action);
     }
-    this.preventDefaultForNavigationStart(event, action);
+    this.preventDefaultForNavigationStart(event, delayedStart);
   }
 
-  /** 把指针位移转换为环绕、平移、缩放或右键观察。 */
+  /** 把指针位移转换为环绕、平移或缩放。 */
   private handlePointerMove(event: PointerEvent): void {
     const pointer = this.activePointer;
     if (!pointer || event.pointerId !== pointer.pointerId) {
+      return;
+    }
+
+    if (!pointer.navigationStarted && this.options.isTransformGizmoDragging?.()) {
+      this.endActiveNavigation();
       return;
     }
 
@@ -846,7 +858,7 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
       this.ensureNavigationStarted(pointer);
     }
 
-    if (pointer.action === "look" && !pointer.moved) {
+    if (pointer.delayedStart && !pointer.moved) {
       return;
     }
 
@@ -863,13 +875,11 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
       this.orbitAroundTarget(deltaX, deltaY, speedMultiplier);
     } else if (pointer.action === "pan") {
       this.panCamera(deltaX, deltaY, speedMultiplier);
-    } else if (pointer.action === "dolly") {
-      this.dollyCamera(deltaY, speedMultiplier);
     } else {
-      this.lookAroundFromCurrentPosition(deltaX, deltaY, speedMultiplier);
+      this.dollyCamera(deltaY, speedMultiplier);
     }
 
-    this.preventDefaultForActiveNavigation(event, pointer.action);
+    this.preventDefaultForActiveNavigation(event, pointer);
   }
 
   /** 指针释放后清理导航状态。 */
@@ -879,14 +889,17 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
       return;
     }
 
+    const shouldSuppressPointerUp = pointer.navigationStarted;
     this.releasePointerCapture(event.pointerId);
     this.endActiveNavigation();
-    this.preventDefaultForActiveNavigation(event, pointer.action);
+    if (shouldSuppressPointerUp) {
+      this.preventDefaultForActiveNavigation(event, pointer);
+    }
   }
 
-  /** 按鼠标键和 Alt 修饰键解析 Unity Scene View 的导航动作。 */
+  /** 按鼠标键和 Alt 修饰键解析查看器导航动作。 */
   private resolveAction(event: PointerEvent): EditorCameraPointerAction | null {
-    if (event.button === LEFT_MOUSE_BUTTON && event.altKey) {
+    if (event.button === LEFT_MOUSE_BUTTON) {
       return "orbit";
     }
 
@@ -899,18 +912,18 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     }
 
     if (event.button === RIGHT_MOUSE_BUTTON) {
-      return "look";
+      return "pan";
     }
 
     return null;
   }
 
-  /** Alt+左键围绕当前 target 环绕，裸左键保留给选择和 Gizmo。 */
+  /** 左键拖拽围绕当前 target 环绕，单击仍保留给选择。 */
   private orbitAroundTarget(deltaX: number, deltaY: number, speedMultiplier: number): void {
     this.rotateCameraAngles(deltaX, deltaY, speedMultiplier);
   }
 
-  /** 中键拖拽沿屏幕平面平移视口，比例随当前观察半径缩放。 */
+  /** 右键或中键拖拽沿屏幕平面平移视口，比例随当前观察半径缩放。 */
   private panCamera(deltaX: number, deltaY: number, speedMultiplier: number): void {
     const scale = this.getPanDistancePerPixel() * speedMultiplier;
     if (scale === 0) {
@@ -931,15 +944,6 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     }
   }
 
-  /** 右键拖拽以相机当前位置为轴观察四周，保留右键单击菜单。 */
-  private lookAroundFromCurrentPosition(deltaX: number, deltaY: number, speedMultiplier: number): void {
-    const cameraPosition = this.camera.position.clone();
-    this.rotateCameraAngles(deltaX, deltaY, speedMultiplier);
-    const orbitOffset = this.getOrbitOffsetFromAngles();
-    const nextTarget = cameraPosition.subtract(orbitOffset);
-    this.camera.setTarget(nextTarget, false, true, false);
-  }
-
   /** 按相机旋转灵敏度更新 alpha/beta，并夹紧 beta 避免翻转。 */
   private rotateCameraAngles(deltaX: number, deltaY: number, speedMultiplier: number): void {
     clearEditorCameraInertia(this.camera);
@@ -951,7 +955,7 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
       lockedBeta ?? Math.min(CAMERA_MAX_BETA, Math.max(CAMERA_MIN_BETA, this.camera.beta + (-deltaY * speedMultiplier) / sensitivityY));
   }
 
-  /** Unity Scene View 中按住 Shift 会加快鼠标导航速度。 */
+  /** 按住 Shift 会加快鼠标导航速度。 */
   private getPointerSpeedMultiplier(event: PointerEvent): number {
     return event.shiftKey ? CAMERA_NAVIGATION_SHIFT_MULTIPLIER : 1;
   }
@@ -985,16 +989,6 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     }
 
     translateEditorCamera(this.camera, worldDelta);
-  }
-
-  /** 使用 Babylon ArcRotateCamera 的默认球坐标公式得到当前位置相对 target 的偏移。 */
-  private getOrbitOffsetFromAngles(): Vector3 {
-    const radius = Number.isFinite(this.camera.radius) ? Math.max(0.0001, Math.abs(this.camera.radius)) : DEFAULT_CAMERA_RADIUS_METERS;
-    const cosAlpha = Math.cos(this.camera.alpha);
-    const sinAlpha = Math.sin(this.camera.alpha);
-    const cosBeta = Math.cos(this.camera.beta);
-    const sinBeta = Math.sin(this.camera.beta) || 0.0001;
-    return new Vector3(radius * cosAlpha * sinBeta, radius * cosBeta, radius * sinAlpha * sinBeta);
   }
 
   /** 在浏览器允许时捕获指针，减少拖出 canvas 导致状态丢失的概率。 */
@@ -1031,7 +1025,7 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     }
   }
 
-  /** 右键观察超过拖拽阈值后才真正进入相机导航，避免普通右键轻微抖动误杀菜单。 */
+  /** 左键环绕和右键平移超过拖拽阈值后才进入导航，避免单击选择或菜单被误杀。 */
   private ensureNavigationStarted(pointer: EditorCameraPointerState): void {
     if (pointer.navigationStarted) {
       return;
@@ -1041,33 +1035,31 @@ class EditorCameraUnityPointerInput implements ICameraInput<ArcRotateCamera> {
     this.options.onNavigationStart?.(pointer.action);
   }
 
-  /** 按 Babylon attachControl 的 noPreventDefault 约定阻止浏览器默认拖拽行为。 */
-  private preventDefault(event: PointerEvent): void {
-    if (!this.noPreventDefault) {
+  /** 延迟启动的导航先放行单击语义，立即启动的导航则屏蔽浏览器默认行为。 */
+  private preventDefaultForNavigationStart(event: PointerEvent, delayedStart: boolean): void {
+    if (delayedStart) {
+      return;
+    }
+
+    this.suppressNavigationEvent(event);
+  }
+
+  /** 相机拖拽已经接管鼠标时，阻止后续 Babylon 指针处理抢占。 */
+  private preventDefaultForActiveNavigation(event: PointerEvent, pointer: EditorCameraPointerState): void {
+    if (pointer.action === "pan" && pointer.delayedStart) {
       event.preventDefault();
-    }
-  }
-
-  /** 中键和 Alt 导航没有编辑菜单语义，需要强制屏蔽浏览器自动滚动和系统菜单。 */
-  private preventDefaultForNavigationStart(event: PointerEvent, action: EditorCameraPointerAction): void {
-    if (action === "look") {
       return;
     }
 
     this.suppressNavigationEvent(event);
   }
 
-  /** Alt 和中键导航优先级高于 Gizmo，需要阻止后续 Babylon 指针处理抢占。 */
-  private preventDefaultForActiveNavigation(event: PointerEvent, action: EditorCameraPointerAction): void {
-    if (action === "look") {
-      this.preventDefault(event);
-      return;
-    }
-
-    this.suppressNavigationEvent(event);
+  /** 左键单击和右键单击需要保留原本编辑语义，只有拖拽超过阈值后才接管。 */
+  private shouldDelayNavigationStart(event: PointerEvent): boolean {
+    return event.button === LEFT_MOUSE_BUTTON || (event.button === RIGHT_MOUSE_BUTTON && !event.altKey);
   }
 
-  /** 拦截当前 DOM 事件，确保 Unity 导航不会同时触发 Babylon 默认 movement 或 Gizmo 拖拽。 */
+  /** 拦截当前 DOM 事件，确保相机导航不会同时触发 Babylon 默认 movement 或 Gizmo 拖拽。 */
   private suppressNavigationEvent(event: PointerEvent): void {
     event.preventDefault();
     event.stopPropagation();
@@ -5557,7 +5549,7 @@ export class BabylonEditorEngine {
     );
   }
 
-  /** 创建编辑器视口相机，提供类似 Unity Scene View 的轨道操作体验。 */
+  /** 创建编辑器视口相机，提供类似 Web 3D 查看器的轨道操作体验。 */
   private createEditorCamera(): ArcRotateCamera {
     const camera = new ArcRotateCamera(
       "Editor Camera",
@@ -5582,22 +5574,24 @@ export class BabylonEditorEngine {
     camera.maxZ = DEFAULT_CAMERA_FAR_CLIP_METERS;
     camera.fov = 0.92;
     camera.useInputToRestoreState = false;
-    // 编辑器只保留显式实现的 Unity 风格导航，避免 Babylon 默认键盘输入产生隐藏相机行为。
+    // 编辑器只保留显式实现的查看器风格导航，避免 Babylon 默认键盘输入产生隐藏相机行为。
     camera.inputs.removeByType("ArcRotateCameraKeyboardMoveInput");
     camera.inputs.removeByType("ArcRotateCameraPointersInput");
     camera.inputs.removeByType("ArcRotateCameraMouseWheelInput");
     camera.inputs.add(
-      new EditorCameraUnityPointerInput(this.canvas, {
+      new EditorCameraOrbitPointerInput(this.canvas, {
         onNavigationStart: () => {
           this.cameraNavigationActive = true;
         },
         onNavigationEnd: (action, moved) => {
           this.cameraNavigationActive = false;
-          if (moved || action !== "look") {
+          if (moved || action !== "orbit") {
             this.lastCameraNavigationEndTime = performance.now();
           }
         },
-        getLockedBeta: () => this.getLockedCameraBeta()
+        getLockedBeta: () => this.getLockedCameraBeta(),
+        isTransformGizmoDragging: () => this.transformGizmoDragging || this.gizmoManager.isDragging,
+        shouldIgnorePointerDown: (event) => this.shouldGizmoHandlePointerDown(event)
       })
     );
     camera.inputs.add(new EditorCameraWheelDollyInput(this.canvas));
@@ -5606,6 +5600,25 @@ export class BabylonEditorEngine {
     camera.attachControl(this.canvas, true);
     disableEditorCameraDefaultMovementInputs(camera);
     return camera;
+  }
+
+  /** 左键命中 Gizmo 时让变换轴优先处理，避免左键环绕抢占对象变换。 */
+  private shouldGizmoHandlePointerDown(event: PointerEvent): boolean {
+    if (event.button !== LEFT_MOUSE_BUTTON || this.previewMode) {
+      return false;
+    }
+
+    if (this.transformGizmoDragging || this.gizmoManager.isDragging || this.gizmoManager.isHovered) {
+      return true;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const pickInfo = this.gizmoManager.utilityLayer.utilityLayerScene.pick(
+      event.clientX - rect.left,
+      event.clientY - rect.top,
+      (mesh) => mesh.isPickable !== false
+    );
+    return Boolean(pickInfo?.hit && pickInfo.pickedMesh);
   }
 
   /** 按相机观察半径同步右键平移速度，避免大模型取景后拖动画面几乎不动。 */
@@ -5677,7 +5690,7 @@ export class BabylonEditorEngine {
     this.transformGizmoDragging = false;
   }
 
-  /** 绑定编辑相机输入后立刻关闭 Babylon 默认 movement 映射，保证只有自定义 Unity 输入生效。 */
+  /** 绑定编辑相机输入后立刻关闭 Babylon 默认 movement 映射，保证只有自定义输入生效。 */
   private attachEditorCameraControl(): void {
     this.applyCameraPitchLock();
     this.editorCamera.attachControl(this.canvas, true);
@@ -7532,7 +7545,7 @@ export class BabylonEditorEngine {
     });
   }
 
-  /** 相机导航刚结束时 Babylon 可能补发 pick，短暂跳过可避免 Alt+左键环绕误选。 */
+  /** 相机导航刚结束时 Babylon 可能补发 pick，短暂跳过可避免左键环绕误选。 */
   private shouldSkipPointerSelectionAfterCameraNavigation(): boolean {
     return this.cameraNavigationActive || (this.lastCameraNavigationEndTime > 0 && performance.now() - this.lastCameraNavigationEndTime < 120);
   }

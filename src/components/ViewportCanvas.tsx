@@ -141,7 +141,7 @@ export function ViewportCanvas({
     }
   };
 
-  /** 记录右键按下位置，用于区分菜单点击和右键拖动画面。 */
+  /** 记录右键按下位置，用于区分菜单点击和右键拖拽平移视角。 */
   const handlePointerDown = (event: PointerLike) => {
     if (event.button !== RIGHT_BUTTON) {
       return;
@@ -158,7 +158,7 @@ export function ViewportCanvas({
     onModelContextMenu(null, { x: event.clientX, y: event.clientY });
   };
 
-  /** 超过阈值的右键移动视为相机导航，不再弹出模型菜单。 */
+  /** 超过阈值的右键移动视为相机平移，不再弹出模型菜单。 */
   const handlePointerMove = (event: PointerLike) => {
     const pointer = rightPointerRef.current;
     if (!pointer) {
@@ -223,7 +223,7 @@ export function ViewportCanvas({
     };
   }, [onModelContextMenu]);
 
-  /** 右键菜单只在编辑态、未拖拽、非 Alt+右键缩放且命中可编辑场景对象时打开。 */
+  /** 右键菜单只在编辑态、未拖拽、非相机导航且命中可编辑场景对象时打开。 */
   const handleContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
     clearRightPointerCleanupTimer();

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>链条机后端停止视觉验证</title>
+    <style>
+      html,
+      body,
+      #renderCanvas {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #101417;
+      }
+
+      .label {
+        position: fixed;
+        left: 18px;
+        top: 16px;
+        max-width: 560px;
+        color: #d8edf2;
+        font: 14px/1.45 system-ui, sans-serif;
+        background: rgba(8, 12, 14, 0.78);
+        padding: 10px 12px;
+        border: 1px solid rgba(116, 232, 255, 0.24);
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="renderCanvas"></canvas>
+    <div class="label">1004：movement_x=1 持续保活后，货箱一直走到后端；红框为图 2 标注后端，货箱前边缘与后端对齐。</div>
+    <script type="module" src="./chain-conveyor-rear-stop-preview.js"></script>
+  </body>
+</html>
