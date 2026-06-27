@@ -14,6 +14,8 @@
     "demo:stacker-ddj2-plc:dry-run": "node scripts/stacker-ddj2-plc-message.mjs --dry-run",
     "demo:stacker-scene": "node scripts/stacker-scene-mqtt-sequence.mjs",
     "demo:stacker-scene:dry-run": "node scripts/stacker-scene-mqtt-sequence.mjs --dry-run",
+    "demo:logistics-transformer": "node scripts/logistics-mqtt-transformer.mjs",
+    "demo:logistics-transformer:dry-run": "node scripts/logistics-mqtt-transformer.mjs --dry-run",
     "pack": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win nsis"

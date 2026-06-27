@@ -70,6 +70,34 @@ const STACKER_TARGET_ANCHOR_FIELDS = ["target_anchor", "targetAnchor", "travel_a
 const STACKER_FORK_TARGET_FIELDS = ["fork_target", "forkTarget", "forkTargetAsset", "fork_target_asset"];
 const STACKER_FORK_ANCHOR_FIELDS = ["fork_anchor", "forkAnchor"];
 const STACKER_HOME_TARGET_VALUES = ["home", "origin", "zero", "retract", "retracted", "缩回", "原位", "零位"];
+const STACKER_DDJ2_STATUS_FIELDS = [
+  "front_command",
+  "back_command",
+  "front_x",
+  "front_y",
+  "front_z",
+  "front_task",
+  "back_task",
+  "front_containerCode",
+  "back_containerCode",
+  "signalBits",
+  "front_signalBits",
+  "back_signalBits",
+  "rpm_x",
+  "rpm_y",
+  "front_rpm_z",
+  "back_rpm_z",
+  "workingHours_x",
+  "workingHours_y",
+  "front_workingHours_z",
+  "back_workingHours_z",
+  "normal",
+  "errorCode",
+  "message",
+  "to_x",
+  "to_y",
+  "to_z"
+];
 const CHAIN_CONVEYOR_LENGTH_PARAMETER_FIELDS = ["chainLength", "chain_length", "length", "链条机长度"];
 const CHAIN_CONVEYOR_FRONT_ENDPOINT_RATIO_FIELDS = [
   "chainFrontEndpointRatio",
@@ -96,6 +124,7 @@ const TRANSPORT_CONTAINER_CODE_FIELDS = [
   "containerId"
 ];
 const TRANSPORT_TASK_CODE_FIELDS = ["task", "taskNo", "task_no", "taskId", "task_id"];
+const TRANSPORT_CONTAINER_QUANTITY_FIELDS = ["container_quantity", "containerQuantity", "container.count", "containerCount"];
 const TRANSPORT_FRONT_CARGO_FIELDS = [
   "front_has_cargo",
   "frontHasCargo",
@@ -107,6 +136,7 @@ const TRANSPORT_FRONT_CARGO_FIELDS = [
   "frontPhotoelectric",
   "前端有货"
 ];
+const SIGNAL_BITS_FRONT_CARGO_VALUE = 0;
 const CARGO_PICKUP_VALUES = ["pickup", "pick", "attach", "load", "carry", "take", "取货", "吸附", "装载"];
 const CARGO_DROP_VALUES = ["drop", "detach", "unload", "release", "put", "放货", "释放", "卸载"];
 const DEFAULT_CARGO_PICKUP_MIN_FORK_EXTENSION = 0.45;
@@ -150,6 +180,7 @@ const DEFAULT_STACKER_FORK_ACTION_SPEED = 0.25;
 const DEFAULT_STACKER_FORK_EXTENSION_LIMIT = 0.941;
 const STACKER_FORK_LENGTH_PARAMETER_NAMES = ["forkLength", "fork_length", "货叉长度", "货叉总长度"];
 const STACKER_FORK_FALLBACK_PATTERN_TEXT = "fork|叉|huocha|cha";
+const MOTION_ALIAS_SOURCES_FIELD = "__dataDrivenMotionAliasSources";
 
 type StackerMotionGroupKey = "travel" | "lift" | "fork" | "forkSide";
 
@@ -971,19 +1002,20 @@ export class SceneDataDrivenRuntime {
     }
 
     const state = this.ensureTargetState(target, now);
+    const scopedFrame = this.createTargetScopedFrame(frame, state);
     const configuredDuration = state.target.rootMotionFields?.interpolationMs ?? state.target.dataDriven?.device?.interpolationMs;
     const fallbackDuration = Math.max(0, Number(configuredDuration ?? config.interpolationMs) || 0);
-    const nextMotionValues = this.readMotionGroupValues(frame, state.motionGroups);
-    const nextActionDirections = this.readMotionGroupActionDirections(frame, state.motionGroups);
+    const nextMotionValues = this.readMotionGroupValues(scopedFrame, state.motionGroups);
+    const nextActionDirections = this.readMotionGroupActionDirections(scopedFrame, state.motionGroups);
     this.applyInterpolatedState(state, now);
     this.applyActionState(state, now, false);
     const currentMotionValues = this.createCurrentMotionValues(state, now);
-    const nextTargetMotionValues = this.readStackerTargetMotionValues(frame, state, currentMotionValues);
-    const nextDistanceMotionValues = this.readStackerDistanceMotionValues(frame, state);
+    const nextTargetMotionValues = this.readStackerTargetMotionValues(scopedFrame, state, currentMotionValues);
+    const nextDistanceMotionValues = this.readStackerDistanceMotionValues(scopedFrame, state);
     this.mergeMotionValues(nextMotionValues, nextDistanceMotionValues);
     // 目标定位由模型锚点实时计算，同帧出现历史距离字段时以模型目标为准。
     this.mergeMotionValues(nextMotionValues, nextTargetMotionValues);
-    this.mergeMotionValues(nextActionDirections, this.readStackerForkActionDirections(frame, state, currentMotionValues));
+    this.mergeMotionValues(nextActionDirections, this.readStackerForkActionDirections(scopedFrame, state, currentMotionValues));
     this.stopDistanceCalibratedActions(nextActionDirections, nextTargetMotionValues);
     this.stopDistanceCalibratedActions(nextActionDirections, nextDistanceMotionValues);
     const speedDuration = this.createSpeedDrivenMotionDuration(currentMotionValues, nextMotionValues, state.motionGroups);
@@ -991,10 +1023,10 @@ export class SceneDataDrivenRuntime {
     state.motionStartedAt = now;
     state.motionDurationMs = duration;
     state.rootStartPosition = state.target.root.position.clone();
-    state.rootTargetPosition = this.createRootTargetPosition(state, frame);
+    state.rootTargetPosition = this.createRootTargetPosition(state, scopedFrame);
     if (state.rootBaseRotationY !== undefined && !state.target.root.rotationQuaternion) {
       state.rootStartRotationY = state.target.root.rotation.y;
-      state.rootTargetRotationY = this.createRootTargetRotationY(state, frame);
+      state.rootTargetRotationY = this.createRootTargetRotationY(state, scopedFrame);
     }
     state.motionStartValues = currentMotionValues;
     if (nextMotionValues.size > 0) {
@@ -1012,11 +1044,22 @@ export class SceneDataDrivenRuntime {
     if (duration === 0) {
       this.applyInterpolatedState(state, now + 1);
     }
-    const changedCargoRoots = this.applyCargoActionFrame(state, frame, now);
-    this.applyCargoTransportFrame(state, frame, now);
+    const changedCargoRoots = this.applyCargoActionFrame(state, scopedFrame, now);
+    this.applyCargoTransportFrame(state, scopedFrame, now);
     if (changedCargoRoots.length > 0) {
       this.options.onTargetsChanged(changedCargoRoots, now);
     }
+  }
+
+  /** 按目标设备语义修正通用协议别名，避免链条机业务 action 被误当输送动作。 */
+  private createTargetScopedFrame(frame: DataFrame, state: DataDrivenTargetState): DataFrame {
+    if (!this.isChainConveyorTarget(state.target) || !this.isMotionAliasFrom(frame, "movement_x", "action")) {
+      return frame;
+    }
+
+    const scopedFrame: DataFrame = { ...frame };
+    delete scopedFrame.movement_x;
+    return scopedFrame;
   }
 
   /** 根据数据帧创建整机根节点目标位置，文档坐标的 X/Y/H 对应 Babylon 的 X/Z/Y。 */
@@ -1429,21 +1472,56 @@ export class SceneDataDrivenRuntime {
     return this.isBoundedRollerConveyorTarget(target) || this.isChainConveyorTarget(target);
   }
 
-  /** 读取输送线前端光电位；优先使用显式字段，新协议 signalBits bit0 和旧 PLC move bit0 都可触发。 */
+  /** 读取输送线前端光电位；新协议 signalBits 使用整数枚举，旧 PLC move 来货信号继续兼容。 */
   private isTransportFrontCargoPresent(frame: DataFrame): boolean | undefined {
-    return this.readBoolean(frame, TRANSPORT_FRONT_CARGO_FIELDS) ?? this.readBitFlag(frame, "signalBits", 0) ?? this.readBitFlag(frame, "move", 0);
+    return (
+      this.readBoolean(frame, TRANSPORT_FRONT_CARGO_FIELDS) ??
+      this.readSignalBitsFrontCargoState(frame) ??
+      this.readBitFlag(frame, "move", 0)
+    );
   }
 
-  /** 从 Byte 位域字段中读取指定 bit，字段缺失或非法时返回 undefined。 */
+  /** 按现场文档读取 signalBits 整数状态，0 表示前端有货；数量明确为 0 时按无货处理。 */
+  private readSignalBitsFrontCargoState(frame: DataFrame): boolean | undefined {
+    const signalState = this.readProtocolInteger(frame, "signalBits");
+    if (signalState === undefined) {
+      return undefined;
+    }
+
+    const containerQuantity = this.readNumber(frame, TRANSPORT_CONTAINER_QUANTITY_FIELDS);
+    if (containerQuantity !== undefined && containerQuantity <= 0) {
+      return false;
+    }
+
+    return signalState === SIGNAL_BITS_FRONT_CARGO_VALUE;
+  }
+
+  /** 从 PLC 位域字段中读取指定 bit，字段缺失或非法时返回 undefined。 */
   private readBitFlag(frame: DataFrame, fieldName: string, bitIndex: number): boolean | undefined {
-    const normalizedFieldName = this.normalizeProtocolFieldName(fieldName);
-    const fieldValue = Object.entries(frame).find(([key]) => this.normalizeProtocolFieldName(key) === normalizedFieldName)?.[1];
+    const fieldValue = this.readProtocolFieldValue(frame, fieldName);
     const bitfield = this.readBitfieldNumber(fieldValue);
     if (bitfield === undefined || bitIndex < 0) {
       return undefined;
     }
 
     return (bitfield & (1 << bitIndex)) !== 0;
+  }
+
+  /** 按协议字段名读取整数枚举值，字段缺失或非整数时返回 undefined。 */
+  private readProtocolInteger(frame: DataFrame, fieldName: string): number | undefined {
+    const fieldValue = this.readProtocolFieldValue(frame, fieldName);
+    const numberValue = this.parseFiniteNumber(fieldValue);
+    if (!Number.isInteger(numberValue)) {
+      return undefined;
+    }
+
+    return numberValue;
+  }
+
+  /** 按规范化后的协议字段名读取原始值，兼容 signalBits/signal_bits 这类写法。 */
+  private readProtocolFieldValue(frame: DataFrame, fieldName: string): unknown {
+    const normalizedFieldName = this.normalizeProtocolFieldName(fieldName);
+    return Object.entries(frame).find(([key]) => this.normalizeProtocolFieldName(key) === normalizedFieldName)?.[1];
   }
 
   /** 为输送线运行态货箱生成稳定编号，优先使用托盘号，其次使用任务号。 */
@@ -2637,6 +2715,7 @@ export class SceneDataDrivenRuntime {
           frame.ts = record.ts;
         }
         frame[pointName] = record.v;
+        this.clearMotionAliasSource(frame, pointName);
         this.applyDocumentPointAlias(frame, pointName, record.v);
         applyLogisticsMqttFrameDefaults(frame, metadata);
         groupedFrames.set(frameKey, frame);
@@ -2668,16 +2747,21 @@ export class SceneDataDrivenRuntime {
 
   /** 将规范点位、现场 PLC 点位映射到运行时可消费的标准字段。 */
   private applyDocumentPointAlias(frame: Record<string, unknown>, pointName: string, pointValue: unknown): void {
-    this.applyDocumentFieldAlias(frame, pointName, pointValue);
+    this.applyDocumentFieldAlias(frame, pointName, pointValue, "point");
   }
 
   /** 扫描整帧字段，兼容已经是对象形态的现场 PLC 报文。 */
   private applyDocumentFrameAliases(frame: Record<string, unknown>): void {
-    Object.entries(frame).forEach(([fieldName, fieldValue]) => this.applyDocumentFieldAlias(frame, fieldName, fieldValue));
+    Object.entries(frame).forEach(([fieldName, fieldValue]) => this.applyDocumentFieldAlias(frame, fieldName, fieldValue, "frame"));
   }
 
   /** 将单个点位别名写入标准字段，原始点位仍保留给业务层展示。 */
-  private applyDocumentFieldAlias(frame: Record<string, unknown>, pointName: string, pointValue: unknown): void {
+  private applyDocumentFieldAlias(
+    frame: Record<string, unknown>,
+    pointName: string,
+    pointValue: unknown,
+    scope: "point" | "frame"
+  ): void {
     const normalizedPointName = this.normalizeProtocolFieldName(pointName);
     const compactPointName = this.compactProtocolFieldName(pointName);
     if (normalizedPointName === "payload") {
@@ -2701,8 +2785,11 @@ export class SceneDataDrivenRuntime {
     }
 
     if (normalizedPointName === "action") {
+      if (scope !== "frame") {
+        return;
+      }
       if (frame.movement_x === undefined) {
-        this.writeMotionAlias(frame, "movement_x", this.readBitfieldAction(pointValue, [0], [1]));
+        this.writeMotionAlias(frame, "movement_x", this.readBitfieldAction(pointValue, [0], [1]), pointName);
       }
       return;
     }
@@ -2750,7 +2837,7 @@ export class SceneDataDrivenRuntime {
     return 0;
   }
 
-  /** 读取 PLC Byte 位域，非法值不参与动作别名转换。 */
+  /** 读取 PLC 位域，非法值不参与动作别名转换。 */
   private readBitfieldNumber(value: unknown): number | undefined {
     const numberValue = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
     if (!Number.isFinite(numberValue) || numberValue < 0) {
@@ -2760,7 +2847,12 @@ export class SceneDataDrivenRuntime {
   }
 
   /** 写入动作别名；0 不覆盖后续同帧非 0 动作，避免前后叉空信号挡住真实动作。 */
-  private writeMotionAlias(frame: Record<string, unknown>, fieldName: string, action: number | undefined): void {
+  private writeMotionAlias(
+    frame: Record<string, unknown>,
+    fieldName: string,
+    action: number | undefined,
+    sourceFieldName?: string
+  ): void {
     if (action === undefined) {
       return;
     }
@@ -2768,7 +2860,59 @@ export class SceneDataDrivenRuntime {
     const current = frame[fieldName];
     if (current === undefined || (this.isZeroActionValue(current) && action !== 0)) {
       frame[fieldName] = action;
+      if (sourceFieldName) {
+        this.recordMotionAliasSource(frame, fieldName, sourceFieldName);
+      }
     }
+  }
+
+  /** 记录别名来源为非枚举运行态元数据，后续可按具体设备语义撤销别名。 */
+  private recordMotionAliasSource(frame: Record<string, unknown>, fieldName: string, sourceFieldName: string): void {
+    const sources = this.ensureMotionAliasSources(frame);
+    sources[this.compactProtocolFieldName(fieldName)] = this.compactProtocolFieldName(sourceFieldName);
+  }
+
+  /** 显式点位写入时清理旧别名来源，避免真实 movement_x 被误判为 action 推导值。 */
+  private clearMotionAliasSource(frame: Record<string, unknown>, fieldName: string): void {
+    const sources = this.getMotionAliasSources(frame);
+    if (!sources) {
+      return;
+    }
+
+    delete sources[this.compactProtocolFieldName(fieldName)];
+  }
+
+  /** 判断某个标准字段是否由指定原始点位别名推导。 */
+  private isMotionAliasFrom(frame: Record<string, unknown>, fieldName: string, sourceFieldName: string): boolean {
+    const sources = this.getMotionAliasSources(frame);
+    return sources?.[this.compactProtocolFieldName(fieldName)] === this.compactProtocolFieldName(sourceFieldName);
+  }
+
+  /** 获取或创建别名来源表，使用非枚举属性避免参与 payload 字段扫描。 */
+  private ensureMotionAliasSources(frame: Record<string, unknown>): Record<string, string> {
+    const existing = this.getMotionAliasSources(frame);
+    if (existing) {
+      return existing;
+    }
+
+    const sources: Record<string, string> = {};
+    Object.defineProperty(frame, MOTION_ALIAS_SOURCES_FIELD, {
+      value: sources,
+      enumerable: false,
+      configurable: true,
+      writable: true
+    });
+    return sources;
+  }
+
+  /** 读取别名来源表，非法结构按不存在处理。 */
+  private getMotionAliasSources(frame: Record<string, unknown>): Record<string, string> | undefined {
+    const value = frame[MOTION_ALIAS_SOURCES_FIELD];
+    if (!this.isRecord(value)) {
+      return undefined;
+    }
+
+    return value as Record<string, string>;
   }
 
   /** 判断当前动作值是否是停止态，用于同帧多个 PLC 信号的优先级合并。 */
@@ -2886,6 +3030,7 @@ export class SceneDataDrivenRuntime {
       "movement_x",
       "movement_y",
       "movement_z",
+      ...STACKER_DDJ2_STATUS_FIELDS,
       "distancex",
       "distanceX",
       "DistanceX",

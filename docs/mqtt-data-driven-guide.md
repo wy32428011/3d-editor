@@ -245,20 +245,40 @@ dt/factory/logistics/+/+/twindatadriven/#
     {"e":"DDJ2","p":"front_command","v":0},
     {"e":"DDJ2","p":"mode","v":4},
     {"e":"DDJ2","p":"back_command","v":9},
-    {"e":"DDJ2","p":"front_x","v":36},
-    {"e":"DDJ2","p":"front_y","v":6},
+    {"e":"DDJ2","p":"front_z","v":0},
+    {"e":"DDJ2","p":"front_x","v":43},
+    {"e":"DDJ2","p":"front_y","v":1},
+    {"e":"DDJ2","p":"front_task","v":0},
+    {"e":"DDJ2","p":"back_task","v":0},
+    {"e":"DDJ2","p":"front_containerCode","v":""},
+    {"e":"DDJ2","p":"back_containerCode","v":""},
+    {"e":"DDJ2","p":"signalBits","v":0},
+    {"e":"DDJ2","p":"front_signalBits","v":512},
+    {"e":"DDJ2","p":"back_signalBits","v":0},
     {"e":"DDJ2","p":"movement_x","v":0},
     {"e":"DDJ2","p":"movement_y","v":0},
     {"e":"DDJ2","p":"front_movement_z","v":0},
     {"e":"DDJ2","p":"back_movement_z","v":0},
-    {"e":"DDJ2","p":"distance_x","v":43.5726},
-    {"e":"DDJ2","p":"distance_y","v":7.6856},
+    {"e":"DDJ2","p":"rpm_x","v":10},
+    {"e":"DDJ2","p":"rpm_y","v":0},
+    {"e":"DDJ2","p":"front_rpm_z","v":0},
+    {"e":"DDJ2","p":"back_rpm_z","v":0},
+    {"e":"DDJ2","p":"distance_x","v":52.1954},
+    {"e":"DDJ2","p":"distance_y","v":0.3563},
     {"e":"DDJ2","p":"front_distance_z","v":0},
     {"e":"DDJ2","p":"back_distance_z","v":0},
+    {"e":"DDJ2","p":"workingHours_x","v":0},
+    {"e":"DDJ2","p":"workingHours_y","v":0},
+    {"e":"DDJ2","p":"front_workingHours_z","v":0},
+    {"e":"DDJ2","p":"back_workingHours_z","v":0},
     {"e":"DDJ2","p":"normal","v":true},
-    {"e":"DDJ2","p":"message","v":"正常"}
+    {"e":"DDJ2","p":"errorCode","v":0},
+    {"e":"DDJ2","p":"message","v":"正常"},
+    {"e":"DDJ2","p":"to_z","v":0},
+    {"e":"DDJ2","p":"to_x","v":0},
+    {"e":"DDJ2","p":"to_y","v":0}
   ],
-  "ts": "2026-06-22T16:31:36.682961605+08:00"
+  "ts": "2026-06-26T09:22:59.559563733+08:00"
 }
 ```
 
@@ -291,21 +311,22 @@ dt/factory/logistics/+/+/twindatadriven/#
 | `back_forkAction` | bit1 右伸，bit2 左缩，bit3 左伸，bit4 右缩 | `back_movement_z` | 旧 V5.2 位信号；缩叉朝原点回收 |
 | `deviceCode` / `device_code` | 调度号 | 保留业务字段 | 不覆盖 `e=DDJ2` 设备匹配号 |
 
-运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`frontForkLocation/backForkLocation`、`front_forkDistance/back_forkDistance`、`front_distance_z/back_distance_z`、`deviceCode/device_code`、`distanceX/distance_x`、`distanceY/distance_y`、`frontDistanceY/backDistanceY`、`front_distanceY/back_distanceY` 都能被识别。对 Stacker 来说，`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`to_x/to_y/to_z`、`front_containerCode/back_containerCode`、`*_rpm`、`*_workingHours`、`signalBits`、`normal/errorCode/message` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算。
+运行时会按字段名归一化后再判断别名，因此对象帧里的 `frontForkAction/backForkAction`、`front_forkAction/back_forkAction`、`frontForkLocation/backForkLocation`、`front_forkDistance/back_forkDistance`、`front_distance_z/back_distance_z`、`deviceCode/device_code`、`distanceX/distance_x`、`distanceY/distance_y`、`frontDistanceY/backDistanceY`、`front_distanceY/back_distanceY` 都能被识别。对 Stacker 来说，`move`、`mode`、`front_command/back_command`、`front_task/back_task`、`front_x/front_y/front_z`、`back_x/back_y/back_z`、`to_x/to_y/to_z`、`front_containerCode/back_containerCode`、`signalBits/front_signalBits/back_signalBits`、`rpm_*`、`workingHours_*`、`normal/errorCode/message` 目前只保留为业务状态或遥测字段，不参与模型位移、升降、伸叉和速度计算；输送线的 `signalBits=0/3` 光电枚举只在辊道机/链条机目标上解释。
 
 **输送线 PLC 点位映射**：
 
 | PLC 点位 | 位信号 / 取值 | 运行态行为 | 说明 |
 |---|---|---|---|
-| `signalBits` | bit0 前端有货，bit3 后端有货 | 前端有货上升沿生成运行态 cube 货箱 | 在 `RollerConveyor01` 和 `ChainConveyor01` 这类输送目标上解释；旧 `move` bit0 和 `front_has_cargo=true` 继续兼容 |
+| `signalBits` | Integer 枚举：`0` 前端有货，`1` 前端换速，`2` 后端换速，`3` 后端有货，`4` 低位停准，`5` 高位停准 | `0` 触发运行态 cube 货箱生成，`3` 表示后端有货，其余状态保留 | 在 `RollerConveyor01` 和 `ChainConveyor01` 这类输送目标上解释；旧 `move` 来货信号和 `front_has_cargo=true` 继续兼容 |
 | `movement_x` | `0` 不转，`1` 链条/滚筒正转，`2` 链条/滚筒反转 | 辊道机驱动辊筒自转；链条机保持 Rail 装配不动，在输送面显示移动光晕箭头并推进已绑定货箱 | 新协议输送方向以该字段为准 |
 | `movement_y` | `0` 原位，`1` 上升，`2` 下降 | 顶升类垂直动作 | 普通辊道机/链条机未声明垂直 motion 时只保留状态 |
 | `rotation` | `0` 停止，`1` 顺时针，`2` 逆时针 | 旋转台方向 | 普通辊道机/链条机默认不把它当成来货信号 |
-| `action` | `0` 没任务，`1` 抱束中，`2` 抱束完成，`3` 解抱束中，`4` 解抱束完成 | 业务状态 | 新协议不作为输送方向；旧 PLC 位域只在同帧没有 `movement_x` 时兼容映射 |
+| `action` | `0` 没任务，`1` 抱束中，`2` 抱束完成，`3` 解抱束中，`4` 解抱束完成 | 业务状态 | 新链条机协议不作为输送方向；链条机目标即使缺少 `movement_x` 也不会把它当输送动作 |
 | `containerCode` / `container_no` | 非空字符串 | 货箱编号 | 优先作为自动生成 cube 的资产编号 |
 | `task` | 非 0 任务号 | 兜底货箱编号 | 缺少托盘条码时生成 `Task202` 这类稳定编号 |
+| `folding` / `flip` / `fork` / `result` / `result2` | 业务结果或机构状态 | 保留字段 | 当前不直接驱动链条机动画 |
 
-示例：`signalBits=0, movement_x=0, task=202` 表示前端无货且输送线停止，不生成 cube；`signalBits=1, movement_x=0, task=202` 会在输送线前端生成临时 `Task202` cube 并保持停止；`signalBits=1, movement_x=1, task=202` 会让该 cube 随输送线正向移动。临时 cube 只存在于预览态，退出预览或 dispose 时清理，不写入场景文件。
+示例：`signalBits=0, movement_x=0, task=202, container_quantity=1` 表示前端有货，会在输送线前端生成临时 `Task202` cube 并保持停止；`signalBits=0, movement_x=1, task=202, container_quantity=1` 会让该 cube 随输送线正向移动；`signalBits=3, movement_x=0, container_quantity=1` 表示后端有货并停止。截图协议未给出“无信号”枚举，运行时只在 `container_quantity` 明确大于 0 或未上报数量时把 `signalBits=0` 当作来货触发，`container_quantity=0` 的完整状态帧不会生成 cube。临时 cube 只存在于预览态，退出预览或 dispose 时清理，不写入场景文件。
 
 **模型包语义**：`dataDriven.motion.<group>.valueMode` 缺省为 `"target"`，保留旧数值目标模式；新模型包显式声明 `valueMode:"action"`。action 模式下运行时按渲染帧积分：`当前值 += actionDirection * speed * deltaSeconds`，`translate` 的 `speed` 单位为 `m/s`，`rotate` 的 `speed` 单位为 `deg/s`。动作值为 `0` 时停止并保持当前位置；真实连接超过 5 秒无新消息时也会停住，避免断流后继续移动。
 
@@ -313,7 +334,7 @@ dt/factory/logistics/+/+/twindatadriven/#
 
 ### 5.3 负载、状态与告警帧
 
-负载绑定用于同步载体设备与负载的关系。模型包配置了货箱吸附语义时，`twindatadriven/payload` 会被归一为现有货箱字段并在预览态同步到载体锚点；配置了运动组的输送线类设备收到同类 payload 后，可以把货箱绑定到该输送线并由 `movement_x` 动作推进货箱，不要求数据侧持续发送货箱距离坐标。当前 opaque 辊道机 `RollerConveyor01` 和链条机 `ChainConveyor01` 支持 `payload` 绑定已有或运行态生成的货箱；现场 PLC 报文也可以用新协议 `signalBits` bit0、旧 `move` bit0 或 `front_has_cargo=true` 前端有货自动生成预览态临时 cube，再由 `movement_x` 推进。`containerCode/container_no` 优先作为运行态货箱编号，缺失时非 0 `task` 兜底。`movement_x/rotation` 会驱动辊道机辊筒视觉自转；链条机的 `movement_x` 不再改写 Rail 节点变换，而是在输送面显示移动光晕箭头并推动货箱沿模型输送段有界移动，货箱整箱不会超出模型端点：
+负载绑定用于同步载体设备与负载的关系。模型包配置了货箱吸附语义时，`twindatadriven/payload` 会被归一为现有货箱字段并在预览态同步到载体锚点；配置了运动组的输送线类设备收到同类 payload 后，可以把货箱绑定到该输送线并由 `movement_x` 动作推进货箱，不要求数据侧持续发送货箱距离坐标。当前 opaque 辊道机 `RollerConveyor01` 和链条机 `ChainConveyor01` 支持 `payload` 绑定已有或运行态生成的货箱；现场 PLC 报文也可以用新协议 `signalBits=0`、旧 `move` 来货信号或 `front_has_cargo=true` 前端有货自动生成预览态临时 cube，再由 `movement_x` 推进。`containerCode/container_no` 优先作为运行态货箱编号，缺失时非 0 `task` 兜底。`movement_x/rotation` 会驱动辊道机辊筒视觉自转；链条机的 `movement_x` 不再改写 Rail 节点变换，而是在输送面显示移动光晕箭头并推动货箱沿模型输送段有界移动，货箱整箱不会超出模型端点：
 
 ```json
 {"e":"Stacker01","p":"payload","v":"BOX008","ts":1746991234567}
@@ -501,7 +522,7 @@ DDJ2 PLC 点位示例：
 | 点位 | 当前行为 | kind/axis |
 |---|---|---|
 | `movement_x` / `rotation` | `0` 停止，`1` 正转/前进，`2` 反转/后退；驱动辊筒自转并推进已绑定货箱 | rotate / z |
-| `signalBits` | Byte 位域；bit0 前端有货时生成预览态临时 cube，bit3 后端有货 | 状态触发 |
+| `signalBits` | Integer 枚举：`0` 前端有货时生成预览态临时 cube，`1` 前端换速，`2` 后端换速，`3` 后端有货，`4` 低位停准，`5` 高位停准 | 状态触发 |
 | `action` | 抱机业务动作；旧位域仅在未上报 `movement_x` 时兼容归一 | 状态 / 兼容 |
 | `containerCode` / `container_no` / `task` | 生成货箱编号；托盘条码优先，缺失时非 0 `task` 生成 `Task202` | 运行态货箱 |
 
@@ -522,7 +543,7 @@ DDJ2 PLC 点位示例：
     {"e":"RollerConveyor01","p":"task","v":202},
     {"e":"RollerConveyor01","p":"movement_x","v":1},
     {"e":"RollerConveyor01","p":"movement_y","v":0},
-    {"e":"RollerConveyor01","p":"signalBits","v":1},
+    {"e":"RollerConveyor01","p":"signalBits","v":0},
     {"e":"RollerConveyor01","p":"containerCode","v":""},
     {"e":"RollerConveyor01","p":"workingHours_x","v":0},
     {"e":"RollerConveyor01","p":"workingHours_y","v":0},
@@ -542,7 +563,7 @@ DDJ2 PLC 点位示例：
 }
 ```
 
-`RollerConveyor01` 会保留模型包 `dataDriven.motion.roller`，因此 `movement_x=1/2/0` 和 `rotation=1/2/0` 会驱动原始 `GT` 辊筒和参数化生成的同源辊筒自转；预览态会把这些辊筒的 pivot 临时校正到各自几何中心，避免围绕模型原点旋转。收到 `payload` 绑定或 `signalBits` bit0 前端有货后，货箱会沿辊道根节点本地 X 轴移动，并按当前辊筒输送段做整箱夹紧。PLC 自动生成的 cube 只存在于预览态，停止预览后清理，不写入 `.babylon` 或项目场景文件。货箱到末端后保持绑定并停在末端，继续收到同向信号不会越界；收到反向 `movement_x/rotation` 或新的绑定信号后恢复移动。
+`RollerConveyor01` 会保留模型包 `dataDriven.motion.roller`，因此 `movement_x=1/2/0` 和 `rotation=1/2/0` 会驱动原始 `GT` 辊筒和参数化生成的同源辊筒自转；预览态会把这些辊筒的 pivot 临时校正到各自几何中心，避免围绕模型原点旋转。收到 `payload` 绑定或 `signalBits=0` 前端有货后，货箱会沿辊道根节点本地 X 轴移动，并按当前辊筒输送段做整箱夹紧。PLC 自动生成的 cube 只存在于预览态，停止预览后清理，不写入 `.babylon` 或项目场景文件。货箱到末端后保持绑定并停在末端，继续收到同向信号不会越界；收到反向 `movement_x/rotation` 或新的绑定信号后恢复移动。
 
 ### 6.5 有电机辊道 MotorConveyor
 
@@ -581,18 +602,20 @@ DDJ2 PLC 点位示例：
 | 点位 | 动作枚举/信号 | 运行效果 | kind/axis |
 |---|---|---|---|
 | `movement_x` | `0` 停止，`1` 从前端送向后端，`2` 从后端送回前端 | Rail 保持主体装配不动，输送面显示移动光晕箭头，已绑定货箱按链条机端点轨迹线段输送 | cargo path + direction arrows |
-| `signalBits` bit0 / `front_has_cargo` / `move` bit0 | 前端有货 | 在链条机前端端点生成预览态 cube 货箱 | 状态触发 |
+| `signalBits=0` / `front_has_cargo` / 旧 `move` 来货信号 | 前端有货 | 在链条机前端端点生成预览态 cube 货箱 | 状态触发 |
+| `action` | `0` 没任务，`1` 抱束中，`2` 抱束完成，`3` 解抱束中，`4` 解抱束完成 | 业务状态保留 | 不驱动链条机方向，输送方向只看 `movement_x` |
 | `containerCode` / `container_no` / `task` | 货箱编号 | 生成运行态 cube 的资产编号 | 托盘条码优先，任务号兜底 |
+| `folding` / `flip` / `fork` / `result` / `result2` | 业务结果或机构状态 | 保留字段 | 当前不直接驱动链条机动画 |
 
 ```json
 [
-  {"deviceCode":"ChainConveyor01","p":"signalBits","v":1,"ts":1746991234567},
+  {"deviceCode":"ChainConveyor01","p":"signalBits","v":0,"ts":1746991234567},
   {"deviceCode":"ChainConveyor01","p":"containerCode","v":"Pallet101","ts":1746991234567},
   {"deviceCode":"ChainConveyor01","p":"movement_x","v":1,"ts":1746991234567}
 ]
 ```
 
-链条机模型包支持 `chainFrontEndpointRatio` 和 `chainRearEndpointRatio` 两个端点参数，默认前端为 `1`、后端为 `0`，沿模型局部 `-Z` 到 `+Z` 的当前输送段比例定位。运行时会用这两个端点形成 `front -> rear` 世界坐标线段：`signalBits` bit0、`front_has_cargo` 或 `move` bit0 生成的运行态 cube 会放在 front 端点，`movement_x=1` 以 0.3m/s 沿该线段推向 rear 端点，`movement_x=2` 反向移动，并按货箱尺寸夹紧在端点内；同时输送面会生成循环移动的青色光晕箭头表达当前方向，`movement_x=0` 或连接断流时自动隐藏。Stacker 目标字段使用 `target_anchor=front/rear` 指向链条机时，也会读取同一组端点参数；旧场景未保存该参数时按默认值兜底，再缺少链条机基线时才回退到模型最长水平轴端点。旧链条机模型包若仍声明 `movement_x` 为 `translate / z` 或指向 `Rail_01_M001/Rail_02_M001`，运行时会兼容转换为货箱输送专用动作组，不再写 Rail 的位置、旋转或 pivot；若旧模型包缺少可解析的 `dataDriven.motion`，运行时会补默认 `movement_x` 输送组，保证链条机能被识别为货箱输送载体。
+链条机模型包支持 `chainFrontEndpointRatio` 和 `chainRearEndpointRatio` 两个端点参数，默认前端为 `1`、后端为 `0`，沿模型局部 `-Z` 到 `+Z` 的当前输送段比例定位。运行时会用这两个端点形成 `front -> rear` 世界坐标线段：`signalBits=0`、`front_has_cargo` 或旧 `move` 来货信号生成的运行态 cube 会放在 front 端点，`movement_x=1` 以 0.3m/s 沿该线段推向 rear 端点，`movement_x=2` 反向移动，并按货箱尺寸夹紧在端点内；同时输送面会生成循环移动的青色光晕箭头表达当前方向，`movement_x=0` 或连接断流时自动隐藏。Stacker 目标字段使用 `target_anchor=front/rear` 指向链条机时，也会读取同一组端点参数；旧场景未保存该参数时按默认值兜底，再缺少链条机基线时才回退到模型最长水平轴端点。旧链条机模型包若仍声明 `movement_x` 为 `translate / z` 或指向 `Rail_01_M001/Rail_02_M001`，运行时会兼容转换为货箱输送专用动作组，不再写 Rail 的位置、旋转或 pivot；若旧模型包缺少可解析的 `dataDriven.motion`，运行时会补默认 `movement_x` 输送组，保证链条机能被识别为货箱输送载体。
 
 ### 6.8 一体式顶升移载 YZJ
 
@@ -811,12 +834,12 @@ node scripts/stacker-mqtt-demo-bridge.mjs
 | `STACKER_DEMO_WS_HOST` / `WS_PORT` / `WS_PATH` | `127.0.0.1` / `18083` / `/stacker` | 编辑器订阅的本地 WebSocket |
 | `STACKER_DEMO_DEVICE_ID` | `DDJ2` | 设备编号；旧 `Stacker01` 可通过该变量切回 |
 | `STACKER_DEMO_DEVICE_CODE` | `1` | PLC `deviceCode` 调度号 |
-| `STACKER_DEMO_PROTOCOL` | `plc` | `plc` 输出 DDJ2 PLC 点位；`standard` 输出旧标准点位 |
+| `STACKER_DEMO_PROTOCOL` | `plc` | `plc` 输出 DDJ2 新现场完整点位包；`standard` 输出旧标准点位 |
 | `STACKER_DEMO_PAYLOAD_WRAP` | `data` | 输出 `{data:[...],ts}`；设为 `none` 可恢复裸数组 |
 | `STACKER_DEMO_CARGO_ID` | `Box01` | 演示货箱编号 |
 | `STACKER_DEMO_INTERVAL_MS` | `500` | 发布间隔 |
 
-配套操作：选中 Stacker → 点击「**填入 Stacker Demo**」自动写入 `ws://127.0.0.1:18083/stacker`、`DDJ2` 和对应 Topic → 手动进入预览。该按钮只填配置不生成数据，需先启动脚本。`--once` 参数（或 `STACKER_DEMO_ONCE=1`）可做一次性发布验证 broker 连通性。
+配套操作：选中 Stacker → 点击「**填入 Stacker Demo**」自动写入 `ws://127.0.0.1:18083/stacker`、`DDJ2` 和对应 Topic → 手动进入预览。默认 `plc` 模式会发送与现场 DDJ2 包一致的 `deviceCode/front_command/mode/back_command/front_x/front_y/signalBits/front_signalBits/back_signalBits/movement_*/distance_*/rpm_*/workingHours_*` 字段集合，不再输出旧 `action/front_action/front_forkAction` 位域；该按钮只填配置不生成数据，需先启动脚本。`--once` 参数（或 `STACKER_DEMO_ONCE=1`）可做一次性发布验证 broker 连通性。
 
 ### 9.3 DDJ2 新现场报文脚本
 
@@ -838,10 +861,10 @@ npm run demo:stacker-ddj2-plc:dry-run
 
 `scripts/stacker-scene-mqtt-sequence.mjs` 用于验证 test2 的「链条机 1004 前端有货 → 运行态 cube 货箱输送到后端 → DDJ2 伸叉取货 → 载货台移动 → 放入定位线框 1-1-1」完整外部报文流程。脚本默认读取 `C:\Users\WY\Documents\test2\test2` 当前主场景，确认资产编号 `1004` 的链条机、`DDJ2` 和 `1-1-1` 的定位线框存在，并只使用 `1004` 的 `chainLength`、`chainFrontEndpointRatio`、`chainRearEndpointRatio` 估算输送等待时间。货箱由 `1004` 前端有货信号在预览态生成，不要求场景中预置 `Box01`。脚本会按多 Topic 顺序发送以下数据：
 
-- `dt/factory/logistics/conveyor/1004/twindatadriven/joint`：发送输送线新协议 `{data:[{e,p,v}],ts}` 完整点位包，包含 `deviceCode/mode/action/task/movement_x/movement_y/signalBits/containerCode/workingHours_x/workingHours_y/normal/errorCode/message/layer/rotation/container_quantity/folding/flip/fork/result/result2`；默认 `task=202`、`containerCode=""`，运行时在 `signalBits bit0` 上升沿生成预览态 `Task202` cube 货箱；随后周期发送 `movement_x=1` 完整点位包，持续刷新动作帧并推进货箱沿 `chainFrontEndpointRatio -> chainRearEndpointRatio` 端点轨迹走到后端，输送期间用光晕箭头显示方向且 Rail 保持主体装配不动，最后发送 `movement_x=0` 和 `signalBits bit3`。脚本默认保活间隔为 2 秒，可用 `STACKER_SCENE_CONVEYOR_ACTION_HEARTBEAT_MS` 调整，但必须小于运行时 5 秒断流保护窗口。
+- `dt/factory/logistics/conveyor/1004/twindatadriven/joint`：发送输送线新协议 `{data:[{e,p,v}],ts}` 完整点位包，包含 `deviceCode/mode/task/movement_x/movement_y/signalBits/containerCode/workingHours_x/workingHours_y/normal/errorCode/message/layer/rotation/container_quantity/folding/flip/fork/result/result2`，`ts` 输出为东八区 `+08:00` 格式；默认 `task=202`、`containerCode=""`，运行时在 `signalBits=0` 且 `container_quantity=1` 时生成预览态 `Task202` cube 货箱；随后周期发送 `movement_x=1` 完整点位包，持续刷新动作帧并推进货箱沿 `chainFrontEndpointRatio -> chainRearEndpointRatio` 端点轨迹走到后端，输送期间用光晕箭头显示方向且 Rail 保持主体装配不动，最后发送 `movement_x=0` 和 `signalBits=3`。脚本默认保活间隔为 2 秒，可用 `STACKER_SCENE_CONVEYOR_ACTION_HEARTBEAT_MS` 调整，但必须小于运行时 5 秒断流保护窗口。
 - `dt/factory/logistics/conveyor/1004/twindatadriven/payload`：发送 `payload=Task202`，把运行态货箱绑定到链条机 1004，后续由链条机模型动作推进。
 - `dt/factory/logistics/stacker/DDJ2/twinspawn`：初始化 DDJ2 设备上下文，不强行改写整机位置。
-- `dt/factory/logistics/stacker/DDJ2/twindatadriven/joint`：通过 `travel_target=1004,target_anchor=rear` 对准链条机后端，通过 `fork_target=Task202` 按运行态货箱模型伸叉取货，再通过 `travel_target=1-1-1,target_anchor=center` 对准定位线框，并用 `fork_target=1-1-1`、`cargo_action=drop`、`drop_target=1-1-1` 放货；PLC 模式只转换 DDJ2 动作位域，目标字段仍保留为 MQTT 点位。
+- `dt/factory/logistics/stacker/DDJ2/twindatadriven/joint`：通过 `travel_target=1004,target_anchor=rear` 对准链条机后端，通过 `fork_target=Task202` 按运行态货箱模型伸叉取货，再通过 `travel_target=1-1-1,target_anchor=center` 对准定位线框，并用 `fork_target=1-1-1`、`cargo_action=drop`、`drop_target=1-1-1` 放货；PLC 模式输出 DDJ2 现场完整字段包，不再转换旧动作位域，目标字段会作为扩展点位保留在同一 `data` 数组中。
 
 当同一帧同时出现 `travel_target/fork_target` 和历史 `distance_x/distance_y/front_distance_z/back_distance_z` 字段时，运行时以模型目标定位结果为准，避免距离字段覆盖链条机或定位框锚点。
 

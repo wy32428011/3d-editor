@@ -17,6 +17,12 @@ const DRY_RUN = process.argv.includes("--dry-run") || process.env.STACKER_DDJ2_D
 const ONCE_MODE = process.argv.includes("--once") || process.env.STACKER_DDJ2_ONCE === "1";
 const NO_MQTT = process.argv.includes("--no-mqtt") || process.env.STACKER_DDJ2_NO_MQTT === "1";
 const NO_WS = process.argv.includes("--no-ws") || process.env.STACKER_DDJ2_NO_WS === "1";
+const BASE_FRONT_X = 43;
+const BASE_FRONT_Y = 1;
+const BASE_FRONT_SIGNAL_BITS = 512;
+const BASE_RPM_X = 10;
+const BASE_DISTANCE_X = 52.1954;
+const BASE_DISTANCE_Y = 0.3563;
 
 const textEncoder = new TextEncoder();
 const websocketClients = new Set();
@@ -36,25 +42,25 @@ const BASE_RECORDS = [
   ["mode", 4],
   ["back_command", 9],
   ["front_z", 0],
-  ["front_x", 36],
-  ["front_y", 6],
+  ["front_x", BASE_FRONT_X],
+  ["front_y", BASE_FRONT_Y],
   ["front_task", 0],
   ["back_task", 0],
   ["front_containerCode", ""],
   ["back_containerCode", ""],
   ["signalBits", 0],
-  ["front_signalBits", 0],
+  ["front_signalBits", BASE_FRONT_SIGNAL_BITS],
   ["back_signalBits", 0],
   ["movement_x", 0],
   ["movement_y", 0],
   ["front_movement_z", 0],
   ["back_movement_z", 0],
-  ["rpm_x", 0],
+  ["rpm_x", BASE_RPM_X],
   ["rpm_y", 0],
   ["front_rpm_z", 0],
   ["back_rpm_z", 0],
-  ["distance_x", 43.5726],
-  ["distance_y", 7.6856],
+  ["distance_x", BASE_DISTANCE_X],
+  ["distance_y", BASE_DISTANCE_Y],
   ["front_distance_z", 0],
   ["back_distance_z", 0],
   ["workingHours_x", 0],
@@ -76,15 +82,15 @@ const MOTION_STEPS = [
   },
   {
     label: "行走前进并更新水平编码",
-    overrides: { movement_x: 1, distance_x: 44.3726, to_x: 37 }
+    overrides: { movement_x: 1, distance_x: 52.9954, to_x: 44 }
   },
   {
     label: "行走停止",
-    overrides: { movement_x: 0, distance_x: 44.3726, front_x: 37 }
+    overrides: { movement_x: 0, distance_x: 52.9954, front_x: 44 }
   },
   {
-    label: "载货台下降并更新垂直编码",
-    overrides: { movement_y: 2, distance_y: 7.3856, to_y: 5 }
+    label: "载货台上升并更新垂直编码",
+    overrides: { movement_y: 1, distance_y: 0.6563, to_y: 2 }
   },
   {
     label: "前叉伸出并更新伸叉编码",

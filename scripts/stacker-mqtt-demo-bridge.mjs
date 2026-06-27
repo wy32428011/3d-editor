@@ -16,6 +16,86 @@ const DEMO_PROTOCOL = normalizeDemoProtocol(process.env.STACKER_DEMO_PROTOCOL ??
 const PAYLOAD_WRAP = normalizePayloadWrap(process.env.STACKER_DEMO_PAYLOAD_WRAP ?? "data");
 const MQTT_KEEP_ALIVE_SECONDS = 30;
 const ONCE_MODE = process.argv.includes("--once") || process.env.STACKER_DEMO_ONCE === "1";
+const STACKER_BASE_FRONT_SIGNAL_BITS = 512;
+const STACKER_BASE_RPM_X = 10;
+const STACKER_BASE_DISTANCE_X = 52.1954;
+const STACKER_BASE_DISTANCE_Y = 0.3563;
+const STACKER_PLC_FIELD_ORDER = [
+  "deviceCode",
+  "front_command",
+  "mode",
+  "back_command",
+  "front_z",
+  "front_x",
+  "front_y",
+  "front_task",
+  "back_task",
+  "front_containerCode",
+  "back_containerCode",
+  "signalBits",
+  "front_signalBits",
+  "back_signalBits",
+  "movement_x",
+  "movement_y",
+  "front_movement_z",
+  "back_movement_z",
+  "rpm_x",
+  "rpm_y",
+  "front_rpm_z",
+  "back_rpm_z",
+  "distance_x",
+  "distance_y",
+  "front_distance_z",
+  "back_distance_z",
+  "workingHours_x",
+  "workingHours_y",
+  "front_workingHours_z",
+  "back_workingHours_z",
+  "normal",
+  "errorCode",
+  "message",
+  "to_z",
+  "to_x",
+  "to_y"
+];
+const STACKER_PLC_DEFAULT_VALUES = {
+  deviceCode: DEMO_DEVICE_CODE,
+  front_command: 0,
+  mode: 4,
+  back_command: 9,
+  front_z: 0,
+  front_x: 43,
+  front_y: 1,
+  front_task: 0,
+  back_task: 0,
+  front_containerCode: "",
+  back_containerCode: "",
+  signalBits: 0,
+  front_signalBits: STACKER_BASE_FRONT_SIGNAL_BITS,
+  back_signalBits: 0,
+  movement_x: 0,
+  movement_y: 0,
+  front_movement_z: 0,
+  back_movement_z: 0,
+  rpm_x: STACKER_BASE_RPM_X,
+  rpm_y: 0,
+  front_rpm_z: 0,
+  back_rpm_z: 0,
+  distance_x: STACKER_BASE_DISTANCE_X,
+  distance_y: STACKER_BASE_DISTANCE_Y,
+  front_distance_z: 0,
+  back_distance_z: 0,
+  workingHours_x: 0,
+  workingHours_y: 0,
+  front_workingHours_z: 0,
+  back_workingHours_z: 0,
+  normal: true,
+  errorCode: 0,
+  message: "正常",
+  to_z: 0,
+  to_x: 0,
+  to_y: 0
+};
 
 const textEncoder = new TextEncoder();
 const websocketClients = new Set();
@@ -215,29 +295,63 @@ function createStackerFrame(ts = Date.now()) {
   return frame;
 }
 
-/** 按现场 PLC 点位表生成 DDJ2 报文，运行时会再归一成标准动作字段。 */
+/** 按现场 DDJ2 点位表生成完整报文，动作字段直接使用 movement_* 新协议。 */
 function createPlcStackerFrame(ts, travelPhase, liftPhase, forkAction, cargoPhase) {
-  const frame = [
-    { e: DEVICE_ID, p: "deviceCode", v: DEMO_DEVICE_CODE },
-    { e: DEVICE_ID, p: "action", v: createTravelBitfield(Math.sin(travelPhase)) },
-    { e: DEVICE_ID, p: "front_action", v: createLiftBitfield(Math.sin(liftPhase)) },
-    { e: DEVICE_ID, p: "back_action", v: createLiftBitfield(Math.sin(liftPhase)) },
-    { e: DEVICE_ID, p: "front_forkAction", v: createForkBitfield(forkAction) },
-    { e: DEVICE_ID, p: "back_forkAction", v: createForkBitfield(forkAction) },
-    { e: DEVICE_ID, p: "distancex", v: createTravelDistanceMillimeters(travelPhase) },
-    { e: DEVICE_ID, p: "front_distanceY", v: 0 },
-    { e: DEVICE_ID, p: "back_distanceY", v: 0 }
-  ];
+  const extensionRecords = [];
   const cargoAction = cargoPhase > 0.92 ? "pickup" : cargoPhase < -0.92 ? "drop" : "";
   if (cargoAction) {
-    frame.push({ e: DEVICE_ID, p: "cargo_action", v: cargoAction }, { e: DEVICE_ID, p: "cargo", v: DEMO_CARGO_ID });
+    extensionRecords.push(createStackerPlcRecord("cargo_action", cargoAction), createStackerPlcRecord("cargo", DEMO_CARGO_ID));
   }
-  return wrapDemoPayload(frame, ts);
+  return createStackerPlcPayload(
+    {
+      movement_x: createMovementAction(Math.sin(travelPhase)),
+      movement_y: createMovementAction(Math.sin(liftPhase)),
+      front_movement_z: forkAction,
+      back_movement_z: forkAction,
+      distance_x: createTravelDistanceValue(travelPhase),
+      distance_y: createLiftDistanceMeters(liftPhase),
+      front_distance_z: createForkDistanceMeters(cargoPhase),
+      back_distance_z: createForkDistanceMeters(cargoPhase)
+    },
+    ts,
+    extensionRecords
+  );
 }
 
-/** 生成 Stacker 行走绝对距离，现场 distancex 使用毫米，范围控制在默认轨道模拟长度内。 */
-function createTravelDistanceMillimeters(travelPhase) {
-  return Math.round((1.4 + 1.2 * Math.sin(travelPhase)) * 1000);
+/** 创建 DDJ2 现场完整点位包，业务扩展点位附加在 data 末尾。 */
+function createStackerPlcPayload(overrides, ts, extensionRecords = []) {
+  const values = {
+    ...STACKER_PLC_DEFAULT_VALUES,
+    deviceCode: DEMO_DEVICE_CODE,
+    ...overrides
+  };
+  return {
+    data: [
+      ...STACKER_PLC_FIELD_ORDER.map((pointName) => createStackerPlcRecord(pointName, values[pointName])),
+      ...extensionRecords
+    ],
+    ts: formatShanghaiTimestamp(ts)
+  };
+}
+
+/** 创建单条 DDJ2 点位记录，保持 e=DDJ2 作为模型匹配号。 */
+function createStackerPlcRecord(pointName, value) {
+  return { e: DEVICE_ID, p: pointName, v: value };
+}
+
+/** 生成 Stacker 行走绝对距离，围绕现场基准值小范围变化。 */
+function createTravelDistanceValue(travelPhase) {
+  return Number((STACKER_BASE_DISTANCE_X + 0.8 * Math.sin(travelPhase)).toFixed(4));
+}
+
+/** 生成载货台米制高度，保持为新协议 distance_y 浮点值。 */
+function createLiftDistanceMeters(liftPhase) {
+  return Number((STACKER_BASE_DISTANCE_Y + 0.3 * ((Math.sin(liftPhase) + 1) / 2)).toFixed(4));
+}
+
+/** 生成货叉米制伸缩距离，当前 demo 前后叉同值便于观察。 */
+function createForkDistanceMeters(cargoPhase) {
+  return Number((0.55 * ((cargoPhase + 1) / 2)).toFixed(4));
 }
 
 /** 把周期函数转换为协议动作枚举：1 正向，2 反向，0 静止。 */
@@ -251,34 +365,6 @@ function createMovementAction(value) {
   return 0;
 }
 
-/** 把前进/后退转换为 PLC action 位域：bit0 前进，bit1 后退。 */
-function createTravelBitfield(value) {
-  return createMovementAction(value);
-}
-
-/** 把上升/下降转换为 PLC front_action/back_action 位域：bit2 上升，bit3 下降。 */
-function createLiftBitfield(value) {
-  const action = createMovementAction(value);
-  if (action === 1) {
-    return 1 << 2;
-  }
-  if (action === 2) {
-    return 1 << 3;
-  }
-  return 0;
-}
-
-/** 把伸叉/缩叉转换为 PLC forkAction 位域：bit1 右伸叉，bit4 向右缩叉。 */
-function createForkBitfield(action) {
-  if (action === 1) {
-    return 1 << 1;
-  }
-  if (action === 2) {
-    return 1 << 4;
-  }
-  return 0;
-}
-
 /** 按现场附件格式包装 payload，必要时可通过环境变量恢复裸数组。 */
 function wrapDemoPayload(payload, ts) {
   if (PAYLOAD_WRAP === "none") {
@@ -286,8 +372,19 @@ function wrapDemoPayload(payload, ts) {
   }
   return {
     [PAYLOAD_WRAP]: payload,
-    ts: new Date(ts).toISOString()
+    ts: formatShanghaiTimestamp(ts)
   };
+}
+
+/** 按东八区输出现场报文时间，便于和 DDJ2 实际 ts 格式对齐。 */
+function formatShanghaiTimestamp(timestamp) {
+  const shanghaiTime = new Date(timestamp + 8 * 60 * 60 * 1000);
+  const pad = (value, length = 2) => String(value).padStart(length, "0");
+  return [
+    `${shanghaiTime.getUTCFullYear()}-${pad(shanghaiTime.getUTCMonth() + 1)}-${pad(shanghaiTime.getUTCDate())}`,
+    `T${pad(shanghaiTime.getUTCHours())}:${pad(shanghaiTime.getUTCMinutes())}:${pad(shanghaiTime.getUTCSeconds())}`,
+    `.${pad(shanghaiTime.getUTCMilliseconds(), 3)}+08:00`
+  ].join("");
 }
 
 /** 发布并广播一帧 demo 数据。 */

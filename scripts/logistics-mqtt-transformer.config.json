@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "scene": {
+    "name": "test2",
+    "description": "多设备 MQTT 报文转换配置：现场 PLC 原始报文转换为编辑器物流数据驱动 Topic。"
+  },
+  "connections": {
+    "sourceMqtt": {
+      "host": "192.168.60.154",
+      "port": 1883,
+      "clientIdPrefix": "logistics-transformer-source"
+    },
+    "targetMqtt": {
+      "host": "192.168.60.154",
+      "port": 1883,
+      "clientIdPrefix": "logistics-transformer-target"
+    },
+    "webSocket": {
+      "host": "127.0.0.1",
+      "port": 18086,
+      "path": "/logistics-transformer"
+    }
+  },
+  "routing": {
+    "sourceTopics": [
+      "dt/factory/plc/raw/+/+"
+    ],
+    "targetTopicTemplate": "dt/factory/logistics/{devType}/{deviceId}/twindatadriven/{subRes}",
+    "defaultSubRes": "joint",
+    "unknownDevicePolicy": "warn-and-skip"
+  },
+  "profiles": {
+    "stacker-ddj2-plc": {
+      "devType": "stacker",
+      "subRes": "joint",
+      "passthroughFields": [
+        "deviceCode",
+        "movement_x",
+        "movement_y",
+        "front_movement_z",
+        "back_movement_z",
+        "distance_x",
+        "distance_y",
+        "front_distance_z",
+        "back_distance_z",
+        "normal",
+        "errorCode",
+        "message"
+      ],
+      "distanceScale": {
+        "distance_x": 1,
+        "distance_y": 1,
+        "front_distance_z": 1,
+        "back_distance_z": 1
+      },
+      "cargo": {
+        "enabled": true,
+        "pickupCommandFields": ["front_command", "back_command"],
+        "pickupCommandValues": [2],
+        "dropCommandFields": ["front_command", "back_command"],
+        "dropCommandValues": [5],
+        "containerFields": ["front_containerCode", "back_containerCode"],
+        "taskFields": ["front_task", "back_task"],
+        "defaultCargo": "Box01",
+        "emitOnRisingEdgeOnly": true
+      },
+      "locator": {
+        "enabled": true,
+        "keyFields": ["to_z", "to_x", "to_y"],
+        "mapRef": "asrsLocators",
+        "missingTargetPolicy": "warn-and-skip"
+      }
+    },
+    "chain-conveyor-plc": {
+      "devType": "conveyor",
+      "subRes": "joint",
+      "passthroughFields": [
+        "deviceCode",
+        "movement_x",
+        "movement_y",
+        "signalBits",
+        "containerCode",
+        "container_no",
+        "task",
+        "container_quantity",
+        "normal",
+        "errorCode",
+        "message"
+      ],
+      "payloadBinding": {
+        "enabled": true,
+        "signalField": "signalBits",
+        "frontSignalValues": [0],
+        "containerFields": ["containerCode", "container_no"],
+        "taskFields": ["task"],
+        "taskPrefix": "Task"
+      }
+    },
+    "rgv-standard": {
+      "devType": "rgv",
+      "subRes": "joint",
+      "passthroughFields": [
+        "movement_x",
+        "movement_y",
+        "distance_x",
+        "distance_y",
+        "normal",
+        "errorCode",
+        "message"
+      ]
+    }
+  },
+  "devices": [
+    {
+      "deviceId": "DDJ2",
+      "assetCode": "DDJ2",
+      "profile": "stacker-ddj2-plc",
+      "enabled": true,
+      "overrides": {
+        "cargo.defaultCargo": "Box01",
+        "locator.mapRef": "asrsLocators"
+      }
+    },
+    {
+      "deviceId": "1004",
+      "assetCode": "1004",
+      "profile": "chain-conveyor-plc",
+      "enabled": true
+    },
+    {
+      "deviceId": "RGV01",
+      "assetCode": "RGV01",
+      "profile": "rgv-standard",
+      "enabled": true
+    }
+  ],
+  "maps": {
+    "asrsLocators": {
+      "1:9:3": "1-9-3",
+      "1:10:3": "1-10-3",
+      "1:11:3": "1-11-3",
+      "2:1:1": "2-1-1"
+    }
+  }
+}

@@ -19,10 +19,13 @@ const CONVEYOR_CONTAINER_CODE = process.env.STACKER_SCENE_CONVEYOR_CONTAINER_COD
 const DEFAULT_BOX_ID = CONVEYOR_CONTAINER_CODE.trim() || (CONVEYOR_TASK_CODE > 0 ? `Task${CONVEYOR_TASK_CODE}` : `Cargo-${CONVEYOR_ID}-001`);
 const BOX_ID = process.env.STACKER_SCENE_BOX_ID ?? DEFAULT_BOX_ID;
 const LOCATOR_ID = process.env.STACKER_SCENE_LOCATOR_ID ?? "1-1-1";
+const STACKER_BASE_FRONT_SIGNAL_BITS = 512;
+const STACKER_BASE_RPM_X = 10;
+const STACKER_BASE_DISTANCE_X = 52.1954;
+const STACKER_BASE_DISTANCE_Y = 0.3563;
 const CONVEYOR_PLC_FIELD_ORDER = [
   "deviceCode",
   "mode",
-  "action",
   "task",
   "movement_x",
   "movement_y",
@@ -42,6 +45,83 @@ const CONVEYOR_PLC_FIELD_ORDER = [
   "result",
   "result2"
 ];
+const STACKER_PLC_FIELD_ORDER = [
+  "deviceCode",
+  "front_command",
+  "mode",
+  "back_command",
+  "front_z",
+  "front_x",
+  "front_y",
+  "front_task",
+  "back_task",
+  "front_containerCode",
+  "back_containerCode",
+  "signalBits",
+  "front_signalBits",
+  "back_signalBits",
+  "movement_x",
+  "movement_y",
+  "front_movement_z",
+  "back_movement_z",
+  "rpm_x",
+  "rpm_y",
+  "front_rpm_z",
+  "back_rpm_z",
+  "distance_x",
+  "distance_y",
+  "front_distance_z",
+  "back_distance_z",
+  "workingHours_x",
+  "workingHours_y",
+  "front_workingHours_z",
+  "back_workingHours_z",
+  "normal",
+  "errorCode",
+  "message",
+  "to_z",
+  "to_x",
+  "to_y"
+];
+const STACKER_PLC_FIELD_NAMES = new Set(STACKER_PLC_FIELD_ORDER);
+const STACKER_PLC_DEFAULT_VALUES = {
+  deviceCode: STACKER_DEVICE_CODE,
+  front_command: 0,
+  mode: 4,
+  back_command: 9,
+  front_z: 0,
+  front_x: 43,
+  front_y: 1,
+  front_task: 0,
+  back_task: 0,
+  front_containerCode: "",
+  back_containerCode: "",
+  signalBits: 0,
+  front_signalBits: STACKER_BASE_FRONT_SIGNAL_BITS,
+  back_signalBits: 0,
+  movement_x: 0,
+  movement_y: 0,
+  front_movement_z: 0,
+  back_movement_z: 0,
+  rpm_x: STACKER_BASE_RPM_X,
+  rpm_y: 0,
+  front_rpm_z: 0,
+  back_rpm_z: 0,
+  distance_x: STACKER_BASE_DISTANCE_X,
+  distance_y: STACKER_BASE_DISTANCE_Y,
+  front_distance_z: 0,
+  back_distance_z: 0,
+  workingHours_x: 0,
+  workingHours_y: 0,
+  front_workingHours_z: 0,
+  back_workingHours_z: 0,
+  normal: true,
+  errorCode: 0,
+  message: "正常",
+  to_z: 0,
+  to_x: 0,
+  to_y: 0
+};
 const CHAIN_CONVEYOR_LENGTH_PARAMETER_FIELDS = ["chainLength", "chain_length", "length", "链条机长度"];
 const CHAIN_CONVEYOR_FRONT_ENDPOINT_RATIO_FIELDS = [
   "chainFrontEndpointRatio",
@@ -62,6 +142,8 @@ const SCENE_FILE_PATH = process.env.STACKER_SCENE_FILE_PATH ?? "";
 const CHAIN_CONVEYOR_CARGO_SPEED_MPS = readNumberOption("STACKER_SCENE_CONVEYOR_CARGO_SPEED", 0.3, 0.01);
 const CONVEYOR_TRANSFER_PADDING_MS = readNumberOption("STACKER_SCENE_CONVEYOR_PADDING_MS", 800, 0);
 const CONVEYOR_ACTION_HEARTBEAT_MS = readNumberOption("STACKER_SCENE_CONVEYOR_ACTION_HEARTBEAT_MS", 2000, 500);
+const CONVEYOR_SIGNAL_FRONT_CARGO = 0;
+const CONVEYOR_SIGNAL_REAR_CARGO = 3;
 const STATIC_BASE_TS = readNumberOption("STACKER_SCENE_BASE_TS", 1781596800000, 0);
 const START_DELAY_MS = readNumberOption("STACKER_SCENE_START_DELAY_MS", 1500, 0);
 const TIME_SCALE = readNumberOption("STACKER_SCENE_TIME_SCALE", 1, 0.01);
@@ -521,14 +603,14 @@ function createSceneMessages(baseTimestamp) {
       atMs: conveyorStartMs,
       label: `${CONVEYOR_ID} 启动链条输送`,
       topic: conveyorJointTopic,
-      payload: createConveyorPlcPayload({ movement_x: 1, signalBits: 1, container_quantity: 1 }, ts(conveyorStartMs))
+      payload: createConveyorPlcPayload({ movement_x: 1, signalBits: CONVEYOR_SIGNAL_FRONT_CARGO, container_quantity: 1 }, ts(conveyorStartMs))
     },
     ...conveyorKeepAliveMessages,
     {
       atMs: conveyorRearMs,
       label: `${CONVEYOR_ID} 后端有货并停止`,
       topic: conveyorJointTopic,
-      payload: createConveyorPlcPayload({ movement_x: 0, signalBits: 1 << 3, container_quantity: 1 }, ts(conveyorRearMs))
+      payload: createConveyorPlcPayload({ movement_x: 0, signalBits: CONVEYOR_SIGNAL_REAR_CARGO, container_quantity: 1 }, ts(conveyorRearMs))
     },
     {
       atMs: stackerTravelStartMs,
@@ -579,6 +661,8 @@ function createSceneMessages(baseTimestamp) {
       label: "DDJ2 取货确认",
       topic: stackerJointTopic,
       payload: [
+        { e: STACKER_ID, p: "fork_target", v: BOX_ID, ts: ts(pickupConfirmMs) },
+        { e: STACKER_ID, p: "fork_anchor", v: "center", ts: ts(pickupConfirmMs) },
         { e: STACKER_ID, p: "cargo_action", v: "pickup", ts: ts(pickupConfirmMs) },
         { e: STACKER_ID, p: "cargo", v: BOX_ID, ts: ts(pickupConfirmMs) }
       ],
@@ -660,7 +744,7 @@ function createSceneMessages(baseTimestamp) {
     },
     {
       atMs: resetMs,
-      label: `${CONVEYOR_ID} 后端有货信号复位`,
+      label: `${CONVEYOR_ID} 货箱数量复位`,
       topic: conveyorJointTopic,
       payload: createConveyorCargoSignalPayload({ frontHasCargo: false, rearHasCargo: false, timestamp: ts(resetMs) })
     }
@@ -675,21 +759,22 @@ function createConveyorTransferKeepAliveMessages({ startMs, stopMs, timestampAt 
       atMs,
       label: `${CONVEYOR_ID} 链条输送动作保活`,
       topic: conveyorJointTopic,
-      payload: createConveyorPlcPayload({ movement_x: 1, signalBits: 1, container_quantity: 1 }, timestampAt(atMs))
+      payload: createConveyorPlcPayload({ movement_x: 1, signalBits: CONVEYOR_SIGNAL_FRONT_CARGO, container_quantity: 1 }, timestampAt(atMs))
     });
   }
   return messages;
 }
 
-/** 创建前端有货来箱信号；signalBits bit0 让运行态 cube 使用新协议前端光电触发。 */
+/** 创建前端有货来箱信号；signalBits=0 让运行态 cube 使用新协议前端光电触发。 */
 function createConveyorFrontCargoPayload(timestamp) {
-  return createConveyorPlcPayload({ signalBits: 1, container_quantity: 1 }, timestamp);
+  return createConveyorPlcPayload({ signalBits: CONVEYOR_SIGNAL_FRONT_CARGO, container_quantity: 1 }, timestamp);
 }
 
-/** 创建链条机前后端有货状态，新协议 signalBits bit0/bit3 对应前后端光电。 */
+/** 创建链条机前后端有货状态，新协议 signalBits 使用整数枚举，0 前端有货、3 后端有货。 */
 function createConveyorCargoSignalPayload({ frontHasCargo, rearHasCargo, timestamp }) {
-  const signalBits = (frontHasCargo ? 1 : 0) | (rearHasCargo ? 1 << 3 : 0);
-  return createConveyorPlcPayload({ signalBits, container_quantity: signalBits === 0 ? 0 : 1 }, timestamp);
+  const hasCargo = frontHasCargo || rearHasCargo;
+  const signalBits = rearHasCargo ? CONVEYOR_SIGNAL_REAR_CARGO : CONVEYOR_SIGNAL_FRONT_CARGO;
+  return createConveyorPlcPayload({ signalBits, container_quantity: hasCargo ? 1 : 0 }, timestamp);
 }
 
 /** 创建辊道机/链条机现场 PLC 完整点位包，外层保持 data + ts 形态供 dry-run 和实发复核。 */
@@ -697,11 +782,11 @@ function createConveyorPlcPayload(overrides, timestamp) {
   const values = {
     deviceCode: CONVEYOR_ID,
     mode: 2,
-    action: 0,
     task: CONVEYOR_TASK_CODE,
     movement_x: 0,
     movement_y: 0,
-    signalBits: 0,
+    // 现场枚举中 0 表示前端有货；完整状态帧用 container_quantity=0 表达当前无货。
+    signalBits: CONVEYOR_SIGNAL_FRONT_CARGO,
     containerCode: CONVEYOR_CONTAINER_CODE,
     workingHours_x: 0,
     workingHours_y: 0,
@@ -892,7 +977,7 @@ function publishSceneMessage(message) {
   console.log(`发送：${message.label} -> ${message.topic} ${payloadText}`);
 }
 
-/** 创建实际发送 payload，PLC 模式会把标准点位转换成现场 bitfield。 */
+/** 创建实际发送 payload，PLC 模式会把 DDJ2 动作帧包装成现场完整点位包。 */
 function createPublishPayload(message) {
   const payload = PLC_MODE && message.plcConvertible ? convertPayloadToPlc(message.payload) : message.payload;
   if (isWrappedPayload(payload)) {
@@ -916,87 +1001,53 @@ function isWrappedPayload(value) {
   return ["data", "payload", "message"].some((key) => Array.isArray(value[key])) && value.ts !== undefined;
 }
 
-/** 将标准 joint 数组转换为 DDJ2 PLC 点位数组，非数组位姿帧保持原字段。 */
+/** 将标准 joint 数组转换为 DDJ2 现场完整点位包，非数组位姿帧保持原字段。 */
 function convertPayloadToPlc(payload) {
   if (!Array.isArray(payload)) {
     return payload;
   }
 
-  const records = [{ e: STACKER_ID, p: "deviceCode", v: STACKER_DEVICE_CODE }];
+  const overrides = {};
+  const extensionRecords = [];
   payload.forEach((record) => {
     if (!record || typeof record !== "object") {
       return;
     }
 
     const pointName = String(record.p ?? "");
-    if (pointName === "movement_x") {
-      records.push(createPlcRecord("action", createTravelBitfieldFromAction(record.v)));
-      return;
-    }
-    if (pointName === "movement_y") {
-      const liftBitfield = createLiftBitfieldFromAction(record.v);
-      records.push(createPlcRecord("front_action", liftBitfield), createPlcRecord("back_action", liftBitfield));
-      return;
-    }
-    if (pointName === "front_movement_z") {
-      records.push(createPlcRecord("front_forkAction", createForkBitfieldFromAction(record.v)));
-      return;
-    }
-    if (pointName === "back_movement_z") {
-      records.push(createPlcRecord("back_forkAction", createForkBitfieldFromAction(record.v)));
+    if (!pointName) {
       return;
     }
 
-    records.push(createPlcRecord(pointName, record.v));
+    if (STACKER_PLC_FIELD_NAMES.has(pointName)) {
+      overrides[pointName] = record.v;
+      return;
+    }
+    extensionRecords.push(createStackerPlcRecord(pointName, record.v));
   });
-  return records;
+
+  return createStackerPlcPayload(overrides, createPayloadTimestamp(payload), extensionRecords);
 }
 
-/** 创建单条 PLC 点位记录，保持 e=DDJ2 作为模型匹配号。 */
-function createPlcRecord(pointName, value) {
+/** 创建 DDJ2 现场完整点位包，动画目标字段作为扩展点位附加在 data 末尾。 */
+function createStackerPlcPayload(overrides, timestampIso, extensionRecords = []) {
+  const values = {
+    ...STACKER_PLC_DEFAULT_VALUES,
+    deviceCode: STACKER_DEVICE_CODE,
+    ...overrides
+  };
+  return {
+    data: [
+      ...STACKER_PLC_FIELD_ORDER.map((pointName) => createStackerPlcRecord(pointName, values[pointName])),
+      ...extensionRecords
+    ],
+    ts: timestampIso
+  };
+}
+
+/** 创建单条 DDJ2 点位记录，保持 e=DDJ2 作为模型匹配号。 */
+function createStackerPlcRecord(pointName, value) {
   return { e: STACKER_ID, p: pointName, v: value };
-}
-
-/** 标准 action 1/2/0 转 PLC 行走位域：bit0 前进，bit1 后退。 */
-function createTravelBitfieldFromAction(value) {
-  const action = readActionNumber(value);
-  if (action === 1) {
-    return 1 << 0;
-  }
-  if (action === 2) {
-    return 1 << 1;
-  }
-  return 0;
-}
-
-/** 标准 action 1/2/0 转 PLC 升降位域：bit2 上升，bit3 下降。 */
-function createLiftBitfieldFromAction(value) {
-  const action = readActionNumber(value);
-  if (action === 1) {
-    return 1 << 2;
-  }
-  if (action === 2) {
-    return 1 << 3;
-  }
-  return 0;
-}
-
-/** 标准伸缩 action 转 PLC 货叉位域：bit1 向右伸叉，bit4 向右缩叉。 */
-function createForkBitfieldFromAction(value) {
-  const action = readActionNumber(value);
-  if (action === 1 || action === 3) {
-    return 1 << 1;
-  }
-  if (action === 2 || action === 4) {
-    return 1 << 4;
-  }
-  return 0;
-}
-
-/** 读取 action 枚举，非法值按停止处理，避免 dry-run 生成 NaN。 */
-function readActionNumber(value) {
-  const numberValue = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
-  return Number.isFinite(numberValue) ? Math.trunc(numberValue) : 0;
 }
 
 /** 从原始 payload 提取时间戳并输出附件同款 ISO 字符串。 */
@@ -1007,9 +1058,15 @@ function createPayloadTimestamp(payload) {
   return createIsoTimestamp(timestamp);
 }
 
-/** 按脚本统一格式输出 ISO 时间字符串，便于和现场 ts 字段对齐。 */
+/** 按东八区输出现场报文时间，便于和链条机附件中的 +08:00 格式对齐。 */
 function createIsoTimestamp(timestamp) {
-  return new Date(timestamp).toISOString();
+  const shanghaiTime = new Date(timestamp + 8 * 60 * 60 * 1000);
+  const pad = (value, length = 2) => String(value).padStart(length, "0");
+  return [
+    `${shanghaiTime.getUTCFullYear()}-${pad(shanghaiTime.getUTCMonth() + 1)}-${pad(shanghaiTime.getUTCDate())}`,
+    `T${pad(shanghaiTime.getUTCHours())}:${pad(shanghaiTime.getUTCMinutes())}:${pad(shanghaiTime.getUTCSeconds())}`,
+    `.${pad(shanghaiTime.getUTCMilliseconds(), 3)}+08:00`
+  ].join("");
 }
 
 /** 向所有已连接编辑器广播文本消息。 */
